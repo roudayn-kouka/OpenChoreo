@@ -2,7 +2,7 @@
 # The event-forwarder watches OpenChoreo Kubernetes resources via informers
 # and forwards lightweight change-notification webhooks to subscribers.
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88
+FROM gcr.io/distroless/static:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 
 ARG TARGETOS
 ARG TARGETARCH
