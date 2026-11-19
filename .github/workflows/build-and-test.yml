@@ -1,0 +1,204 @@
+name: Build and Test
+on:
+  push:
+    branches:
+      - "main"
+      - "release-v*"
+  pull_request:
+    branches:
+      - "main"
+      - "release-v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  OCI_REGISTRY_HOST: ${{ vars.OCI_REGISTRY_HOST || 'ghcr.io' }}
+  IMAGE_REPO_PREFIX: ${{ vars.IMAGE_REPO_PREFIX || 'ghcr.io/openchoreo' }}
+  HELM_OCI_REGISTRY: ${{ vars.HELM_OCI_REGISTRY || 'oci://ghcr.io/openchoreo/helm-charts' }}
+  PUBLISH_LATEST: ${{ vars.PUBLISH_LATEST || 'true' }}
+  IMAGE_PLATFORMS: ${{ github.event_name == 'push' && 'linux/amd64 linux/arm64' || 'linux/amd64' }}
+  CLI_EXTRA_PLATFORMS: ${{ github.event_name == 'push' && 'darwin/amd64 darwin/arm64 windows/amd64 windows/arm64' || '' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Release branches must not install 0.0.0-latest-dev observability modules
+      # (e.g. reintroduced by a backport from main).
+      - name: Check observability module pins
+        if: startsWith(github.base_ref, 'release-v') || startsWith(github.ref_name, 'release-v')
+        run: hack/pin-observability-modules.sh --check
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Run linter
+        run: make lint
+
+  gen-check:
+    name: Code Generation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Run Code Generation Checks
+        run: make code.gen-check
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # Required for Codecov OIDC
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Running Tests
+        run: |
+          make go.test
+
+      - name: Upload coverage to Codecov
+        if: vars.CODECOV_ENABLED != 'false'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ./cover.out
+          fail_ci_if_error: ${{ github.event_name == 'push' }}
+          use_oidc: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Build multiarch binaries
+        run: |
+          make go.build-multiarch GO_TARGET_PLATFORMS="${{ env.IMAGE_PLATFORMS }}"
+
+          # Build occ for extra platforms (push only)
+          if [[ -n "${{ env.CLI_EXTRA_PLATFORMS }}" ]]; then
+            make go.build-multiarch.occ GO_TARGET_PLATFORMS="${{ env.CLI_EXTRA_PLATFORMS }}"
+          fi
+
+      - name: Upload occ binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: occ
+          path: bin/dist/**/occ
+
+      - name: Upload manager binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manager
+          path: bin/dist/**/manager
+
+      - name: Upload openchoreo-api binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openchoreo-api
+          path: bin/dist/**/openchoreo-api
+
+      - name: Upload observer binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: observer
+          path: bin/dist/**/observer
+
+      - name: Upload event-forwarder binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: event-forwarder
+          path: bin/dist/**/event-forwarder
+
+      - name: Upload cluster-gateway binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cluster-gateway
+          path: bin/dist/**/cluster-gateway
+
+      - name: Upload cluster-agent binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cluster-agent
+          path: bin/dist/**/cluster-agent
+
+      - name: Upload remote-agent binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remote-agent
+          path: bin/dist/**/remote-agent
+
+      - name: Upload remote-agent-router binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remote-agent-router
+          path: bin/dist/**/remote-agent-router
+
+  agent-tests:
+    name: Agent Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: agents/*/uv.lock
+
+      - name: Run tests
+        # uv reads each agent's .python-version (3.14) and provisions the
+        # interpreter. ruff lint/format is intentionally deferred until the
+        # pre-existing src/ debt is cleaned up; this gates on pytest only.
+        run: make python.test
+
+  package-helm:
+    name: Package Helm Charts
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'push'
+    needs: [ lint, gen-check, test, build, agent-tests ]
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Package helm charts
+        run: make helm-package
+
+  publish:
+    name: Publish
+    if: github.event_name == 'push'
+    needs: [ lint, gen-check, test, build, agent-tests ]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-candidates.yml
+    secrets:
+      OCI_REGISTRY_USERNAME: ${{ secrets.OCI_REGISTRY_USERNAME }}
+      OCI_REGISTRY_PASSWORD: ${{ secrets.OCI_REGISTRY_PASSWORD }}

@@ -1,0 +1,73 @@
+version: 2
+updates:
+  # Go modules
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 20
+    allow:
+      - dependency-type: "direct"
+      # Most x/* modules are indirect, but they carry most Go security fixes.
+      - dependency-name: "golang.org/x/*"
+        dependency-type: "all"
+    groups:
+      # A dependency goes into the first group it matches, so order matters.
+      k8s.io:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+      patch:
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+
+  # Go modules: licenser tool
+  - package-ecosystem: "gomod"
+    directory: "/tools/licenser"
+    schedule:
+      interval: "monthly"
+    allow:
+      - dependency-type: "direct"
+      - dependency-name: "golang.org/x/*"
+        dependency-type: "all"
+    groups:
+      licenser:
+        patterns:
+          - "*"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+      - "/.github/actions/setup-go"
+    schedule:
+      interval: "weekly"
+
+  # Dockerfiles
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/cmd/*"
+      - "/install/*"
+      - "/agents/*"
+    schedule:
+      interval: "monthly"
+
+  # Helm charts
+  - package-ecosystem: "helm"
+    directories:
+      - "/install/helm/*"
+    schedule:
+      interval: "monthly"
+
+  # Python dependencies (uv)
+  - package-ecosystem: "uv"
+    directories:
+      - "/agents/*"
+    schedule:
+      interval: "weekly"

@@ -1,0 +1,20 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: ClusterAuthzRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: openchoreo
+    app.kubernetes.io/managed-by: kustomize
+    openchoreo.dev/internal: "false"
+  name: platform-admins-binding
+spec:
+  entitlement:
+    claim: groups
+    value: admins
+  roleMappings:
+    - roleRef:
+        kind: ClusterAuthzRole
+        name: platform-admin
+    - roleRef:
+        kind: ClusterAuthzRole
+        name: audit-viewer
+  effect: allow

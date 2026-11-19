@@ -1,0 +1,792 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package autobuild
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/controller"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services/git"
+)
+
+// discardLogger returns a slog.Logger that discards all output, for use in tests.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+const (
+	// testSchemaURLOnly is a minimal openAPIV3Schema with only the url extension.
+	testSchemaURLOnly = `{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string","x-openchoreo-component-parameter-repository-url":true}}}}}`
+	// testSchemaURLAndAppPath is a schema with url and app-path extensions.
+	testSchemaURLAndAppPath = `{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string","x-openchoreo-component-parameter-repository-url":true}}},"appPath":{"type":"string","x-openchoreo-component-parameter-repository-app-path":true}}}`
+	// testSchemaURLAndBranch is a schema with url and branch extensions.
+	testSchemaURLAndBranch = `{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string","x-openchoreo-component-parameter-repository-url":true},"revision":{"type":"object","properties":{"branch":{"type":"string","x-openchoreo-component-parameter-repository-branch":true}}}}}}}`
+)
+
+func newTestSchemeForWebhook(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add scheme: %v", err)
+	}
+	return scheme
+}
+
+func TestExtractComponentRepositoryPaths(t *testing.T) {
+	makeSchema := func(jsonStr string) *runtime.RawExtension {
+		return &runtime.RawExtension{Raw: []byte(jsonStr)}
+	}
+
+	tests := []struct {
+		name    string
+		schema  *runtime.RawExtension
+		want    map[string]string
+		wantErr bool
+	}{
+		{
+			name:   "nil schema",
+			schema: nil,
+			want:   map[string]string{},
+		},
+		{
+			name:   "nil raw bytes",
+			schema: &runtime.RawExtension{},
+			want:   map[string]string{},
+		},
+		{
+			name:    "invalid JSON",
+			schema:  makeSchema(`not-json`),
+			wantErr: true,
+		},
+		{
+			name:   "single url extension",
+			schema: makeSchema(`{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string","x-openchoreo-component-parameter-repository-url":true}}}}}`),
+			want:   map[string]string{"url": "repository.url"},
+		},
+		{
+			name:   "url and branch extensions",
+			schema: makeSchema(`{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string","x-openchoreo-component-parameter-repository-url":true},"revision":{"type":"object","properties":{"branch":{"type":"string","x-openchoreo-component-parameter-repository-branch":true}}}}}}}`),
+			want: map[string]string{
+				"url":    "repository.url",
+				"branch": "repository.revision.branch",
+			},
+		},
+		{
+			name:   "full repository extensions",
+			schema: makeSchema(`{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string","x-openchoreo-component-parameter-repository-url":true},"secretRef":{"type":"string","x-openchoreo-component-parameter-repository-secret-ref":true},"revision":{"type":"object","properties":{"branch":{"type":"string","x-openchoreo-component-parameter-repository-branch":true},"commit":{"type":"string","x-openchoreo-component-parameter-repository-commit":true}}},"appPath":{"type":"string","x-openchoreo-component-parameter-repository-app-path":true}}}}}`),
+			want: map[string]string{
+				"url":        "repository.url",
+				"branch":     "repository.revision.branch",
+				"commit":     "repository.revision.commit",
+				"app-path":   "repository.appPath",
+				"secret-ref": "repository.secretRef",
+			},
+		},
+		{
+			name:   "no extensions present",
+			schema: makeSchema(`{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string"}}}}}`),
+			want:   map[string]string{},
+		},
+		{
+			name:    "duplicate role returns error",
+			schema:  makeSchema(`{"type":"object","properties":{"a":{"type":"string","x-openchoreo-component-parameter-repository-url":true},"b":{"type":"string","x-openchoreo-component-parameter-repository-url":true}}}`),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := controller.ExtractComponentRepositoryPaths(tt.schema)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d entries, want %d: %v", len(got), len(tt.want), got)
+			}
+			for k, v := range tt.want {
+				if got[k] != v {
+					t.Errorf("key %q: got %q, want %q", k, got[k], v)
+				}
+			}
+		})
+	}
+}
+
+func TestGetNestedStringFromRawExtension(t *testing.T) {
+	makeRaw := func(v interface{}) *runtime.RawExtension {
+		b, _ := json.Marshal(v)
+		return &runtime.RawExtension{Raw: b}
+	}
+
+	tests := []struct {
+		name       string
+		raw        *runtime.RawExtension
+		dottedPath string
+		want       string
+		wantErr    bool
+	}{
+		{
+			name:       "nil RawExtension",
+			raw:        nil,
+			dottedPath: "repository.url",
+			wantErr:    true,
+		},
+		{
+			name:       "nil Raw bytes",
+			raw:        &runtime.RawExtension{},
+			dottedPath: "repository.url",
+			wantErr:    true,
+		},
+		{
+			name: "simple top-level key",
+			raw: makeRaw(map[string]interface{}{
+				"url": "https://github.com/example/repo",
+			}),
+			dottedPath: "url",
+			want:       "https://github.com/example/repo",
+		},
+		{
+			name: "nested path",
+			raw: makeRaw(map[string]interface{}{
+				"repository": map[string]interface{}{
+					"url": "https://github.com/example/repo",
+				},
+			}),
+			dottedPath: "repository.url",
+			want:       "https://github.com/example/repo",
+		},
+		{
+			name: "strips parameters prefix",
+			raw: makeRaw(map[string]interface{}{
+				"repository": map[string]interface{}{
+					"url": "https://github.com/example/repo",
+				},
+			}),
+			dottedPath: "parameters.repository.url",
+			want:       "https://github.com/example/repo",
+		},
+		{
+			name: "deeply nested path",
+			raw: makeRaw(map[string]interface{}{
+				"repository": map[string]interface{}{
+					"revision": map[string]interface{}{
+						"branch": "main",
+					},
+				},
+			}),
+			dottedPath: "parameters.repository.revision.branch",
+			want:       "main",
+		},
+		{
+			name: "key not found",
+			raw: makeRaw(map[string]interface{}{
+				"repository": map[string]interface{}{
+					"url": "https://github.com/example/repo",
+				},
+			}),
+			dottedPath: "repository.branch",
+			wantErr:    true,
+		},
+		{
+			name: "value is not a string",
+			raw: makeRaw(map[string]interface{}{
+				"repository": map[string]interface{}{
+					"port": 8080,
+				},
+			}),
+			dottedPath: "repository.port",
+			wantErr:    true,
+		},
+		{
+			name: "intermediate path is not an object",
+			raw: makeRaw(map[string]interface{}{
+				"repository": "not-an-object",
+			}),
+			dottedPath: "repository.url",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := getNestedStringFromRawExtension(tt.raw, tt.dottedPath)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractRepoInfoFromComponent(t *testing.T) {
+	makeRaw := func(v interface{}) *runtime.RawExtension {
+		b, _ := json.Marshal(v)
+		return &runtime.RawExtension{Raw: b}
+	}
+
+	scheme := newTestSchemeForWebhook(t)
+
+	tests := []struct {
+		name            string
+		component       *v1alpha1.Component
+		workflow        *v1alpha1.Workflow
+		clusterWorkflow *v1alpha1.ClusterWorkflow
+		wantRepo        string
+		wantAppPath     string
+		wantBranch      string
+		wantErr         bool
+	}{
+		{
+			name: "no workflow config on component",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec:       v1alpha1.ComponentSpec{},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty workflow name",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{Name: ""},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "workflow missing url extension in schema",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name: "wf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{"url": "https://github.com/example/repo"},
+						}),
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				schemaJSON := `{"type":"object","properties":{"repository":{"type":"object","properties":{"revision":{"type":"object","properties":{"branch":{"type":"string","x-openchoreo-component-parameter-repository-branch":true}}}}}}}`
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(schemaJSON)},
+						},
+					},
+				}
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "extracts repoUrl successfully",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name: "wf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "https://github.com/example/repo",
+							},
+						}),
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLOnly)},
+						},
+					},
+				}
+			}(),
+			wantRepo: "https://github.com/example/repo",
+		},
+		{
+			name: "extracts repoUrl and appPath",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name: "wf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "https://github.com/example/repo",
+							},
+							"appPath": "/src/app",
+						}),
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLAndAppPath)},
+						},
+					},
+				}
+			}(),
+			wantRepo:    "https://github.com/example/repo",
+			wantAppPath: "/src/app",
+		},
+		{
+			name: "empty repoUrl value in parameters",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name: "wf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "",
+							},
+						}),
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLOnly)},
+						},
+					},
+				}
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "nil parameters RawExtension",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name:       "wf1",
+						Parameters: nil,
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLOnly)},
+						},
+					},
+				}
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "appPath missing from parameters is not an error",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name: "wf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "https://github.com/example/repo",
+							},
+						}),
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLAndAppPath)},
+						},
+					},
+				}
+			}(),
+			wantRepo:    "https://github.com/example/repo",
+			wantAppPath: "",
+		},
+		{
+			name: "branch missing from parameters and no schema default yields empty branch (all branches trigger)",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name: "wf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "https://github.com/example/repo",
+							},
+						}),
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLAndBranch)},
+						},
+					},
+				}
+			}(),
+			wantRepo:   "https://github.com/example/repo",
+			wantBranch: "",
+		},
+		{
+			name: "branch missing from parameters falls back to schema default",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Name: "wf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "https://github.com/example/repo",
+							},
+						}),
+					},
+				},
+			},
+			workflow: func() *v1alpha1.Workflow {
+				schemaJSON := `{"type":"object","properties":{"repository":{"type":"object","properties":{"url":{"type":"string","x-openchoreo-component-parameter-repository-url":true},"revision":{"type":"object","properties":{"branch":{"type":"string","default":"main","x-openchoreo-component-parameter-repository-branch":true}}}}}}}`
+				return &v1alpha1.Workflow{
+					ObjectMeta: metav1.ObjectMeta{Name: "wf1", Namespace: "ns1"},
+					Spec: v1alpha1.WorkflowSpec{
+						Parameters: &v1alpha1.SchemaSection{
+							OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(schemaJSON)},
+						},
+					},
+				}
+			}(),
+			wantRepo:   "https://github.com/example/repo",
+			wantBranch: "main",
+		},
+		{
+			name: "ClusterWorkflow kind: extracts repoUrl from cluster-scoped workflow",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Kind: v1alpha1.WorkflowRefKindClusterWorkflow,
+						Name: "cwf1",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "https://github.com/example/repo",
+							},
+						}),
+					},
+				},
+			},
+			clusterWorkflow: &v1alpha1.ClusterWorkflow{
+				ObjectMeta: metav1.ObjectMeta{Name: "cwf1"},
+				Spec: v1alpha1.ClusterWorkflowSpec{
+					Parameters: &v1alpha1.SchemaSection{
+						OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLOnly)},
+					},
+				},
+			},
+			wantRepo: "https://github.com/example/repo",
+		},
+		{
+			name: "ClusterWorkflow not found returns wrapped error",
+			component: &v1alpha1.Component{
+				ObjectMeta: metav1.ObjectMeta{Name: "comp1", Namespace: "ns1"},
+				Spec: v1alpha1.ComponentSpec{
+					Workflow: &v1alpha1.ComponentWorkflowConfig{
+						Kind: v1alpha1.WorkflowRefKindClusterWorkflow,
+						Name: "nonexistent-cwf",
+						Parameters: makeRaw(map[string]interface{}{
+							"repository": map[string]interface{}{
+								"url": "https://github.com/example/repo",
+							},
+						}),
+					},
+				},
+			},
+			// no clusterWorkflow registered → fake client returns not-found
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tt.workflow != nil {
+				builder = builder.WithObjects(tt.workflow)
+			}
+			if tt.clusterWorkflow != nil {
+				builder = builder.WithObjects(tt.clusterWorkflow)
+			}
+			k8sClient := builder.Build()
+
+			svc := &webhookProcessor{k8sClient: k8sClient, logger: discardLogger()}
+
+			gotRepo, gotAppPath, gotBranch, err := svc.extractRepoInfoFromComponent(context.Background(), tt.component)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotRepo != tt.wantRepo {
+				t.Errorf("repoURL: got %q, want %q", gotRepo, tt.wantRepo)
+			}
+			if gotAppPath != tt.wantAppPath {
+				t.Errorf("appPath: got %q, want %q", gotAppPath, tt.wantAppPath)
+			}
+			if gotBranch != tt.wantBranch {
+				t.Errorf("branch: got %q, want %q", gotBranch, tt.wantBranch)
+			}
+		})
+	}
+}
+
+// makeAutoBuildComponent returns a Component with autoBuild enabled, pointing at the given
+// Workflow CR and carrying repository parameters including an optional branch.
+func makeAutoBuildComponent(name, ns, workflowName, repoURL, branch string, makeRaw func(interface{}) *runtime.RawExtension) *v1alpha1.Component {
+	autoBuild := true
+	params := map[string]interface{}{
+		"repository": map[string]interface{}{
+			"url": repoURL,
+			"revision": map[string]interface{}{
+				"branch": branch,
+			},
+		},
+	}
+	return &v1alpha1.Component{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: v1alpha1.ComponentSpec{
+			AutoBuild: &autoBuild,
+			Workflow: &v1alpha1.ComponentWorkflowConfig{
+				Name:       workflowName,
+				Parameters: makeRaw(params),
+			},
+		},
+	}
+}
+
+// makeWorkflowWithBranch returns a Workflow CR whose schema marks url and branch with x-openchoreo-component-repository extensions.
+func makeWorkflowWithBranch(name, ns string) *v1alpha1.Workflow {
+	return &v1alpha1.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: v1alpha1.WorkflowSpec{
+			Parameters: &v1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLAndBranch)},
+			},
+		},
+	}
+}
+
+// makeWorkflowNoBranch returns a Workflow CR whose schema marks only url with x-openchoreo-component-repository extension (no branch).
+func makeWorkflowNoBranch(name, ns string) *v1alpha1.Workflow {
+	return &v1alpha1.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: v1alpha1.WorkflowSpec{
+			Parameters: &v1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{Raw: []byte(testSchemaURLOnly)},
+			},
+		},
+	}
+}
+
+func TestWebhookBranchFilter_Match(t *testing.T) {
+	makeRaw := func(v interface{}) *runtime.RawExtension {
+		b, _ := json.Marshal(v)
+		return &runtime.RawExtension{Raw: b}
+	}
+
+	scheme := newTestSchemeForWebhook(t)
+	comp := makeAutoBuildComponent("svc", "ns1", "wf1", "https://github.com/example/repo", "main", makeRaw)
+	workflow := makeWorkflowWithBranch("wf1", "ns1")
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(comp, workflow).Build()
+	svc := &webhookProcessor{k8sClient: k8sClient, logger: discardLogger()}
+
+	event := &git.WebhookEvent{
+		Provider:      string(git.ProviderGitHub),
+		RepositoryURL: "https://github.com/example/repo",
+		Branch:        "main",
+	}
+
+	affected, err := svc.findAffectedComponents(context.Background(), event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(affected) != 1 {
+		t.Fatalf("expected 1 affected component, got %d", len(affected))
+	}
+	if affected[0].Name != "svc" {
+		t.Errorf("expected component %q, got %q", "svc", affected[0].Name)
+	}
+}
+
+func TestProviderFromRepoURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		repoURL string
+		want    git.ProviderType
+	}{
+		{"github https", "https://github.com/org/repo", git.ProviderGitHub},
+		{"github https .git", "https://github.com/org/repo.git", git.ProviderGitHub},
+		{"github ssh", "git@github.com:org/repo.git", git.ProviderGitHub},
+		{"gitlab https", "https://gitlab.com/org/repo", git.ProviderGitLab},
+		{"bitbucket https", "https://bitbucket.org/org/repo", git.ProviderBitbucket},
+		// Regression: a Bitbucket repo whose path contains another provider's domain
+		// must be classified by host, not by substring match on the path.
+		{"bitbucket repo path contains github.com", "https://bitbucket.org/my-org/github.com-sync", git.ProviderBitbucket},
+		{"github repo path contains bitbucket.org", "https://github.com/my-org/bitbucket.org-mirror", git.ProviderGitHub},
+		// Self-hosted / unknown hosts are not inferred.
+		{"self-hosted host", "https://git.example.com/org/repo", ""},
+		{"self-hosted with github in path", "https://git.example.com/org/github.com", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := providerFromRepoURL(tt.repoURL); got != tt.want {
+				t.Errorf("providerFromRepoURL(%q) = %q, want %q", tt.repoURL, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWebhookProviderFilter_Mismatch verifies that a webhook authenticated as one provider
+// does not trigger builds for a component hosted on a different provider, even when the
+// repository URL matches. This guards against provider-confusion across shared repo URLs.
+func TestWebhookProviderFilter_Mismatch(t *testing.T) {
+	makeRaw := func(v interface{}) *runtime.RawExtension {
+		b, _ := json.Marshal(v)
+		return &runtime.RawExtension{Raw: b}
+	}
+
+	scheme := newTestSchemeForWebhook(t)
+	comp := makeAutoBuildComponent("svc", "ns1", "wf1", "https://github.com/example/repo", "main", makeRaw)
+	workflow := makeWorkflowWithBranch("wf1", "ns1")
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(comp, workflow).Build()
+	svc := &webhookProcessor{k8sClient: k8sClient, logger: discardLogger()}
+
+	// GitHub-hosted component, but the webhook was validated as Bitbucket.
+	event := &git.WebhookEvent{
+		Provider:      string(git.ProviderBitbucket),
+		RepositoryURL: "https://github.com/example/repo",
+		Branch:        "main",
+	}
+
+	affected, err := svc.findAffectedComponents(context.Background(), event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("expected 0 affected components for provider mismatch, got %d", len(affected))
+	}
+}
+
+func TestWebhookBranchFilter_Mismatch(t *testing.T) {
+	makeRaw := func(v interface{}) *runtime.RawExtension {
+		b, _ := json.Marshal(v)
+		return &runtime.RawExtension{Raw: b}
+	}
+
+	scheme := newTestSchemeForWebhook(t)
+	comp := makeAutoBuildComponent("svc", "ns1", "wf1", "https://github.com/example/repo", "main", makeRaw)
+	workflow := makeWorkflowWithBranch("wf1", "ns1")
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(comp, workflow).Build()
+	svc := &webhookProcessor{k8sClient: k8sClient, logger: discardLogger()}
+
+	event := &git.WebhookEvent{
+		Provider:      string(git.ProviderGitHub),
+		RepositoryURL: "https://github.com/example/repo",
+		Branch:        "feature/new-api",
+	}
+
+	affected, err := svc.findAffectedComponents(context.Background(), event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("expected 0 affected components for branch mismatch, got %d", len(affected))
+	}
+}
+
+func TestWebhookBranchFilter_NoConfiguredBranch(t *testing.T) {
+	makeRaw := func(v interface{}) *runtime.RawExtension {
+		b, _ := json.Marshal(v)
+		return &runtime.RawExtension{Raw: b}
+	}
+
+	scheme := newTestSchemeForWebhook(t)
+	autoBuild := true
+	comp := &v1alpha1.Component{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns1"},
+		Spec: v1alpha1.ComponentSpec{
+			AutoBuild: &autoBuild,
+			Workflow: &v1alpha1.ComponentWorkflowConfig{
+				Name: "wf1",
+				Parameters: makeRaw(map[string]interface{}{
+					"repository": map[string]interface{}{
+						"url": "https://github.com/example/repo",
+					},
+				}),
+			},
+		},
+	}
+	workflow := makeWorkflowNoBranch("wf1", "ns1")
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(comp, workflow).Build()
+	svc := &webhookProcessor{k8sClient: k8sClient, logger: discardLogger()}
+
+	for _, pushBranch := range []string{"main", "feature/foo", "release/v1"} {
+		t.Run(pushBranch, func(t *testing.T) {
+			event := &git.WebhookEvent{
+				Provider:      string(git.ProviderGitHub),
+				RepositoryURL: "https://github.com/example/repo",
+				Branch:        pushBranch,
+			}
+			affected, err := svc.findAffectedComponents(context.Background(), event)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(affected) != 1 {
+				t.Fatalf("expected 1 affected component for branch %q (no branch filter), got %d", pushBranch, len(affected))
+			}
+		})
+	}
+}

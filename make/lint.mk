@@ -1,0 +1,187 @@
+# This makefile contains all the make targets related code generation and linting.
+
+##@ Code Generation and Linting
+
+# All project Go files, excluding generated / vendored paths
+ALL_GO_FILES := $(shell \
+	find . -type f -name '*.go' \
+		! -path './internal/dataplane/kubernetes/types/*' \
+		! -path './internal/openchoreo-api/api/gen/*' \
+		! -path './api/v1alpha1/zz_generated.deepcopy.go' \
+		! -path './internal/observer/api/gen/*' \
+		! -path './internal/observer/api/internalgen/*' \
+		! -path './internal/observer/api/logsadapterclientgen/*' \
+		! -path './internal/observer/api/finopsadapterclientgen/*' \
+		! -path './samples/*' \
+		! -path '**/mocks/*' \
+	| sort)
+
+# Path to your tool (update if different)
+LICENSE_TOOL := go run ./tools/licenser/main.go
+LICENSE_HOLDER := "The OpenChoreo Authors"
+
+.PHONY: license-check
+license-check: ## Check all Go files for license headers
+	@CHECK_ONLY=1 $(LICENSE_TOOL) -check-only -c $(LICENSE_HOLDER) $(ALL_GO_FILES)
+
+.PHONY: license-fix
+license-fix: ## Add license headers to all Go files
+	@$(LICENSE_TOOL) -c $(LICENSE_HOLDER) $(ALL_GO_FILES)
+
+# Binary file extensions to exclude from newline checks
+BINARY_EXTENSIONS := png jpg jpeg gif ico pdf zip tar gz tgz bin exe so dylib dll woff woff2 ttf eot jar war
+
+# Create regex pattern for binary files
+BINARY_PATTERN := $(shell echo $(BINARY_EXTENSIONS) | sed 's/ /|/g')
+
+.PHONY: newline-check
+newline-check: ## Check for missing trailing newlines in all Git-tracked text files
+	@echo "Checking all Git-tracked text files for missing trailing newlines..."
+	@files_without_newline=$$(git ls-files | grep -v -E '\.($(BINARY_PATTERN))$$' | while read file; do \
+		if [ -f "$$file" ] && [ -s "$$file" ] && [ "$$(tail -c1 "$$file" 2>/dev/null)" != "" ]; then \
+			echo "$$file"; \
+		fi; \
+	done); \
+	if [ -n "$$files_without_newline" ]; then \
+		echo "Files missing trailing newlines:"; \
+		echo "$$files_without_newline"; \
+		echo "Run 'make newline-fix' to fix these files"; \
+		exit 1; \
+	else \
+		echo "✓ All Git-tracked text files have trailing newlines"; \
+	fi
+
+.PHONY: newline-fix
+newline-fix: ## Add missing trailing newlines to all Git-tracked text files
+	@echo "Adding trailing newlines to all Git-tracked text files that need them..."
+	@count=0; \
+	git ls-files | grep -v -E '\.($(BINARY_PATTERN))$$' | while read file; do \
+		if [ -f "$$file" ] && [ -s "$$file" ] && [ "$$(tail -c1 "$$file" 2>/dev/null)" != "" ]; then \
+			echo "" >> "$$file"; \
+			echo "Fixed: $$file"; \
+			count=$$((count + 1)); \
+		fi; \
+	done | tee /tmp/newline-fix-output.txt; \
+	fixed_count=$$(grep -c "^Fixed:" /tmp/newline-fix-output.txt 2>/dev/null || echo 0); \
+	rm -f /tmp/newline-fix-output.txt; \
+	echo "✓ Fixed $$fixed_count files"
+
+CHART_IMAGE_PREFIX := $(OPENCHOREO_PUBLIC_REGISTRY)
+LEGACY_CHART_IMAGE_PREFIX := ghcr.io/openchoreo
+
+.PHONY: chart-image-registry-check
+chart-image-registry-check: ## Check that Helm chart image defaults use cr.openchoreo.dev instead of ghcr.io/openchoreo
+	@matches=$$(grep -rnF "$(LEGACY_CHART_IMAGE_PREFIX)/" $(PROJECT_DIR)/install/helm || true); \
+	if [ -n "$$matches" ]; then \
+		echo "Chart image defaults must use $(CHART_IMAGE_PREFIX)/<image>, not $(LEGACY_CHART_IMAGE_PREFIX)/<image>:"; \
+		echo "$$matches"; \
+		exit 1; \
+	else \
+		echo "✓ Chart image defaults use $(CHART_IMAGE_PREFIX)"; \
+	fi
+
+.PHONY: golangci-lint-check
+golangci-lint-check: golangci-lint ## Check code with golangci-lint
+	$(GOLANGCI_LINT) run
+
+.PHONY: golangci-lint-fix
+golangci-lint-fix: golangci-lint ## Run golangci-lint with fix option
+	$(GOLANGCI_LINT) run --fix
+
+.PHONY: lint
+lint: golangci-lint-check license-check newline-check chart-image-registry-check ## Run golangci-lint linter, licenser, newline, and chart image registry checks
+
+.PHONY: lint-fix
+lint-fix: golangci-lint-fix license-fix newline-fix ## Run golangci-lint linter, licenser, and newline fix to perform fixes
+
+# Individual getting-started sample files that compose all.yaml (order matters)
+GETTING_STARTED_DIR := samples/getting-started
+GETTING_STARTED_FILES := \
+	$(GETTING_STARTED_DIR)/cluster-project-types/default.yaml \
+	$(GETTING_STARTED_DIR)/project.yaml \
+	$(GETTING_STARTED_DIR)/deployment-pipeline.yaml \
+	$(GETTING_STARTED_DIR)/environments.yaml \
+	$(GETTING_STARTED_DIR)/component-types/worker.yaml \
+	$(GETTING_STARTED_DIR)/component-types/service.yaml \
+	$(GETTING_STARTED_DIR)/component-types/webapp.yaml \
+	$(GETTING_STARTED_DIR)/component-types/scheduled-task.yaml \
+	$(GETTING_STARTED_DIR)/cluster-resource-types/postgres.yaml \
+	$(GETTING_STARTED_DIR)/cluster-resource-types/valkey.yaml \
+	$(GETTING_STARTED_DIR)/cluster-resource-types/nats.yaml \
+	$(GETTING_STARTED_DIR)/ci-workflows/paketo-buildpacks-builder.yaml \
+	$(GETTING_STARTED_DIR)/ci-workflows/gcp-buildpacks-builder.yaml \
+	$(GETTING_STARTED_DIR)/ci-workflows/ballerina-buildpack-builder.yaml \
+	$(GETTING_STARTED_DIR)/ci-workflows/dockerfile-builder.yaml \
+	$(GETTING_STARTED_DIR)/component-traits/alert-rule-trait.yaml \
+	$(GETTING_STARTED_DIR)/component-traits/health-probes-trait.yaml \
+	$(GETTING_STARTED_DIR)/component-traits/hpa-trait.yaml \
+	$(GETTING_STARTED_DIR)/component-traits/pvc-trait.yaml \
+	$(GETTING_STARTED_DIR)/component-traits/vpa-trait.yaml
+
+.PHONY: samples-gen
+samples-gen: ## Generate samples/getting-started/all.yaml from individual files
+	@echo "Generating $(GETTING_STARTED_DIR)/all.yaml..."
+	@{ \
+	printf '# OpenChoreo Getting Started Resources\n'; \
+	printf '#\n'; \
+	printf '# This file is auto-generated by "make samples-gen". DO NOT EDIT.\n'; \
+	printf '#\n'; \
+	printf '# This file contains all the default resources needed to get started with OpenChoreo.\n'; \
+	printf '# Apply this file after installing the control plane to create the default project,\n'; \
+	printf '# environments, pipeline, component types, workflows, and traits.\n'; \
+	printf '#\n'; \
+	printf '# Usage:\n'; \
+	printf '#   kubectl apply -f samples/getting-started/all.yaml\n'; \
+	for f in $(GETTING_STARTED_FILES); do \
+		printf '\n---\n'; \
+		cat "$$f"; \
+	done; \
+	} > $(GETTING_STARTED_DIR)/all.yaml
+	@echo "✓ Generated $(GETTING_STARTED_DIR)/all.yaml"
+
+# Coordinator and generate-workload templates bundled into workflow-templates.yaml.
+# checkout-source and publish-image are NOT included because they are the
+# customization points that users apply (and replace) separately.
+WORKFLOW_TEMPLATE_DIR := $(GETTING_STARTED_DIR)/workflow-templates
+WORKFLOW_TEMPLATE_FILES := \
+	$(WORKFLOW_TEMPLATE_DIR)/paketo-buildpacks-build.yaml \
+	$(WORKFLOW_TEMPLATE_DIR)/gcp-buildpacks-build.yaml \
+	$(WORKFLOW_TEMPLATE_DIR)/ballerina-buildpack-build.yaml \
+	$(WORKFLOW_TEMPLATE_DIR)/containerfile-build.yaml
+
+.PHONY: workflow-templates-gen
+workflow-templates-gen: ## Generate samples/getting-started/workflow-templates.yaml from individual files
+	@echo "Generating $(GETTING_STARTED_DIR)/workflow-templates.yaml..."
+	@{ \
+	printf '# OpenChoreo Workflow Templates\n'; \
+	printf '#\n'; \
+	printf '# This file is auto-generated by "make workflow-templates-gen". DO NOT EDIT.\n'; \
+	printf '#\n'; \
+	printf '# Contains the coordinator ClusterWorkflowTemplates (docker-build-step,\n'; \
+	printf '# pack-build-paketo, pack-build-gcp,\n'; \
+	printf '# pack-build-ballerina) and the generate-workload-build-step\n'; \
+	printf '# template. checkout-source-build-step and publish-image-build-step are\n'; \
+	printf '# applied separately so they can be replaced independently.\n'; \
+	printf '#\n'; \
+	printf '# Usage:\n'; \
+	printf '#   kubectl apply -f .../workflow-templates/checkout-source.yaml\n'; \
+	printf '#   kubectl apply -f .../workflow-templates.yaml\n'; \
+	printf '#   kubectl apply -f .../workflow-templates/publish-image.yaml\n'; \
+	printf '#   kubectl apply -f .../workflow-templates/generate-workload.yaml\n'; \
+	for f in $(WORKFLOW_TEMPLATE_FILES); do \
+		printf '\n---\n'; \
+		cat "$$f"; \
+	done; \
+	} > $(GETTING_STARTED_DIR)/workflow-templates.yaml
+	@echo "✓ Generated $(GETTING_STARTED_DIR)/workflow-templates.yaml"
+
+.PHONY: code.gen
+code.gen: manifests generate openapi-codegen go.mod.lint helm-generate samples-gen workflow-templates-gen mockery-gen audit-gen ## Generate code and fix the code with linter
+
+.PHONY: code.gen-check
+code.gen-check: code.gen ## Verify the clean Git status after code generation
+	@if [ ! -z "$$(git status --porcelain)" ]; then \
+	  git status --porcelain; \
+      echo "There are new changes after the code generation. Please run 'make code.gen' and commit the changes"; \
+      exit 1; \
+    fi

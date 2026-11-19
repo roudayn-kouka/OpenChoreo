@@ -1,0 +1,2184 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/openchoreo/openchoreo/internal/observer/api/gen"
+	"github.com/openchoreo/openchoreo/internal/observer/service"
+	"github.com/openchoreo/openchoreo/internal/observer/types"
+	"github.com/openchoreo/openchoreo/pkg/mcp/mcpaudit"
+)
+
+const (
+	testNamespace   = "test-namespace"
+	testProject     = "test-project"
+	testComponent   = "test-component"
+	testEnvironment = "development"
+	testStartTime   = "2025-01-01T00:00:00Z"
+	testEndTime     = "2025-01-01T23:59:59Z"
+	testTraceID     = "trace-abc123"
+	testSpanID      = "span-def456"
+	sortOrderAsc    = "asc"
+	sortOrderDesc   = "desc"
+	logLevelError   = "ERROR"
+	logLevelWarn    = "WARN"
+
+	testClusterInstance = "cluster1"
+	testK8sNamespace    = "openchoreo-control-plane"
+	testPodName         = "controller-manager-7f58b689b5-pwsb5"
+	testContainerName   = "manager"
+	testLabelSelector   = "openchoreo.dev/plane=controlplane"
+)
+
+// ---- Mock service implementations ----
+
+type MockLogsQuerier struct {
+	requests []*types.LogsQueryRequest
+	response *types.LogsQueryResponse
+	err      error
+}
+
+func NewMockLogsQuerier() *MockLogsQuerier {
+	return &MockLogsQuerier{
+		response: &types.LogsQueryResponse{
+			Logs:   []types.LogEntry{{Timestamp: "2025-01-01T00:00:00Z", Log: "test log", Level: "INFO"}},
+			Total:  1,
+			TookMs: 10,
+		},
+	}
+}
+
+func (m *MockLogsQuerier) QueryLogs(_ context.Context, req *types.LogsQueryRequest) (*types.LogsQueryResponse, error) {
+	m.requests = append(m.requests, req)
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.response, nil
+}
+
+func (m *MockLogsQuerier) lastRequest() *types.LogsQueryRequest {
+	if len(m.requests) == 0 {
+		return nil
+	}
+	return m.requests[len(m.requests)-1]
+}
+
+func (m *MockLogsQuerier) reset() { m.requests = nil }
+
+type MockPlatformLogsQuerier struct {
+	logsRequests   []*types.PlatformLogsQueryRequest
+	valuesRequests []*types.PlatformLogFilterValuesRequest
+	logsResponse   *types.PlatformLogsResponse
+	valuesResponse *types.PlatformLogFilterValuesResponse
+	logsErr        error
+	valuesErr      error
+}
+
+func NewMockPlatformLogsQuerier() *MockPlatformLogsQuerier {
+	return &MockPlatformLogsQuerier{
+		logsResponse: &types.PlatformLogsResponse{
+			Logs: []types.PlatformLog{
+				{Timestamp: testStartTime, Log: "reconcile failed", Level: logLevelError, PodName: testPodName},
+			},
+			Total:  1,
+			TookMs: 4,
+		},
+		valuesResponse: &types.PlatformLogFilterValuesResponse{
+			Values:      []types.PlatformLogFilterValue{{Value: testPodName, Count: 1}},
+			TotalValues: 1,
+			TookMs:      2,
+		},
+	}
+}
+
+func (m *MockPlatformLogsQuerier) QueryPlatformLogs(_ context.Context, req *types.PlatformLogsQueryRequest) (*types.PlatformLogsResponse, error) {
+	m.logsRequests = append(m.logsRequests, req)
+	if m.logsErr != nil {
+		return nil, m.logsErr
+	}
+	return m.logsResponse, nil
+}
+
+func (m *MockPlatformLogsQuerier) QueryPlatformLogFilterValues(_ context.Context, req *types.PlatformLogFilterValuesRequest) (*types.PlatformLogFilterValuesResponse, error) {
+	m.valuesRequests = append(m.valuesRequests, req)
+	if m.valuesErr != nil {
+		return nil, m.valuesErr
+	}
+	return m.valuesResponse, nil
+}
+
+func (m *MockPlatformLogsQuerier) lastRequest() *types.PlatformLogsQueryRequest {
+	if len(m.logsRequests) == 0 {
+		return nil
+	}
+	return m.logsRequests[len(m.logsRequests)-1]
+}
+
+func (m *MockPlatformLogsQuerier) reset() {
+	m.logsRequests = nil
+	m.valuesRequests = nil
+}
+
+// MockAuditLogsQuerier implements service.AuditLogsQuerier. There is no
+// filter-values tool, so QueryAuditLogFilterValues only satisfies the interface
+// and fails loudly if something calls it.
+type MockAuditLogsQuerier struct {
+	requests []*types.AuditLogsQueryRequest
+	response *types.AuditLogsResponse
+	err      error
+}
+
+func NewMockAuditLogsQuerier() *MockAuditLogsQuerier {
+	return &MockAuditLogsQuerier{
+		response: &types.AuditLogsResponse{
+			Records: []types.AuditLogRecord{{
+				SchemaVersion: "v1",
+				EventID:       "01JCZ8P0000000000000000000",
+				EventTime:     testStartTime,
+				Actor:         types.AuditLogActor{Type: "user", ID: "alice@example.com"},
+				Action:        "delete_component",
+				Category:      "management",
+				Result:        "success",
+			}},
+			Total:  1,
+			TookMs: 7,
+		},
+	}
+}
+
+func (m *MockAuditLogsQuerier) QueryAuditLogs(_ context.Context, req *types.AuditLogsQueryRequest) (*types.AuditLogsResponse, error) {
+	m.requests = append(m.requests, req)
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.response, nil
+}
+
+func (m *MockAuditLogsQuerier) QueryAuditLogFilterValues(_ context.Context, _ *types.AuditLogFilterValuesRequest) (*types.AuditLogFilterValuesResponse, error) {
+	return nil, errors.New("QueryAuditLogFilterValues is not exposed over MCP")
+}
+
+func (m *MockAuditLogsQuerier) lastRequest() *types.AuditLogsQueryRequest {
+	if len(m.requests) == 0 {
+		return nil
+	}
+	return m.requests[len(m.requests)-1]
+}
+
+func (m *MockAuditLogsQuerier) reset() { m.requests = nil }
+
+type MockEventsQuerier struct {
+	requests []*types.EventsQueryRequest
+	response *types.EventsQueryResponse
+	err      error
+}
+
+func NewMockEventsQuerier() *MockEventsQuerier {
+	return &MockEventsQuerier{
+		response: &types.EventsQueryResponse{
+			Events: []types.EventEntry{{Timestamp: "2025-01-01T00:00:00Z", Message: "test event", Type: "Normal", Reason: "Scheduled"}},
+			Total:  1,
+			TookMs: 10,
+		},
+	}
+}
+
+func (m *MockEventsQuerier) QueryEvents(_ context.Context, req *types.EventsQueryRequest) (*types.EventsQueryResponse, error) {
+	m.requests = append(m.requests, req)
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.response, nil
+}
+
+func (m *MockEventsQuerier) lastRequest() *types.EventsQueryRequest {
+	if len(m.requests) == 0 {
+		return nil
+	}
+	return m.requests[len(m.requests)-1]
+}
+
+func (m *MockEventsQuerier) reset() { m.requests = nil }
+
+type MockMetricsQuerier struct {
+	requests []*types.MetricsQueryRequest
+	response any
+	err      error
+}
+
+func NewMockMetricsQuerier() *MockMetricsQuerier {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	return &MockMetricsQuerier{
+		response: &types.ResourceMetricsQueryResponse{
+			CPUUsage: []types.MetricsTimeSeriesItem{{Timestamp: ts, Value: 0.5}},
+		},
+	}
+}
+
+func (m *MockMetricsQuerier) QueryMetrics(_ context.Context, req *types.MetricsQueryRequest) (any, error) {
+	m.requests = append(m.requests, req)
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.response, nil
+}
+
+func (m *MockMetricsQuerier) QueryRuntimeTopology(_ context.Context, _ *types.RuntimeTopologyRequest) (*types.RuntimeTopologyResponse, error) {
+	return &types.RuntimeTopologyResponse{}, nil
+}
+
+func (m *MockMetricsQuerier) lastRequest() *types.MetricsQueryRequest {
+	if len(m.requests) == 0 {
+		return nil
+	}
+	return m.requests[len(m.requests)-1]
+}
+
+func (m *MockMetricsQuerier) reset() { m.requests = nil }
+
+type MockTracesQuerier struct {
+	tracesRequests      []*types.TracesQueryRequest
+	spansRequests       []*types.TracesQueryRequest
+	spanDetailsTraceIDs []string
+	spanDetailsSpanIDs  []string
+	tracesResponse      *types.TracesQueryResponse
+	spansResponse       *types.SpansQueryResponse
+	spanInfo            *types.SpanInfo
+	queryTracesErr      error
+	querySpansErr       error
+	spanDetailsErr      error
+}
+
+func NewMockTracesQuerier() *MockTracesQuerier {
+	now := time.Now()
+	return &MockTracesQuerier{
+		tracesResponse: &types.TracesQueryResponse{
+			Traces: []types.TraceInfo{
+				{TraceID: testTraceID, TraceName: "test-trace", SpanCount: 3},
+			},
+			Total:  1,
+			TookMs: 15,
+		},
+		spansResponse: &types.SpansQueryResponse{
+			Spans: []types.SpanInfo{
+				{SpanID: testSpanID, SpanName: "test-span", StartTime: &now},
+			},
+			Total:  1,
+			TookMs: 5,
+		},
+		spanInfo: &types.SpanInfo{
+			SpanID:     testSpanID,
+			SpanName:   "test-span",
+			Attributes: map[string]any{"http.method": "GET"},
+		},
+	}
+}
+
+func (m *MockTracesQuerier) QueryTraces(_ context.Context, req *types.TracesQueryRequest) (*types.TracesQueryResponse, error) {
+	m.tracesRequests = append(m.tracesRequests, req)
+	if m.queryTracesErr != nil {
+		return nil, m.queryTracesErr
+	}
+	return m.tracesResponse, nil
+}
+
+func (m *MockTracesQuerier) QuerySpans(_ context.Context, traceID string, req *types.TracesQueryRequest) (*types.SpansQueryResponse, error) {
+	m.spansRequests = append(m.spansRequests, req)
+	m.spanDetailsTraceIDs = append(m.spanDetailsTraceIDs, traceID)
+	if m.querySpansErr != nil {
+		return nil, m.querySpansErr
+	}
+	return m.spansResponse, nil
+}
+
+func (m *MockTracesQuerier) GetSpanDetails(_ context.Context, traceID string, spanID string) (*types.SpanInfo, error) {
+	m.spanDetailsTraceIDs = append(m.spanDetailsTraceIDs, traceID)
+	m.spanDetailsSpanIDs = append(m.spanDetailsSpanIDs, spanID)
+	if m.spanDetailsErr != nil {
+		return nil, m.spanDetailsErr
+	}
+	return m.spanInfo, nil
+}
+
+func (m *MockTracesQuerier) lastTracesRequest() *types.TracesQueryRequest {
+	if len(m.tracesRequests) == 0 {
+		return nil
+	}
+	return m.tracesRequests[len(m.tracesRequests)-1]
+}
+
+func (m *MockTracesQuerier) lastSpansRequest() *types.TracesQueryRequest {
+	if len(m.spansRequests) == 0 {
+		return nil
+	}
+	return m.spansRequests[len(m.spansRequests)-1]
+}
+
+func (m *MockTracesQuerier) reset() {
+	m.tracesRequests = nil
+	m.spansRequests = nil
+	m.spanDetailsTraceIDs = nil
+	m.spanDetailsSpanIDs = nil
+}
+
+type MockAlertIncidentService struct {
+	alertsRequests    []gen.AlertsQueryRequest
+	incidentsRequests []gen.IncidentsQueryRequest
+	alertsResponse    *gen.AlertsQueryResponse
+	incidentsResponse *gen.IncidentsQueryResponse
+	queryAlertsErr    error
+	queryIncidentsErr error
+}
+
+func NewMockAlertIncidentService() *MockAlertIncidentService {
+	return &MockAlertIncidentService{
+		alertsResponse:    &gen.AlertsQueryResponse{},
+		incidentsResponse: &gen.IncidentsQueryResponse{},
+	}
+}
+
+func (m *MockAlertIncidentService) QueryAlerts(_ context.Context, req gen.AlertsQueryRequest) (*gen.AlertsQueryResponse, error) {
+	m.alertsRequests = append(m.alertsRequests, req)
+	if m.queryAlertsErr != nil {
+		return nil, m.queryAlertsErr
+	}
+	return m.alertsResponse, nil
+}
+
+func (m *MockAlertIncidentService) QueryIncidents(_ context.Context, req gen.IncidentsQueryRequest) (*gen.IncidentsQueryResponse, error) {
+	m.incidentsRequests = append(m.incidentsRequests, req)
+	if m.queryIncidentsErr != nil {
+		return nil, m.queryIncidentsErr
+	}
+	return m.incidentsResponse, nil
+}
+
+func (m *MockAlertIncidentService) UpdateIncident(_ context.Context, _ string, _ gen.IncidentPutRequest) (*gen.IncidentPutResponse, error) {
+	return &gen.IncidentPutResponse{}, nil
+}
+
+func (m *MockAlertIncidentService) IncidentScope(_ context.Context, _ string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
+func (m *MockAlertIncidentService) lastAlertsRequest() *gen.AlertsQueryRequest {
+	if len(m.alertsRequests) == 0 {
+		return nil
+	}
+	return &m.alertsRequests[len(m.alertsRequests)-1]
+}
+
+func (m *MockAlertIncidentService) lastIncidentsRequest() *gen.IncidentsQueryRequest {
+	if len(m.incidentsRequests) == 0 {
+		return nil
+	}
+	return &m.incidentsRequests[len(m.incidentsRequests)-1]
+}
+
+func (m *MockAlertIncidentService) reset() {
+	m.alertsRequests = nil
+	m.incidentsRequests = nil
+}
+
+type MockFinOpsQuerier struct {
+	costsRequests           []*types.CostQueryRequest
+	recommendationsRequests []*types.RecommendationQueryRequest
+	costsResponse           any
+	recommendationsResponse any
+	getCostsErr             error
+	getRecommendationsErr   error
+}
+
+func NewMockFinOpsQuerier() *MockFinOpsQuerier {
+	return &MockFinOpsQuerier{
+		costsResponse:           map[string]any{"items": []any{}},
+		recommendationsResponse: map[string]any{"items": []any{}},
+	}
+}
+
+func (m *MockFinOpsQuerier) GetComponentCosts(_ context.Context, req *types.CostQueryRequest) (any, error) {
+	m.costsRequests = append(m.costsRequests, req)
+	if m.getCostsErr != nil {
+		return nil, m.getCostsErr
+	}
+	return m.costsResponse, nil
+}
+
+func (m *MockFinOpsQuerier) GetRecommendations(_ context.Context, req *types.RecommendationQueryRequest) (any, error) {
+	m.recommendationsRequests = append(m.recommendationsRequests, req)
+	if m.getRecommendationsErr != nil {
+		return nil, m.getRecommendationsErr
+	}
+	return m.recommendationsResponse, nil
+}
+
+func (m *MockFinOpsQuerier) lastCostsRequest() *types.CostQueryRequest {
+	if len(m.costsRequests) == 0 {
+		return nil
+	}
+	return m.costsRequests[len(m.costsRequests)-1]
+}
+
+func (m *MockFinOpsQuerier) lastRecommendationsRequest() *types.RecommendationQueryRequest {
+	if len(m.recommendationsRequests) == 0 {
+		return nil
+	}
+	return m.recommendationsRequests[len(m.recommendationsRequests)-1]
+}
+
+func (m *MockFinOpsQuerier) reset() {
+	m.costsRequests = nil
+	m.recommendationsRequests = nil
+}
+
+type MockDeliveryInsightsService struct {
+	doraMetricsRequests     []gen.DoraMetricsQueryRequest
+	doraDeploymentsRequests []gen.DoraDeploymentsQueryRequest
+	doraMetricsResponse     *gen.DoraMetricsQueryResponse
+	doraDeploymentsResponse *gen.DoraDeploymentsQueryResponse
+	queryDoraMetricsErr     error
+	queryDoraDeploymentsErr error
+}
+
+func NewMockDeliveryInsightsService() *MockDeliveryInsightsService {
+	return &MockDeliveryInsightsService{
+		doraMetricsResponse:     &gen.DoraMetricsQueryResponse{},
+		doraDeploymentsResponse: &gen.DoraDeploymentsQueryResponse{},
+	}
+}
+
+func (m *MockDeliveryInsightsService) QueryDoraMetrics(
+	_ context.Context, req gen.DoraMetricsQueryRequest,
+) (*gen.DoraMetricsQueryResponse, error) {
+	m.doraMetricsRequests = append(m.doraMetricsRequests, req)
+	if m.queryDoraMetricsErr != nil {
+		return nil, m.queryDoraMetricsErr
+	}
+	return m.doraMetricsResponse, nil
+}
+
+func (m *MockDeliveryInsightsService) QueryDoraDeployments(
+	_ context.Context, req gen.DoraDeploymentsQueryRequest,
+) (*gen.DoraDeploymentsQueryResponse, error) {
+	m.doraDeploymentsRequests = append(m.doraDeploymentsRequests, req)
+	if m.queryDoraDeploymentsErr != nil {
+		return nil, m.queryDoraDeploymentsErr
+	}
+	return m.doraDeploymentsResponse, nil
+}
+
+func (m *MockDeliveryInsightsService) lastDoraMetricsRequest() *gen.DoraMetricsQueryRequest {
+	if len(m.doraMetricsRequests) == 0 {
+		return nil
+	}
+	return &m.doraMetricsRequests[len(m.doraMetricsRequests)-1]
+}
+
+func (m *MockDeliveryInsightsService) lastDoraDeploymentsRequest() *gen.DoraDeploymentsQueryRequest {
+	if len(m.doraDeploymentsRequests) == 0 {
+		return nil
+	}
+	return &m.doraDeploymentsRequests[len(m.doraDeploymentsRequests)-1]
+}
+
+func (m *MockDeliveryInsightsService) reset() {
+	m.doraMetricsRequests = nil
+	m.doraDeploymentsRequests = nil
+}
+
+// ---- Test harness ----
+
+type testServices struct {
+	logs            *MockLogsQuerier
+	platformLogs    *MockPlatformLogsQuerier
+	events          *MockEventsQuerier
+	metrics         *MockMetricsQuerier
+	traces          *MockTracesQuerier
+	alertsIncidents *MockAlertIncidentService
+	finops          *MockFinOpsQuerier
+	auditLogs       *MockAuditLogsQuerier
+	insights        *MockDeliveryInsightsService
+}
+
+func newTestServices() *testServices {
+	return &testServices{
+		logs:            NewMockLogsQuerier(),
+		platformLogs:    NewMockPlatformLogsQuerier(),
+		events:          NewMockEventsQuerier(),
+		metrics:         NewMockMetricsQuerier(),
+		traces:          NewMockTracesQuerier(),
+		alertsIncidents: NewMockAlertIncidentService(),
+		finops:          NewMockFinOpsQuerier(),
+		auditLogs:       NewMockAuditLogsQuerier(),
+		insights:        NewMockDeliveryInsightsService(),
+	}
+}
+
+func (s *testServices) resetAll() {
+	s.logs.reset()
+	s.platformLogs.reset()
+	s.events.reset()
+	s.metrics.reset()
+	s.traces.reset()
+	s.alertsIncidents.reset()
+	s.finops.reset()
+	s.auditLogs.reset()
+	s.insights.reset()
+}
+
+func buildMCPHandler(svcs *testServices) (*MCPHandler, error) {
+	logger := slog.Default()
+	healthSvc, err := service.NewHealthService(logger)
+	if err != nil {
+		return nil, err
+	}
+	return NewMCPHandler(healthSvc, svcs.logs, svcs.platformLogs, svcs.events, svcs.metrics, svcs.alertsIncidents,
+		svcs.traces, svcs.finops, svcs.auditLogs, svcs.insights, logger)
+}
+
+func setupTestServer(t *testing.T) (*mcpsdk.ClientSession, *testServices) {
+	t.Helper()
+
+	svcs := newTestServices()
+	handler, err := buildMCPHandler(svcs)
+	require.NoError(t, err, "Failed to build MCPHandler")
+
+	server := mcpsdk.NewServer(&mcpsdk.Implementation{
+		Name:    "test-openchoreo-observer",
+		Version: "1.0.0",
+	}, nil)
+
+	registerTools(server, handler)
+
+	ctx := context.Background()
+	clientTransport, serverTransport := mcpsdk.NewInMemoryTransports()
+
+	_, err = server.Connect(ctx, serverTransport, nil)
+	require.NoError(t, err, "Failed to connect server")
+
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{
+		Name:    "test-client",
+		Version: "1.0.0",
+	}, nil)
+
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	require.NoError(t, err, "Failed to connect client")
+
+	return clientSession, svcs
+}
+
+// ---- Tool test specifications ----
+
+type toolTestSpec struct {
+	name string
+
+	// Description validation
+	descriptionKeywords []string
+	descriptionMinLen   int
+
+	// Schema validation
+	requiredParams []string
+	optionalParams []string
+
+	// Parameter wiring test
+	testArgs     map[string]any
+	validateCall func(t *testing.T, svcs *testServices)
+}
+
+var allToolSpecs = []toolTestSpec{
+	{
+		name:                "query_component_logs",
+		descriptionKeywords: []string{"component", "logs"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "search_phrase", "log_levels", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":     testNamespace,
+			"project":       testProject,
+			"component":     testComponent,
+			"environment":   testEnvironment,
+			"start_time":    testStartTime,
+			"end_time":      testEndTime,
+			"search_phrase": "error",
+			"log_levels":    []any{logLevelError, logLevelWarn},
+			"limit":         50,
+			"sort_order":    sortOrderAsc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.logs.lastRequest()
+			require.NotNil(t, req, "Expected QueryLogs to be called")
+			require.NotNil(t, req.SearchScope)
+			require.NotNil(t, req.SearchScope.Component)
+			scope := req.SearchScope.Component
+			assert.Equal(t, testNamespace, scope.Namespace)
+			assert.Equal(t, testProject, scope.Project)
+			assert.Equal(t, testComponent, scope.Component)
+			assert.Equal(t, testEnvironment, scope.Environment)
+			assert.Equal(t, testStartTime, req.StartTime)
+			assert.Equal(t, testEndTime, req.EndTime)
+			assert.Equal(t, "error", req.SearchPhrase)
+			if diff := cmp.Diff([]string{logLevelError, logLevelWarn}, req.LogLevels); diff != "" {
+				t.Errorf("log_levels mismatch (-want +got):\n%s", diff)
+			}
+			assert.Equal(t, 50, req.Limit)
+			assert.Equal(t, sortOrderAsc, req.SortOrder)
+		},
+	},
+	{
+		name:                "query_workflow_logs",
+		descriptionKeywords: []string{"workflow", "logs"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"workflow_run_name", "task_name", "search_phrase", "log_levels", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":         testNamespace,
+			"workflow_run_name": "my-workflow-run",
+			"task_name":         "build-step",
+			"start_time":        testStartTime,
+			"end_time":          testEndTime,
+			"search_phrase":     "failed",
+			"log_levels":        []any{logLevelError},
+			"limit":             75,
+			"sort_order":        sortOrderDesc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.logs.lastRequest()
+			require.NotNil(t, req, "Expected QueryLogs to be called")
+			require.NotNil(t, req.SearchScope)
+			require.NotNil(t, req.SearchScope.Workflow)
+			scope := req.SearchScope.Workflow
+			assert.Equal(t, testNamespace, scope.Namespace)
+			assert.Equal(t, "my-workflow-run", scope.WorkflowRunName)
+			assert.Equal(t, "build-step", scope.TaskName)
+			assert.Equal(t, "failed", req.SearchPhrase)
+			if diff := cmp.Diff([]string{logLevelError}, req.LogLevels); diff != "" {
+				t.Errorf("log_levels mismatch (-want +got):\n%s", diff)
+			}
+			assert.Equal(t, 75, req.Limit)
+			assert.Equal(t, sortOrderDesc, req.SortOrder)
+		},
+	},
+	{
+		name:                "query_platform_logs",
+		descriptionKeywords: []string{"platform", "control plane"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"start_time", "end_time"},
+		optionalParams: []string{
+			"cluster_instance", "kubernetes_namespace", "pod_name", "container_name", "labels",
+			"search_phrase", "log_levels", "limit", "sort_order", "include_sources", "max_sources",
+		},
+		testArgs: map[string]any{
+			"cluster_instance":     []any{testClusterInstance},
+			"kubernetes_namespace": []any{testK8sNamespace},
+			"pod_name":             []any{testPodName},
+			"container_name":       []any{testContainerName},
+			"labels":               testLabelSelector,
+			"start_time":           testStartTime,
+			"end_time":             testEndTime,
+			"search_phrase":        "reconcile",
+			"log_levels":           []any{logLevelError},
+			"limit":                50,
+			"sort_order":           sortOrderAsc,
+			"include_sources":      []any{"pod_name"},
+			"max_sources":          5,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.platformLogs.lastRequest()
+			require.NotNil(t, req, "Expected QueryPlatformLogs to be called")
+			if diff := cmp.Diff([]string{testClusterInstance}, req.ClusterInstances); diff != "" {
+				t.Errorf("cluster_instance mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff([]string{testK8sNamespace}, req.Namespaces); diff != "" {
+				t.Errorf("kubernetes_namespace mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff([]string{testPodName}, req.PodNames); diff != "" {
+				t.Errorf("pod_name mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff([]string{testContainerName}, req.ContainerNames); diff != "" {
+				t.Errorf("container_name mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(map[string]string{"openchoreo.dev/plane": "controlplane"}, req.Labels); diff != "" {
+				t.Errorf("labels mismatch (-want +got):\n%s", diff)
+			}
+			assert.Equal(t, testStartTime, req.StartTime)
+			assert.Equal(t, testEndTime, req.EndTime)
+			assert.Equal(t, "reconcile", req.SearchPhrase)
+			if diff := cmp.Diff([]string{logLevelError}, req.LogLevels); diff != "" {
+				t.Errorf("log_levels mismatch (-want +got):\n%s", diff)
+			}
+			assert.Equal(t, 50, req.Limit)
+			assert.Equal(t, sortOrderAsc, req.SortOrder)
+
+			require.Len(t, svcs.platformLogs.valuesRequests, 1, "include_sources should trigger one aggregation")
+			values := svcs.platformLogs.valuesRequests[0]
+			assert.Equal(t, "podName", values.Filter)
+			assert.Equal(t, 5, values.MaxValues)
+		},
+	},
+	{
+		name:                "query_component_events",
+		descriptionKeywords: []string{"component", "events"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"limit":       50,
+			"sort_order":  sortOrderAsc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.events.lastRequest()
+			require.NotNil(t, req, "Expected QueryEvents to be called")
+			require.NotNil(t, req.SearchScope)
+			require.NotNil(t, req.SearchScope.Component)
+			scope := req.SearchScope.Component
+			assert.Equal(t, testNamespace, scope.Namespace)
+			assert.Equal(t, testProject, scope.Project)
+			assert.Equal(t, testComponent, scope.Component)
+			assert.Equal(t, testEnvironment, scope.Environment)
+			assert.Equal(t, testStartTime, req.StartTime)
+			assert.Equal(t, testEndTime, req.EndTime)
+			assert.Equal(t, 50, req.Limit)
+			assert.Equal(t, sortOrderAsc, req.SortOrder)
+		},
+	},
+	{
+		name:                "query_workflow_events",
+		descriptionKeywords: []string{"workflow", "events"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"workflow_run_name", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":         testNamespace,
+			"workflow_run_name": "my-workflow-run",
+			"start_time":        testStartTime,
+			"end_time":          testEndTime,
+			"limit":             75,
+			"sort_order":        sortOrderDesc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.events.lastRequest()
+			require.NotNil(t, req, "Expected QueryEvents to be called")
+			require.NotNil(t, req.SearchScope)
+			require.NotNil(t, req.SearchScope.Workflow)
+			scope := req.SearchScope.Workflow
+			assert.Equal(t, testNamespace, scope.Namespace)
+			assert.Equal(t, "my-workflow-run", scope.WorkflowRunName)
+			assert.Equal(t, 75, req.Limit)
+			assert.Equal(t, sortOrderDesc, req.SortOrder)
+		},
+	},
+	{
+		name:                "query_resource_metrics",
+		descriptionKeywords: []string{"resource", "metrics"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "step"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"step":        "5m",
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.metrics.lastRequest()
+			require.NotNil(t, req, "Expected QueryMetrics to be called")
+			assert.Equal(t, types.MetricTypeResource, req.Metric)
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			assert.Equal(t, testProject, req.SearchScope.Project)
+			assert.Equal(t, testComponent, req.SearchScope.Component)
+			assert.Equal(t, testEnvironment, req.SearchScope.Environment)
+			assert.Equal(t, testStartTime, req.StartTime)
+			assert.Equal(t, testEndTime, req.EndTime)
+			require.NotNil(t, req.Step)
+			assert.Equal(t, "5m", *req.Step)
+		},
+	},
+	{
+		name:                "query_http_metrics",
+		descriptionKeywords: []string{"http", "metrics"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "step"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"step":        "1h",
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.metrics.lastRequest()
+			require.NotNil(t, req, "Expected QueryMetrics to be called")
+			assert.Equal(t, types.MetricTypeHTTP, req.Metric)
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			require.NotNil(t, req.Step)
+			assert.Equal(t, "1h", *req.Step)
+		},
+	},
+	{
+		name:                "query_traces",
+		descriptionKeywords: []string{"traces"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"limit":       25,
+			"sort_order":  sortOrderAsc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.traces.lastTracesRequest()
+			require.NotNil(t, req, "Expected QueryTraces to be called")
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			assert.Equal(t, testProject, req.SearchScope.Project)
+			assert.Equal(t, testComponent, req.SearchScope.Component)
+			assert.Equal(t, testEnvironment, req.SearchScope.Environment)
+			expectedStart, _ := time.Parse(time.RFC3339, testStartTime)
+			assert.True(t, req.StartTime.Equal(expectedStart), "Expected start_time %v, got %v", expectedStart, req.StartTime)
+			expectedEnd, _ := time.Parse(time.RFC3339, testEndTime)
+			assert.True(t, req.EndTime.Equal(expectedEnd), "Expected end_time %v, got %v", expectedEnd, req.EndTime)
+			assert.Equal(t, 25, req.Limit)
+			assert.Equal(t, sortOrderAsc, req.SortOrder)
+		},
+	},
+	{
+		name:                "query_trace_spans",
+		descriptionKeywords: []string{"span", "trace"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"trace_id", "namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"trace_id":    testTraceID,
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"limit":       200,
+			"sort_order":  sortOrderDesc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.traces.lastSpansRequest()
+			require.NotNil(t, req, "Expected QuerySpans to be called")
+			require.NotEmpty(t, svcs.traces.spanDetailsTraceIDs, "Expected trace ID to be recorded")
+			lastTraceID := svcs.traces.spanDetailsTraceIDs[len(svcs.traces.spanDetailsTraceIDs)-1]
+			assert.Equal(t, testTraceID, lastTraceID)
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			assert.Equal(t, 200, req.Limit)
+			assert.Equal(t, sortOrderDesc, req.SortOrder)
+		},
+	},
+	{
+		name:                "get_span_details",
+		descriptionKeywords: []string{"span"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"trace_id", "span_id"},
+		optionalParams:      []string{},
+		testArgs: map[string]any{
+			"trace_id": testTraceID,
+			"span_id":  testSpanID,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			require.NotEmpty(t, svcs.traces.spanDetailsTraceIDs, "Expected GetSpanDetails to be called")
+			require.NotEmpty(t, svcs.traces.spanDetailsSpanIDs, "Expected GetSpanDetails to be called")
+			lastIdx := len(svcs.traces.spanDetailsSpanIDs) - 1
+			assert.Equal(t, testTraceID, svcs.traces.spanDetailsTraceIDs[lastIdx])
+			assert.Equal(t, testSpanID, svcs.traces.spanDetailsSpanIDs[lastIdx])
+		},
+	},
+	{
+		name:                "query_alerts",
+		descriptionKeywords: []string{"alert"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"limit":       50,
+			"sort_order":  sortOrderAsc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.alertsIncidents.lastAlertsRequest()
+			require.NotNil(t, req, "Expected QueryAlerts to be called")
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			require.NotNil(t, req.SearchScope.Project)
+			assert.Equal(t, testProject, *req.SearchScope.Project)
+			require.NotNil(t, req.SearchScope.Component)
+			assert.Equal(t, testComponent, *req.SearchScope.Component)
+			require.NotNil(t, req.SearchScope.Environment)
+			assert.Equal(t, testEnvironment, *req.SearchScope.Environment)
+			expectedStart, _ := time.Parse(time.RFC3339, testStartTime)
+			assert.True(t, req.StartTime.Equal(expectedStart), "Expected start_time %v, got %v", expectedStart, req.StartTime)
+			expectedEnd, _ := time.Parse(time.RFC3339, testEndTime)
+			assert.True(t, req.EndTime.Equal(expectedEnd), "Expected end_time %v, got %v", expectedEnd, req.EndTime)
+			require.NotNil(t, req.Limit)
+			assert.Equal(t, 50, *req.Limit)
+			require.NotNil(t, req.SortOrder)
+			assert.Equal(t, sortOrderAsc, string(*req.SortOrder))
+		},
+	},
+	{
+		name:                "query_incidents",
+		descriptionKeywords: []string{"incident"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"limit":       25,
+			"sort_order":  sortOrderDesc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.alertsIncidents.lastIncidentsRequest()
+			require.NotNil(t, req, "Expected QueryIncidents to be called")
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			require.NotNil(t, req.SearchScope.Project)
+			assert.Equal(t, testProject, *req.SearchScope.Project)
+			require.NotNil(t, req.SearchScope.Component)
+			assert.Equal(t, testComponent, *req.SearchScope.Component)
+			require.NotNil(t, req.SearchScope.Environment)
+			assert.Equal(t, testEnvironment, *req.SearchScope.Environment)
+			expectedStart, _ := time.Parse(time.RFC3339, testStartTime)
+			assert.True(t, req.StartTime.Equal(expectedStart), "Expected start_time %v, got %v", expectedStart, req.StartTime)
+			expectedEnd, _ := time.Parse(time.RFC3339, testEndTime)
+			assert.True(t, req.EndTime.Equal(expectedEnd), "Expected end_time %v, got %v", expectedEnd, req.EndTime)
+			require.NotNil(t, req.Limit)
+			assert.Equal(t, 25, *req.Limit)
+			require.NotNil(t, req.SortOrder)
+			assert.Equal(t, sortOrderDesc, string(*req.SortOrder))
+		},
+	},
+	{
+		name:                "query_costs",
+		descriptionKeywords: []string{"cost"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "environment", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "granularity"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"environment": testEnvironment,
+			"project":     testProject,
+			"component":   testComponent,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"granularity": "1d",
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.finops.lastCostsRequest()
+			require.NotNil(t, req, "Expected GetComponentCosts to be called")
+			assert.Equal(t, testNamespace, req.Namespace)
+			assert.Equal(t, testEnvironment, req.Environment)
+			assert.Equal(t, testProject, req.Project)
+			assert.Equal(t, testComponent, req.Component)
+			assert.Equal(t, testStartTime, req.StartTime)
+			assert.Equal(t, testEndTime, req.EndTime)
+			assert.Equal(t, "1d", req.Granularity)
+		},
+	},
+	{
+		name:                "query_recommendations",
+		descriptionKeywords: []string{"recommendation"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "environment", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"environment": testEnvironment,
+			"project":     testProject,
+			"component":   testComponent,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.finops.lastRecommendationsRequest()
+			require.NotNil(t, req, "Expected GetRecommendations to be called")
+			assert.Equal(t, testNamespace, req.Namespace)
+			assert.Equal(t, testEnvironment, req.Environment)
+			assert.Equal(t, testProject, req.Project)
+			assert.Equal(t, testComponent, req.Component)
+			assert.Equal(t, testStartTime, req.StartTime)
+			assert.Equal(t, testEndTime, req.EndTime)
+		},
+	},
+	{
+		name:                "query_audit_logs",
+		descriptionKeywords: []string{"audit"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"start_time", "end_time"},
+		// Every filter, so a renamed or dropped argument fails here rather than
+		// silently becoming a filter nobody can reach.
+		optionalParams: []string{
+			"actor_id", "actor_type", "actor_issuer", "actor_session_id", "actor_entitlements",
+			"resource_type", "resource_namespace", "resource_environment", "resource_project",
+			"resource_component", "resource_resource", "resource_name",
+			"action", "category", "result", "producer", "surface", "operation_id", "request_id",
+			"event_id", "source_ip", "user_agent",
+			"search_phrase", "limit", "sort_order", "include_timeline", "timeline_interval",
+		},
+		testArgs: map[string]any{
+			"start_time":           testStartTime,
+			"end_time":             testEndTime,
+			"actor_id":             []string{"alice@example.com"},
+			"actor_type":           []string{"user"},
+			"actor_issuer":         []string{"https://idp.example.com"},
+			"actor_session_id":     []string{"sid-1"},
+			"actor_entitlements":   []string{"platform-engineer"},
+			"resource_type":        []string{"project"},
+			"resource_namespace":   []string{testNamespace},
+			"resource_environment": []string{"test-namespace/development"},
+			"resource_project":     []string{testProject},
+			"resource_component":   []string{testComponent},
+			"resource_resource":    []string{"orders-db"},
+			"resource_name":        []string{"my-project"},
+			"action":               []string{"delete_component"},
+			"category":             []string{"management"},
+			"result":               []string{"denied"},
+			"producer":             []string{"openchoreo-api"},
+			"surface":              []string{"rest"},
+			"operation_id":         []string{"CreateProject"},
+			"request_id":           []string{"req-1"},
+			"event_id":             []string{"evt-1"},
+			"source_ip":            []string{"10.0.0.1"},
+			"user_agent":           []string{"occ/1.0"},
+			"search_phrase":        "failed",
+			"limit":                25,
+			"sort_order":           sortOrderAsc,
+			"include_timeline":     true,
+			"timeline_interval":    "15m",
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.auditLogs.lastRequest()
+			require.NotNil(t, req, "Expected QueryAuditLogs to be called")
+			assert.Equal(t, testStartTime, req.StartTime)
+			assert.Equal(t, testEndTime, req.EndTime)
+			assert.Equal(t, []string{"alice@example.com"}, req.Actor.IDs)
+			assert.Equal(t, []string{"user"}, req.Actor.Types)
+			assert.Equal(t, []string{"https://idp.example.com"}, req.Actor.Issuers)
+			assert.Equal(t, []string{"sid-1"}, req.Actor.SessionIDs)
+			assert.Equal(t, []string{"platform-engineer"}, req.Actor.Entitlements)
+			assert.Equal(t, []string{"project"}, req.Resource.Types)
+			assert.Equal(t, []string{testNamespace}, req.Resource.Namespaces)
+			assert.Equal(t, []string{"test-namespace/development"}, req.Resource.Environments)
+			assert.Equal(t, []string{testProject}, req.Resource.Projects)
+			assert.Equal(t, []string{testComponent}, req.Resource.Components)
+			assert.Equal(t, []string{"orders-db"}, req.Resource.Resources)
+			assert.Equal(t, []string{"my-project"}, req.Resource.Names)
+			assert.Equal(t, []string{"delete_component"}, req.Actions)
+			assert.Equal(t, []string{"management"}, req.Categories)
+			assert.Equal(t, []string{"denied"}, req.Results)
+			assert.Equal(t, []string{"openchoreo-api"}, req.Producers)
+			assert.Equal(t, []string{"rest"}, req.Surfaces)
+			assert.Equal(t, []string{"CreateProject"}, req.OperationIDs)
+			assert.Equal(t, []string{"req-1"}, req.RequestIDs)
+			assert.Equal(t, []string{"evt-1"}, req.EventIDs)
+			assert.Equal(t, []string{"10.0.0.1"}, req.SourceIPs)
+			assert.Equal(t, []string{"occ/1.0"}, req.UserAgents)
+			assert.Equal(t, "failed", req.SearchPhrase)
+			assert.Equal(t, 25, req.Limit)
+			assert.Equal(t, sortOrderAsc, req.SortOrder)
+			assert.True(t, req.IncludeTimeline)
+			assert.Equal(t, "15m", req.TimelineInterval)
+		},
+	},
+	{
+		name:                "query_dora_metrics",
+		descriptionKeywords: []string{"dora", "lead time"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "granularity", "metrics"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"granularity": "weekly",
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"metrics":     []any{"leadTime", "mttr"},
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.insights.lastDoraMetricsRequest()
+			require.NotNil(t, req, "Expected QueryDoraMetrics to be called")
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			require.NotNil(t, req.SearchScope.Project)
+			assert.Equal(t, testProject, *req.SearchScope.Project)
+			require.NotNil(t, req.SearchScope.Component)
+			assert.Equal(t, testComponent, *req.SearchScope.Component)
+			require.NotNil(t, req.SearchScope.Environment)
+			assert.Equal(t, testEnvironment, *req.SearchScope.Environment)
+			require.NotNil(t, req.Granularity)
+			assert.Equal(t, "weekly", string(*req.Granularity))
+			expectedStart, _ := time.Parse(time.RFC3339, testStartTime)
+			assert.True(t, req.StartTime.Equal(expectedStart), "Expected start_time %v, got %v", expectedStart, req.StartTime)
+			expectedEnd, _ := time.Parse(time.RFC3339, testEndTime)
+			assert.True(t, req.EndTime.Equal(expectedEnd), "Expected end_time %v, got %v", expectedEnd, req.EndTime)
+			require.NotNil(t, req.Metrics)
+			require.Len(t, *req.Metrics, 2)
+			assert.Equal(t, "leadTime", string((*req.Metrics)[0]))
+			assert.Equal(t, "mttr", string((*req.Metrics)[1]))
+		},
+	},
+	{
+		name:                "query_dora_deployments",
+		descriptionKeywords: []string{"deployment", "outcome"},
+		descriptionMinLen:   20,
+		requiredParams:      []string{"namespace", "start_time", "end_time"},
+		optionalParams:      []string{"project", "component", "environment", "limit", "sort_order"},
+		testArgs: map[string]any{
+			"namespace":   testNamespace,
+			"project":     testProject,
+			"component":   testComponent,
+			"environment": testEnvironment,
+			"start_time":  testStartTime,
+			"end_time":    testEndTime,
+			"limit":       25,
+			"sort_order":  sortOrderAsc,
+		},
+		validateCall: func(t *testing.T, svcs *testServices) {
+			t.Helper()
+			req := svcs.insights.lastDoraDeploymentsRequest()
+			require.NotNil(t, req, "Expected QueryDoraDeployments to be called")
+			assert.Equal(t, testNamespace, req.SearchScope.Namespace)
+			require.NotNil(t, req.SearchScope.Project)
+			assert.Equal(t, testProject, *req.SearchScope.Project)
+			require.NotNil(t, req.SearchScope.Component)
+			assert.Equal(t, testComponent, *req.SearchScope.Component)
+			require.NotNil(t, req.SearchScope.Environment)
+			assert.Equal(t, testEnvironment, *req.SearchScope.Environment)
+			expectedStart, _ := time.Parse(time.RFC3339, testStartTime)
+			assert.True(t, req.StartTime.Equal(expectedStart), "Expected start_time %v, got %v", expectedStart, req.StartTime)
+			expectedEnd, _ := time.Parse(time.RFC3339, testEndTime)
+			assert.True(t, req.EndTime.Equal(expectedEnd), "Expected end_time %v, got %v", expectedEnd, req.EndTime)
+			// The page cap and ordering reach the service: this is the list behind
+			// the numbers, so both are the point of asking.
+			require.NotNil(t, req.Limit)
+			assert.Equal(t, 25, *req.Limit)
+			require.NotNil(t, req.SortOrder)
+			assert.Equal(t, sortOrderAsc, string(*req.SortOrder))
+		},
+	},
+}
+
+// ---- Tests ----
+
+// TestNewMCPHandlerValidation verifies that nil services are rejected.
+func TestNewMCPHandlerValidation(t *testing.T) {
+	logger := slog.Default()
+	healthSvc, _ := service.NewHealthService(logger)
+	alertIncidentSvc := NewMockAlertIncidentService()
+	deliveryInsightsSvc := NewMockDeliveryInsightsService()
+	logs := NewMockLogsQuerier()
+	platformLogs := NewMockPlatformLogsQuerier()
+	events := NewMockEventsQuerier()
+	metrics := NewMockMetricsQuerier()
+	traces := NewMockTracesQuerier()
+	finops := NewMockFinOpsQuerier()
+	auditLogs := NewMockAuditLogsQuerier()
+
+	tests := []struct {
+		name                 string
+		health               *service.HealthService
+		logs                 service.LogsQuerier
+		platformLogs         service.PlatformLogsQuerier
+		events               service.EventsQuerier
+		metrics              service.MetricsQuerier
+		alertIncidentService service.AlertIncidentService
+		traces               service.TracesQuerier
+		finops               service.FinOpsQuerier
+		auditLogs            service.AuditLogsQuerier
+		insights             service.DeliveryInsightsService
+		log                  *slog.Logger
+	}{
+		{"nil healthService", nil, logs, platformLogs, events, metrics, alertIncidentSvc, traces, finops, auditLogs, deliveryInsightsSvc, logger},
+		{"nil logsService", healthSvc, nil, platformLogs, events, metrics, alertIncidentSvc, traces, finops, auditLogs, deliveryInsightsSvc, logger},
+		{"nil platformLogsService", healthSvc, logs, nil, events, metrics, alertIncidentSvc, traces, finops, auditLogs, deliveryInsightsSvc, logger},
+		{"nil eventsService", healthSvc, logs, platformLogs, nil, metrics, alertIncidentSvc, traces, finops, auditLogs, deliveryInsightsSvc, logger},
+		{"nil metricsService", healthSvc, logs, platformLogs, events, nil, alertIncidentSvc, traces, finops, auditLogs, deliveryInsightsSvc, logger},
+		{"nil alertIncidentService", healthSvc, logs, platformLogs, events, metrics, nil, traces, finops, auditLogs, deliveryInsightsSvc, logger},
+		{"nil tracesService", healthSvc, logs, platformLogs, events, metrics, alertIncidentSvc, nil, finops, auditLogs, deliveryInsightsSvc, logger},
+		{"nil finopsService", healthSvc, logs, platformLogs, events, metrics, alertIncidentSvc, traces, nil, auditLogs, deliveryInsightsSvc, logger},
+		{"nil auditLogsService", healthSvc, logs, platformLogs, events, metrics, alertIncidentSvc, traces, finops, nil, deliveryInsightsSvc, logger},
+		{"nil deliveryInsightsService", healthSvc, logs, platformLogs, events, metrics, alertIncidentSvc, traces, finops, auditLogs, nil, logger},
+		{"nil logger", healthSvc, logs, platformLogs, events, metrics, alertIncidentSvc, traces, finops, auditLogs, deliveryInsightsSvc, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewMCPHandler(tt.health, tt.logs, tt.platformLogs, tt.events, tt.metrics,
+				tt.alertIncidentService, tt.traces, tt.finops, tt.auditLogs, tt.insights, tt.log)
+			require.Error(t, err, "Expected error for %s", tt.name)
+		})
+	}
+}
+
+// TestToolRegistration verifies that all expected tools are registered.
+func TestToolRegistration(t *testing.T) {
+	clientSession, _ := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+	toolsResult, err := clientSession.ListTools(ctx, nil)
+	require.NoError(t, err, "Failed to list tools")
+
+	expectedTools := make(map[string]bool)
+	for _, spec := range allToolSpecs {
+		expectedTools[spec.name] = true
+	}
+
+	registeredTools := make(map[string]bool)
+	for _, tool := range toolsResult.Tools {
+		registeredTools[tool.Name] = true
+		assert.True(t, expectedTools[tool.Name], "Unexpected tool %q found in registered tools", tool.Name)
+	}
+
+	for expected := range expectedTools {
+		assert.True(t, registeredTools[expected], "Expected tool %q not found in registered tools", expected)
+	}
+
+	assert.Len(t, toolsResult.Tools, len(expectedTools))
+}
+
+// TestToolDescriptions verifies that tool descriptions are meaningful and distinguishable.
+func TestToolDescriptions(t *testing.T) {
+	clientSession, _ := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+	toolsResult, err := clientSession.ListTools(ctx, nil)
+	require.NoError(t, err, "Failed to list tools")
+
+	toolsByName := make(map[string]*mcpsdk.Tool)
+	for _, tool := range toolsResult.Tools {
+		toolsByName[tool.Name] = tool
+	}
+
+	for _, spec := range allToolSpecs {
+		t.Run(spec.name, func(t *testing.T) {
+			tool, exists := toolsByName[spec.name]
+			require.True(t, exists, "Tool %q not found", spec.name)
+
+			desc := strings.ToLower(tool.Description)
+
+			assert.GreaterOrEqual(t, len(desc), spec.descriptionMinLen,
+				"Description too short: got %d chars, want at least %d", len(desc), spec.descriptionMinLen)
+
+			for _, word := range spec.descriptionKeywords {
+				assert.Contains(t, desc, strings.ToLower(word),
+					"Description missing required keyword %q: %s", word, tool.Description)
+			}
+		})
+	}
+
+	// Ensure descriptions are unique across all tools
+	descriptions := make(map[string]string)
+	for _, tool := range toolsResult.Tools {
+		if existingTool, exists := descriptions[tool.Description]; exists {
+			t.Errorf("Duplicate description found: %q used by both %q and %q",
+				tool.Description, tool.Name, existingTool)
+		}
+		descriptions[tool.Description] = tool.Name
+	}
+}
+
+// TestToolSchemas verifies that tool input schemas have correct parameters defined.
+func TestToolSchemas(t *testing.T) {
+	clientSession, _ := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+	toolsResult, err := clientSession.ListTools(ctx, nil)
+	require.NoError(t, err, "Failed to list tools")
+
+	toolsByName := make(map[string]*mcpsdk.Tool)
+	for _, tool := range toolsResult.Tools {
+		toolsByName[tool.Name] = tool
+	}
+
+	for _, spec := range allToolSpecs {
+		t.Run(spec.name, func(t *testing.T) {
+			tool, exists := toolsByName[spec.name]
+			require.True(t, exists, "Tool %q not found", spec.name)
+			require.NotNil(t, tool.InputSchema, "InputSchema is nil")
+
+			schemaMap, ok := tool.InputSchema.(map[string]any)
+			require.True(t, ok, "Expected InputSchema to be map[string]any, got %T", tool.InputSchema)
+
+			schemaType, ok := schemaMap["type"].(string)
+			assert.True(t, ok && schemaType == "object", "Expected schema type 'object', got %v", schemaMap["type"])
+
+			// Check required parameters appear in schema.required
+			if len(spec.requiredParams) > 0 {
+				requiredInSchema := make(map[string]bool)
+				if requiredList, ok := schemaMap["required"].([]any); ok {
+					for _, req := range requiredList {
+						if reqStr, ok := req.(string); ok {
+							requiredInSchema[reqStr] = true
+						}
+					}
+				}
+				for _, param := range spec.requiredParams {
+					assert.True(t, requiredInSchema[param], "Required parameter %q not found in schema.required", param)
+				}
+			}
+
+			// Check all parameters exist in schema.properties
+			allParams := append(append([]string{}, spec.requiredParams...), spec.optionalParams...)
+			if len(allParams) > 0 {
+				properties, ok := schemaMap["properties"].(map[string]any)
+				require.True(t, ok, "Properties is not a map")
+				for _, param := range allParams {
+					_, exists := properties[param]
+					assert.True(t, exists, "Parameter %q not found in schema.properties", param)
+				}
+			}
+		})
+	}
+}
+
+// TestToolParameterWiring verifies that parameters are correctly passed to service methods.
+func TestToolParameterWiring(t *testing.T) {
+	clientSession, svcs := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+
+	for _, spec := range allToolSpecs {
+		t.Run(spec.name, func(t *testing.T) {
+			svcs.resetAll()
+
+			result, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+				Name:      spec.name,
+				Arguments: spec.testArgs,
+			})
+			require.NoError(t, err, "Failed to call tool")
+			require.NotEmpty(t, result.Content, "Expected non-empty result content")
+
+			spec.validateCall(t, svcs)
+		})
+	}
+}
+
+// TestToolResponseFormat verifies that tool responses are valid JSON.
+func TestToolResponseFormat(t *testing.T) {
+	clientSession, _ := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+
+	// Test response format for each tool
+	for _, spec := range allToolSpecs {
+		t.Run(spec.name, func(t *testing.T) {
+			result, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+				Name:      spec.name,
+				Arguments: spec.testArgs,
+			})
+			require.NoError(t, err, "Failed to call tool")
+			require.NotEmpty(t, result.Content, "Expected non-empty result content")
+
+			textContent, ok := result.Content[0].(*mcpsdk.TextContent)
+			require.True(t, ok, "Expected TextContent")
+
+			var data any
+			err = json.Unmarshal([]byte(textContent.Text), &data)
+			assert.NoError(t, err, "Response is not valid JSON: %s", textContent.Text)
+		})
+	}
+}
+
+// TestToolErrorHandling verifies that the MCP SDK validates required parameters.
+func TestToolErrorHandling(t *testing.T) {
+	clientSession, mockHandler := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+
+	var testSpec toolTestSpec
+	for _, spec := range allToolSpecs {
+		if len(spec.requiredParams) > 0 {
+			testSpec = spec
+			break
+		}
+	}
+
+	require.NotEmpty(t, testSpec.name, "No tool with required parameters found in allToolSpecs")
+
+	mockHandler.resetAll()
+
+	result, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      testSpec.name,
+		Arguments: map[string]any{}, // Empty - missing required params
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.IsError, "Expected tool error for %q with missing required parameters", testSpec.name)
+}
+
+// TestMinimalParameterSets verifies that tools work with only required parameters.
+func TestMinimalParameterSets(t *testing.T) {
+	clientSession, svcs := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+
+	minimalTests := []struct {
+		name     string
+		toolName string
+		args     map[string]any
+	}{
+		{
+			name:     "query_component_logs_minimal",
+			toolName: "query_component_logs",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_workflow_logs_minimal",
+			toolName: "query_workflow_logs",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_platform_logs_minimal",
+			toolName: "query_platform_logs",
+			args: map[string]any{
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_resource_metrics_minimal",
+			toolName: "query_resource_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_http_metrics_minimal",
+			toolName: "query_http_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_traces_minimal",
+			toolName: "query_traces",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_trace_spans_minimal",
+			toolName: "query_trace_spans",
+			args: map[string]any{
+				"trace_id":   testTraceID,
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "get_span_details_minimal",
+			toolName: "get_span_details",
+			args: map[string]any{
+				"trace_id": testTraceID,
+				"span_id":  testSpanID,
+			},
+		},
+		{
+			name:     "query_component_events_minimal",
+			toolName: "query_component_events",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_workflow_events_minimal",
+			toolName: "query_workflow_events",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+		{
+			name:     "query_dora_metrics_minimal",
+			toolName: "query_dora_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+		},
+	}
+
+	for _, tt := range minimalTests {
+		t.Run(tt.name, func(t *testing.T) {
+			svcs.resetAll()
+
+			result, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+				Name:      tt.toolName,
+				Arguments: tt.args,
+			})
+			require.NoError(t, err, "Failed to call tool with minimal parameters")
+			require.NotEmpty(t, result.Content, "Expected non-empty result content")
+
+			textContent, ok := result.Content[0].(*mcpsdk.TextContent)
+			require.True(t, ok, "Expected TextContent")
+
+			var data any
+			err = json.Unmarshal([]byte(textContent.Text), &data)
+			assert.NoError(t, err, "Response is not valid JSON")
+		})
+	}
+}
+
+// TestHandlerErrorPropagation verifies that service errors are propagated as MCP errors.
+func TestHandlerErrorPropagation(t *testing.T) {
+	ctx := context.Background()
+
+	newServerWithError := func(t *testing.T, setupErr func(*testServices)) *mcpsdk.ClientSession {
+		t.Helper()
+		svcs := newTestServices()
+		setupErr(svcs)
+
+		handler, err := buildMCPHandler(svcs)
+		require.NoError(t, err, "Failed to build MCPHandler")
+
+		server := mcpsdk.NewServer(&mcpsdk.Implementation{
+			Name:    "test-openchoreo-observer",
+			Version: "1.0.0",
+		}, nil)
+		registerTools(server, handler)
+
+		clientTransport, serverTransport := mcpsdk.NewInMemoryTransports()
+		_, err = server.Connect(ctx, serverTransport, nil)
+		require.NoError(t, err, "Failed to connect server")
+
+		client := mcpsdk.NewClient(&mcpsdk.Implementation{
+			Name:    "test-client",
+			Version: "1.0.0",
+		}, nil)
+
+		session, err := client.Connect(ctx, clientTransport, nil)
+		require.NoError(t, err, "Failed to connect client")
+		return session
+	}
+
+	errorTests := []struct {
+		name     string
+		toolName string
+		args     map[string]any
+		setupErr func(*testServices)
+	}{
+		{
+			name:     "logs_service_error",
+			toolName: "query_component_logs",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.logs.err = errors.New("opensearch unavailable") },
+		},
+		{
+			name:     "workflow_logs_service_error",
+			toolName: "query_workflow_logs",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.logs.err = errors.New("connection refused") },
+		},
+		{
+			name:     "resource_metrics_service_error",
+			toolName: "query_resource_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.metrics.err = errors.New("prometheus unavailable") },
+		},
+		{
+			name:     "http_metrics_service_error",
+			toolName: "query_http_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.metrics.err = errors.New("query timeout") },
+		},
+		{
+			name:     "traces_service_error",
+			toolName: "query_traces",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.traces.queryTracesErr = errors.New("trace service down") },
+		},
+		{
+			name:     "trace_spans_service_error",
+			toolName: "query_trace_spans",
+			args: map[string]any{
+				"trace_id":   testTraceID,
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.traces.querySpansErr = errors.New("span query failed") },
+		},
+		{
+			name:     "span_details_service_error",
+			toolName: "get_span_details",
+			args: map[string]any{
+				"trace_id": testTraceID,
+				"span_id":  testSpanID,
+			},
+			setupErr: func(s *testServices) { s.traces.spanDetailsErr = errors.New("span not found") },
+		},
+		{
+			name:     "alerts_service_error",
+			toolName: "query_alerts",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.alertsIncidents.queryAlertsErr = errors.New("alert store unavailable") },
+		},
+		{
+			name:     "incidents_service_error",
+			toolName: "query_incidents",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) { s.alertsIncidents.queryIncidentsErr = errors.New("incident store unavailable") },
+		},
+		{
+			name:     "dora_metrics_service_error",
+			toolName: "query_dora_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) {
+				s.insights.queryDoraMetricsErr = errors.New("delivery insights store unavailable")
+			},
+		},
+		{
+			name:     "dora_metrics_invalid_start_time",
+			toolName: "query_dora_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": "not-a-time",
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) {}, // error comes from time parsing, not service
+		},
+		{
+			name:     "alerts_invalid_start_time",
+			toolName: "query_alerts",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": "not-a-time",
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) {},
+		},
+		{
+			name:     "incidents_invalid_end_time",
+			toolName: "query_incidents",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   "bad-time-format",
+			},
+			setupErr: func(s *testServices) {},
+		},
+		{
+			name:     "traces_invalid_start_time",
+			toolName: "query_traces",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": "not-a-time",
+				"end_time":   testEndTime,
+			},
+			setupErr: func(s *testServices) {}, // error comes from time parsing, not service
+		},
+		{
+			name:     "trace_spans_invalid_end_time",
+			toolName: "query_trace_spans",
+			args: map[string]any{
+				"trace_id":   testTraceID,
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   "bad-time-format",
+			},
+			setupErr: func(s *testServices) {}, // error comes from time parsing, not service
+		},
+	}
+
+	for _, tt := range errorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := newServerWithError(t, tt.setupErr)
+			defer session.Close()
+
+			result, err := session.CallTool(ctx, &mcpsdk.CallToolParams{
+				Name:      tt.toolName,
+				Arguments: tt.args,
+			})
+
+			// MCP SDK wraps errors in result.IsError rather than returning Go errors
+			assert.True(t, err != nil || (result != nil && result.IsError),
+				"Expected error from handler, got err=%v, result.IsError=%v",
+				err, result != nil && result.IsError)
+		})
+	}
+}
+
+// TestNewHTTPServer verifies that the HTTP server is created correctly.
+func TestNewHTTPServer(t *testing.T) {
+	svcs := newTestServices()
+	handler, err := buildMCPHandler(svcs)
+	require.NoError(t, err, "Failed to build MCPHandler")
+
+	httpHandler, err := NewHTTPServer(handler, newTestAuditOptions(t, io.Discard))
+	require.NoError(t, err)
+
+	require.NotNil(t, httpHandler)
+
+	var _ http.Handler = httpHandler
+}
+
+// TestNewHTTPServerRejectsMisconfiguredAudit pins that the constructor reports
+// a bad audit configuration rather than serving without audit.
+func TestNewHTTPServerRejectsMisconfiguredAudit(t *testing.T) {
+	svcs := newTestServices()
+	handler, err := buildMCPHandler(svcs)
+	require.NoError(t, err, "Failed to build MCPHandler")
+
+	_, err = NewHTTPServer(handler, mcpaudit.MiddlewareOptions{})
+	require.Error(t, err)
+}
+
+// TestOptionalParametersDefaults verifies that optional parameters have sensible defaults.
+func TestOptionalParametersDefaults(t *testing.T) {
+	clientSession, svcs := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		toolName     string
+		args         map[string]any
+		validateCall func(t *testing.T, svcs *testServices)
+	}{
+		{
+			name:     "component_logs_default_limit_and_sort",
+			toolName: "query_component_logs",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.logs.lastRequest()
+				require.NotNil(t, req, "Expected QueryLogs to be called")
+				assert.Equal(t, 100, req.Limit)
+				assert.Equal(t, sortOrderDesc, req.SortOrder)
+				assert.Empty(t, req.LogLevels)
+			},
+		},
+		{
+			name:     "workflow_logs_default_limit_and_sort",
+			toolName: "query_workflow_logs",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.logs.lastRequest()
+				require.NotNil(t, req, "Expected QueryLogs to be called")
+				assert.Equal(t, 100, req.Limit)
+				assert.Equal(t, sortOrderDesc, req.SortOrder)
+			},
+		},
+		{
+			name:     "platform_logs_default_limit_and_sort",
+			toolName: "query_platform_logs",
+			args: map[string]any{
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.platformLogs.lastRequest()
+				require.NotNil(t, req, "Expected QueryPlatformLogs to be called")
+				assert.Equal(t, 100, req.Limit)
+				assert.Equal(t, sortOrderDesc, req.SortOrder)
+				assert.Empty(t, req.Labels)
+				assert.Empty(t, svcs.platformLogs.valuesRequests,
+					"no include_sources means no aggregation is issued")
+			},
+		},
+		{
+			name:     "resource_metrics_no_step",
+			toolName: "query_resource_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.metrics.lastRequest()
+				require.NotNil(t, req, "Expected QueryMetrics to be called")
+				assert.Nil(t, req.Step)
+			},
+		},
+		{
+			name:     "traces_default_limit_and_sort",
+			toolName: "query_traces",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.traces.lastTracesRequest()
+				require.NotNil(t, req, "Expected QueryTraces to be called")
+				assert.Equal(t, 100, req.Limit)
+				assert.Equal(t, sortOrderDesc, req.SortOrder)
+			},
+		},
+		{
+			name:     "alerts_default_limit_and_sort",
+			toolName: "query_alerts",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.alertsIncidents.lastAlertsRequest()
+				require.NotNil(t, req, "Expected QueryAlerts to be called")
+				require.NotNil(t, req.Limit)
+				assert.Equal(t, 100, *req.Limit)
+				require.NotNil(t, req.SortOrder)
+				assert.Equal(t, sortOrderDesc, string(*req.SortOrder))
+			},
+		},
+		{
+			name:     "incidents_default_limit_and_sort",
+			toolName: "query_incidents",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.alertsIncidents.lastIncidentsRequest()
+				require.NotNil(t, req, "Expected QueryIncidents to be called")
+				require.NotNil(t, req.Limit)
+				assert.Equal(t, 100, *req.Limit)
+				require.NotNil(t, req.SortOrder)
+				assert.Equal(t, sortOrderDesc, string(*req.SortOrder))
+			},
+		},
+		{
+			name:     "dora_metrics_no_granularity_or_metrics_filter",
+			toolName: "query_dora_metrics",
+			args: map[string]any{
+				"namespace":  testNamespace,
+				"start_time": testStartTime,
+				"end_time":   testEndTime,
+			},
+			validateCall: func(t *testing.T, svcs *testServices) {
+				req := svcs.insights.lastDoraMetricsRequest()
+				require.NotNil(t, req, "Expected QueryDoraMetrics to be called")
+				assert.Nil(t, req.Granularity, "Expected granularity to be left unset for the service's own default")
+				assert.Nil(t, req.Metrics, "Expected metrics to be left unset for the service's own all-four default")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svcs.resetAll()
+
+			_, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+				Name:      tt.toolName,
+				Arguments: tt.args,
+			})
+			require.NoError(t, err, "Failed to call tool")
+
+			tt.validateCall(t, svcs)
+		})
+	}
+}
+
+// TestParameterMappingRegression demonstrates that validateCall catches real parameter mapping bugs.
+func TestParameterMappingRegression(t *testing.T) {
+	clientSession, svcs := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+
+	_, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "query_component_logs",
+		Arguments: map[string]any{
+			"namespace":     "my-namespace",
+			"project":       "my-project",
+			"component":     "my-service",
+			"environment":   "production",
+			"start_time":    testStartTime,
+			"end_time":      testEndTime,
+			"search_phrase": "my-search",
+			"limit":         42,
+		},
+	})
+	require.NoError(t, err, "Failed to call tool")
+
+	req := svcs.logs.lastRequest()
+	require.NotNil(t, req, "Expected QueryLogs to be called")
+	require.NotNil(t, req.SearchScope)
+	require.NotNil(t, req.SearchScope.Component)
+
+	scope := req.SearchScope.Component
+	assert.Equal(t, "my-namespace", scope.Namespace)
+	assert.Equal(t, "my-project", scope.Project)
+	assert.Equal(t, "my-service", scope.Component)
+	assert.Equal(t, "production", scope.Environment)
+	assert.Equal(t, "my-search", req.SearchPhrase)
+	assert.Equal(t, 42, req.Limit)
+}
+
+// TestSchemaPropertyTypes verifies that schema properties have the correct JSON types.
+func TestSchemaPropertyTypes(t *testing.T) {
+	clientSession, _ := setupTestServer(t)
+	defer clientSession.Close()
+
+	ctx := context.Background()
+	toolsResult, err := clientSession.ListTools(ctx, nil)
+	require.NoError(t, err, "Failed to list tools")
+
+	expectedTypes := map[string]map[string]string{
+		"query_component_logs": {
+			"namespace":     "string",
+			"project":       "string",
+			"component":     "string",
+			"environment":   "string",
+			"start_time":    "string",
+			"end_time":      "string",
+			"search_phrase": "string",
+			"log_levels":    "array",
+			"limit":         "number",
+			"sort_order":    "string",
+		},
+		"query_workflow_logs": {
+			"namespace":         "string",
+			"workflow_run_name": "string",
+			"task_name":         "string",
+			"start_time":        "string",
+			"end_time":          "string",
+			"search_phrase":     "string",
+			"log_levels":        "array",
+			"limit":             "number",
+			"sort_order":        "string",
+		},
+		"query_platform_logs": {
+			"cluster_instance":     "array",
+			"kubernetes_namespace": "array",
+			"pod_name":             "array",
+			"container_name":       "array",
+			"labels":               "string",
+			"start_time":           "string",
+			"end_time":             "string",
+			"search_phrase":        "string",
+			"log_levels":           "array",
+			"limit":                "number",
+			"sort_order":           "string",
+			"include_sources":      "array",
+			"max_sources":          "number",
+		},
+		"query_component_events": {
+			"namespace":   "string",
+			"project":     "string",
+			"component":   "string",
+			"environment": "string",
+			"start_time":  "string",
+			"end_time":    "string",
+			"limit":       "number",
+			"sort_order":  "string",
+		},
+		"query_workflow_events": {
+			"namespace":         "string",
+			"workflow_run_name": "string",
+			"start_time":        "string",
+			"end_time":          "string",
+			"limit":             "number",
+			"sort_order":        "string",
+		},
+		"query_resource_metrics": {
+			"namespace":   "string",
+			"project":     "string",
+			"component":   "string",
+			"environment": "string",
+			"start_time":  "string",
+			"end_time":    "string",
+			"step":        "string",
+		},
+		"query_http_metrics": {
+			"namespace":   "string",
+			"project":     "string",
+			"component":   "string",
+			"environment": "string",
+			"start_time":  "string",
+			"end_time":    "string",
+			"step":        "string",
+		},
+		"query_traces": {
+			"namespace":   "string",
+			"project":     "string",
+			"component":   "string",
+			"environment": "string",
+			"start_time":  "string",
+			"end_time":    "string",
+			"limit":       "number",
+			"sort_order":  "string",
+		},
+		"query_trace_spans": {
+			"trace_id":    "string",
+			"namespace":   "string",
+			"project":     "string",
+			"component":   "string",
+			"environment": "string",
+			"start_time":  "string",
+			"end_time":    "string",
+			"limit":       "number",
+			"sort_order":  "string",
+		},
+		"get_span_details": {
+			"trace_id": "string",
+			"span_id":  "string",
+		},
+	}
+
+	for _, tool := range toolsResult.Tools {
+		expectedProps, ok := expectedTypes[tool.Name]
+		if !ok {
+			continue
+		}
+
+		t.Run(tool.Name, func(t *testing.T) {
+			schemaMap, ok := tool.InputSchema.(map[string]any)
+			require.True(t, ok, "Expected InputSchema to be map[string]any, got %T", tool.InputSchema)
+
+			properties, ok := schemaMap["properties"].(map[string]any)
+			require.True(t, ok, "Properties is not a map")
+
+			for propName, expectedType := range expectedProps {
+				prop, exists := properties[propName]
+				if !exists {
+					t.Errorf("Property %q not found", propName)
+					continue
+				}
+
+				propMap, ok := prop.(map[string]any)
+				if !ok {
+					t.Errorf("Property %q is not a map", propName)
+					continue
+				}
+
+				actualType, ok := propMap["type"].(string)
+				if !ok {
+					t.Errorf("Property %q has no type field", propName)
+					continue
+				}
+
+				assert.Equal(t, expectedType, actualType, "Property %q type mismatch", propName)
+			}
+		})
+	}
+}

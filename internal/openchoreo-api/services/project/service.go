@@ -1,0 +1,225 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package project
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services"
+)
+
+var projectTypeMeta = metav1.TypeMeta{
+	APIVersion: openchoreov1alpha1.GroupVersion.String(),
+	Kind:       "Project",
+}
+
+const (
+	defaultPipeline = "default"
+
+	// defaultProjectType is the cluster-scoped ProjectType applied when a
+	// Project is created without spec.type. Matches the default
+	// ClusterProjectType shipped in the getting-started samples.
+	defaultProjectType = "default"
+)
+
+// projectService handles project-related business logic without authorization checks.
+// Other services within this layer should use this directly to avoid double authz.
+type projectService struct {
+	k8sClient client.Client
+	logger    *slog.Logger
+}
+
+var _ Service = (*projectService)(nil)
+
+// NewService creates a new project service without authorization.
+func NewService(k8sClient client.Client, logger *slog.Logger) Service {
+	return &projectService{
+		k8sClient: k8sClient,
+		logger:    logger,
+	}
+}
+
+func (s *projectService) CreateProject(ctx context.Context, namespaceName string, project *openchoreov1alpha1.Project) (*openchoreov1alpha1.Project, error) {
+	if project == nil {
+		return nil, fmt.Errorf("project cannot be nil")
+	}
+
+	s.logger.Debug("Creating project", "namespace", namespaceName, "project", project.Name)
+
+	exists, err := s.projectExists(ctx, namespaceName, project.Name)
+	if err != nil {
+		s.logger.Error("Failed to check project existence", "error", err)
+		return nil, fmt.Errorf("failed to check project existence: %w", err)
+	}
+	if exists {
+		s.logger.Warn("Project already exists", "namespace", namespaceName, "project", project.Name)
+		return nil, ErrProjectAlreadyExists
+	}
+
+	project.Namespace = namespaceName
+	project.Status = openchoreov1alpha1.ProjectStatus{}
+	if project.Spec.DeploymentPipelineRef.Name == "" {
+		project.Spec.DeploymentPipelineRef = openchoreov1alpha1.DeploymentPipelineRef{
+			Kind: openchoreov1alpha1.DeploymentPipelineRefKindDeploymentPipeline,
+			Name: defaultPipeline,
+		}
+	}
+	if project.Spec.Type.Name == "" {
+		project.Spec.Type = openchoreov1alpha1.ProjectTypeRef{
+			Kind: openchoreov1alpha1.ProjectTypeRefKindClusterProjectType,
+			Name: defaultProjectType,
+		}
+	}
+
+	if err := s.k8sClient.Create(ctx, project); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			s.logger.Warn("Project already exists", "namespace", namespaceName, "project", project.Name)
+			return nil, ErrProjectAlreadyExists
+		}
+		if vErr := services.ExtractValidationError(err); vErr != nil {
+			return nil, vErr
+		}
+		s.logger.Error("Failed to create project CR", "error", err)
+		return nil, fmt.Errorf("failed to create project: %w", err)
+	}
+
+	s.logger.Debug("Project created successfully", "namespace", namespaceName, "project", project.Name)
+	project.TypeMeta = projectTypeMeta
+	return project, nil
+}
+
+func (s *projectService) UpdateProject(ctx context.Context, namespaceName string, project *openchoreov1alpha1.Project) (*openchoreov1alpha1.Project, error) {
+	if project == nil {
+		return nil, fmt.Errorf("project cannot be nil")
+	}
+
+	s.logger.Debug("Updating project", "namespace", namespaceName, "project", project.Name)
+
+	existing := &openchoreov1alpha1.Project{}
+	if err := s.k8sClient.Get(ctx, client.ObjectKey{Name: project.Name, Namespace: namespaceName}, existing); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Project not found", "namespace", namespaceName, "project", project.Name)
+			return nil, ErrProjectNotFound
+		}
+		s.logger.Error("Failed to get project", "error", err)
+		return nil, fmt.Errorf("failed to get project: %w", err)
+	}
+
+	// Clear status from user input — status is server-managed
+	project.Status = openchoreov1alpha1.ProjectStatus{}
+
+	// Only apply user-mutable fields to the existing object, preserving server-managed fields
+	existing.Spec = project.Spec
+	existing.Labels = project.Labels
+	existing.Annotations = project.Annotations
+
+	if err := s.k8sClient.Update(ctx, existing); err != nil {
+		if vErr := services.ExtractValidationError(err); vErr != nil {
+			return nil, vErr
+		}
+		s.logger.Error("Failed to update project CR", "error", err)
+		return nil, fmt.Errorf("failed to update project: %w", err)
+	}
+
+	s.logger.Debug("Project updated successfully", "namespace", namespaceName, "project", project.Name)
+	existing.TypeMeta = projectTypeMeta
+	return existing, nil
+}
+
+func (s *projectService) ListProjects(ctx context.Context, namespaceName string, opts services.ListOptions) (*services.ListResult[openchoreov1alpha1.Project], error) {
+	s.logger.Debug("Listing projects", "namespace", namespaceName, "limit", opts.Limit, "cursor", opts.Cursor)
+
+	commonOpts, err := services.BuildListOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	listOpts := append([]client.ListOption{client.InNamespace(namespaceName)}, commonOpts...)
+
+	var projectList openchoreov1alpha1.ProjectList
+	if err := s.k8sClient.List(ctx, &projectList, listOpts...); err != nil {
+		s.logger.Error("Failed to list projects", "error", err)
+		return nil, fmt.Errorf("failed to list projects: %w", err)
+	}
+
+	for i := range projectList.Items {
+		projectList.Items[i].TypeMeta = projectTypeMeta
+	}
+
+	result := &services.ListResult[openchoreov1alpha1.Project]{
+		Items:      projectList.Items,
+		NextCursor: projectList.Continue,
+	}
+	if projectList.RemainingItemCount != nil {
+		remaining := *projectList.RemainingItemCount
+		result.RemainingCount = &remaining
+	}
+
+	s.logger.Debug("Listed projects", "namespace", namespaceName, "count", len(projectList.Items))
+	return result, nil
+}
+
+func (s *projectService) GetProject(ctx context.Context, namespaceName, projectName string) (*openchoreov1alpha1.Project, error) {
+	s.logger.Debug("Getting project", "namespace", namespaceName, "project", projectName)
+
+	project := &openchoreov1alpha1.Project{}
+	key := client.ObjectKey{
+		Name:      projectName,
+		Namespace: namespaceName,
+	}
+
+	if err := s.k8sClient.Get(ctx, key, project); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Project not found", "namespace", namespaceName, "project", projectName)
+			return nil, ErrProjectNotFound
+		}
+		s.logger.Error("Failed to get project", "error", err)
+		return nil, fmt.Errorf("failed to get project: %w", err)
+	}
+
+	project.TypeMeta = projectTypeMeta
+	return project, nil
+}
+
+func (s *projectService) DeleteProject(ctx context.Context, namespaceName, projectName string) error {
+	s.logger.Debug("Deleting project", "namespace", namespaceName, "project", projectName)
+
+	project := &openchoreov1alpha1.Project{}
+	project.Name = projectName
+	project.Namespace = namespaceName
+
+	if err := s.k8sClient.Delete(ctx, project); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ErrProjectNotFound
+		}
+		s.logger.Error("Failed to delete project CR", "error", err)
+		return fmt.Errorf("failed to delete project: %w", err)
+	}
+
+	s.logger.Debug("Project deleted successfully", "namespace", namespaceName, "project", projectName)
+	return nil
+}
+
+func (s *projectService) projectExists(ctx context.Context, namespaceName, projectName string) (bool, error) {
+	project := &openchoreov1alpha1.Project{}
+	key := client.ObjectKey{
+		Name:      projectName,
+		Namespace: namespaceName,
+	}
+
+	err := s.k8sClient.Get(ctx, key, project)
+	if err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking existence of project %s/%s: %w", namespaceName, projectName, err)
+	}
+	return true, nil
+}

@@ -1,0 +1,208 @@
+version: "2"
+
+run:
+  timeout: 10m
+  allow-parallel-runners: true
+
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - dupl
+    - errcheck
+    - errorlint
+    - ginkgolinter
+    - goconst
+    - gocritic
+    - gocyclo
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - prealloc
+    - revive
+    - staticcheck # includes gosimple
+    - unconvert
+    - unparam
+    - unused
+    - whitespace
+
+  settings:
+    gosec:
+      excludes:
+        - G101 # Potential hardcoded credentials - false positives on config/dto structs
+        - G117 # Exported secret fields - false positives on config/dto structs
+        # Taint analysis rules (G7xx) produce too many false positives.
+        # See https://github.com/securego/gosec/issues/1500
+        - G703 # Path traversal via taint analysis
+        - G704 # SSRF via taint analysis
+        - G705 # XSS via taint analysis
+    staticcheck:
+      checks:
+        - "all"
+        - "-QF1001" # De Morgan's law suggestions
+        - "-QF1003" # tagged switch suggestions
+        - "-QF1008" # embedded field selector suggestions
+        - "-QF1011" # omit type from declaration - needed for compile-time interface checks
+        - "-ST1000" # missing package comment
+        - "-ST1001" # dot imports - used by gomega/ginkgo test suites
+        - "-ST1020" # comment on exported function
+        - "-ST1021" # comment on exported type
+        - "-ST1022" # comment on exported var/const
+    errcheck:
+      # report about not checking of errors in type assertions: `a := b.(MyStruct)`;
+      check-type-assertions: false
+      # report about assignment of errors to blank identifier: `num, _ := strconv.Atoi(numStr)`;
+      check-blank: false
+      # See https://github.com/kisielk/errcheck#excluding-functions for details.
+    gocritic:
+      # See https://go-critic.github.io/overview#checks-overview
+      # To check which checks are enabled run `GL_DEBUG=gocritic golangci-lint run`
+      disabled-checks:
+        - exitAfterDefer
+        - ifElseChain
+        - elseif
+      # Enable multiple checks by tags, run `GL_DEBUG=gocritic golangci-lint run` to see all tags and checks.
+      # See https://github.com/go-critic/go-critic#usage -> section "Tags".
+      enabled-tags:
+        - diagnostic
+    govet:
+      # Enable all analyzers.
+      enable-all: true
+      # Disable analyzers by name.
+      disable:
+        - fieldalignment
+        - shadow
+    misspell:
+      # Correct spellings using locale preferences for US or UK.
+      # Setting locale to US will correct the British spelling of 'colour' to 'color'.
+      locale: US
+      ignore-rules:
+        - cancelled
+    revive:
+      rules:
+        - name: struct-tag
+          arguments:
+            - json,inline
+        - name: var-naming
+        - name: redundant-import-alias
+        - name: comment-spacings
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+        - name: package-comments
+
+  exclusions:
+    generated: lax
+    presets:
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Suppress "exported X should have comment or be unexported" (EXC0012).
+      # Only the format of existing comments is enforced (EXC0013, EXC0014).
+      - linters:
+          - revive
+        text: "exported (.+) should have comment"
+      # SA1019: APIs deprecated by the controller-runtime v0.20 → v0.24 bump
+      # (k8s 1.32 → 1.36). Migration is tracked separately; suppressing here so
+      # the version bump itself stays mechanical.
+      - linters:
+          - staticcheck
+        text: 'SA1019: .*\.Requeue is deprecated'
+      - linters:
+          - staticcheck
+        text: "SA1019: .*GetEventRecorderFor is deprecated"
+      - linters:
+          - staticcheck
+        text: 'SA1019: client\.Apply is deprecated'
+      - linters:
+          - staticcheck
+        text: "SA1019: scheme.Builder is deprecated"
+      # Scoped to internal/webhook/ so the patterns still warn if they leak
+      # into controllers, cmd, etc.
+      - linters:
+          - staticcheck
+        text: "SA1019: webhook.CustomValidator is deprecated"
+        path: ^internal/webhook/
+      - linters:
+          - staticcheck
+        text: "SA1019: webhook.CustomDefaulter is deprecated"
+        path: ^internal/webhook/
+      - linters:
+          - staticcheck
+        text: "SA1019: ctrl.NewWebhookManagedBy"
+        path: ^internal/webhook/
+      - linters:
+          - staticcheck
+        text: "SA1019: admission.CustomValidator is deprecated"
+      - linters:
+          - staticcheck
+        text: "SA1019: admission.CustomDefaulter is deprecated"
+      # SA1019: the deprecated Trait/ClusterTrait spec.validations field is intentionally
+      # exercised by tests for backward-compat coverage. Production reads are suppressed
+      # inline with //nolint; this scopes only the test-file uses so new production reads
+      # still warn.
+      - linters:
+          - staticcheck
+        text: "SA1019: .*Validations is deprecated: use PreRenderValidations"
+        path: _test\.go$
+      # Suppress "should have a package comment" (EXC0015).
+      - linters:
+          - revive
+        text: "should have a package comment"
+      # Suppress "avoid package names that conflict/meaningless" (var-naming).
+      # Renaming existing packages (build, version, hash, template, etc.) is too invasive.
+      - linters:
+          - revive
+        text: "var-naming: avoid"
+      - linters:
+          - lll
+        path: ^api/
+      - linters:
+          - dupl
+          - lll
+        path: ^internal/
+      # MCP scope-collapsed tool registration files and their spec-test fixtures
+      # are intentionally parallel per resource family (project types mirror
+      # resource types, etc.). dupl flags this structural repetition with no value.
+      - linters:
+          - dupl
+        path: pkg/mcp/tools/(scoped_.*|.*_specs_test)\.go$
+    paths:
+      - internal/dataplane/kubernetes/types # 3rd party types for CustomResourceDefinitions
+      - ^test/ # E2E tests
+
+issues:
+  # Set to 0 to disable the limit.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      # list of prefixes to use for grouping imports
+      sections:
+        - standard
+        - default
+        - prefix(github.com/openchoreo/openchoreo)
+    goimports:
+      # put imports beginning with prefix after 3rd-party packages
+      local-prefixes:
+        - github.com/openchoreo/openchoreo
+  exclusions:
+    generated: lax
+    paths:
+      - internal/dataplane/kubernetes/types
+      # Exclude suite_test.go files with +kubebuilder:scaffold:imports from gci formatting.
+      # gci strips standalone scaffold comments from import blocks.
+      # See https://github.com/daixiang0/gci/issues/135
+      - internal/controller/.+/suite_test\.go
+      - ^test/

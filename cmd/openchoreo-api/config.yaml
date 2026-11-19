@@ -1,0 +1,212 @@
+# OpenChoreo API Configuration
+#
+# Configuration priority (highest to lowest):
+#   1. Environment variables
+#   2. Config file
+#   3. Built-in defaults
+#
+# Environment variable format: OC_API__<SECTION>__<FIELD>
+# Examples:
+#   OC_API__SERVER__PORT=9090
+#   OC_API__LOGGING__LEVEL=debug
+#   OC_API__SECURITY__ENABLED=true
+
+server:
+  # Address to bind the HTTP server to.
+  bind_address: "0.0.0.0"
+
+  # Port to listen on for HTTP requests.
+  port: 8080
+
+  # Public URL where this API is externally accessible.
+  # Used for OAuth resource metadata and self-referential links.
+  public_url: "http://api.openchoreo.localhost:8080"
+
+  timeouts:
+    # Maximum duration for reading the entire request, including the body.
+    read: 15s
+
+    # Maximum duration before timing out writes of the response.
+    #
+    # Must outlast the resource tree walk budget, the top of the timeout ladder
+    # (agent 25s < gateway 28s < client 30s < walk 60s), or a legitimate tree
+    # response is cut off while the walk is still within its budget. Keep this
+    # at or above the derived Go default in
+    # internal/openchoreo-api/config.TimeoutsDefaults.
+    write: 65s
+
+    # Maximum amount of time to wait for the next request when keep-alives are enabled.
+    idle: 60s
+
+    # Maximum duration to wait for active connections to close during shutdown.
+    shutdown: 30s
+
+  tls:
+    # Enable TLS for the HTTP server.
+    enabled: false
+
+    # Path to the TLS certificate file.
+    cert_file: ""
+
+    # Path to the TLS private key file.
+    key_file: ""
+
+  # Middleware configuration placeholder for future settings (e.g., request_id).
+  middleware: { }
+
+security:
+  # Enable all security checks (authentication and authorization).
+  # When false, global authentication and authorization enforcement is disabled
+  # and requests are processed as anonymous without any access restrictions.
+  # This overrides all individual security settings.
+  enabled: false
+
+  authentication:
+    jwt:
+      # List of acceptable audiences (aud) for the JWT.
+      # Tokens must contain at least one of these audiences.
+      audiences: [ ]
+
+      # Allowed clock skew when validating token expiration times.
+      # Compensates for clock differences between servers.
+      clock_skew: 0s
+
+      jwks:
+        # How often to refresh the JWKS from the remote URL.
+        refresh_interval: 1h
+
+        # Skip TLS certificate verification when fetching JWKS.
+        skip_tls_verify: false
+
+  # Subject types define how to classify and extract identity information
+  # from authenticated tokens. Each subject type can have different
+  # entitlement extraction rules based on the authentication mechanism.
+  subjects:
+    user:
+      # Human-readable name for this subject type.
+      display_name: "User"
+
+      # Priority for subject type resolution when multiple types match.
+      # Lower numbers have higher priority.
+      priority: 1
+
+      # Authentication mechanisms and how to extract entitlements from each.
+      mechanisms:
+        jwt:
+          readable_id_claim: "username"
+          entitlement:
+            # JWT claim containing the user's entitlements/roles.
+            claim: "groups"
+
+            # Human-readable name for the entitlement type.
+            display_name: "User Group"
+
+    service_account:
+      display_name: "Service Account"
+      priority: 2
+      mechanisms:
+        jwt:
+          readable_id_claim: "client_id"
+          entitlement:
+            claim: "client_id"
+            display_name: "Client ID"
+
+  authorization:
+    # Enable authorization checks using Casbin.
+    # When disabled, all authenticated requests are permitted.
+    # Note: security.enabled=false also disables authorization.
+    enabled: false
+
+    cache:
+      # Enable caching of authorization decisions.
+      enabled: false
+
+      # How long to cache authorization decisions.
+      ttl: 5m
+
+identity:
+  oidc:
+    # OIDC provider issuer URL.
+    # Used for token validation and as the base for OAuth metadata.
+    issuer: "http://sts.openchoreo.localhost"
+
+    # JWKS URL for fetching JSON Web Keys for token verification.
+    jwks_url: "http://sts.openchoreo.localhost/oauth2/jwks"
+
+    # OAuth authorization endpoint URL.
+    authorization_endpoint: "http://sts.openchoreo.localhost/oauth2/authorize"
+
+    # OAuth token endpoint URL.
+    token_endpoint: "http://sts.openchoreo.localhost/oauth2/token"
+
+  # OAuth client configurations for external integrations.
+  # These are returned by the client discovery endpoint for CLI, CI/CD, etc.
+  clients:
+    cli:
+      # OAuth client ID for the CLI application.
+      client_id: "openchoreo-cli"
+
+      # OAuth scopes to request during authentication.
+      scopes:
+        - "openid"
+        - "profile"
+        - "email"
+
+  # OAuth scopes advertised by the MCP endpoint via
+  # `.well-known/oauth-protected-resource` and the WWW-Authenticate header on
+  # 401 responses. MCP clients prefer this list over the authorization server's
+  # scopes_supported, which can be over-broad (e.g. Cognito pool-level scopes
+  # that a specific app client doesn't allow). See issue #3217.
+  mcp_oauth_scopes:
+    - "openid"
+    - "profile"
+    - "email"
+
+secret_management:
+  # Enable the Secret management API under
+  # /api/v1alpha1/namespaces/{namespaceName}/secrets
+  # (POST/PUT/GET/LIST/DELETE).
+  # When false, all five endpoints return 501 Not Implemented.
+  enabled: false
+
+mcp:
+  # Enable the Model Context Protocol (MCP) server.
+  # MCP provides AI-friendly tool interfaces for the API.
+  enabled: true
+
+  # List of enabled MCP toolsets.
+  # Each toolset exposes a group of related operations.
+  toolsets:
+    - namespace
+    - project
+    - component
+    - deployment
+    - build
+    - pe
+    - resource
+
+logging:
+  # Minimum log level: debug, info, warn, error
+  level: info
+
+  # Log output format: json, text
+  format: json
+
+  # Include source file and line number in log entries.
+  add_source: false
+
+audit:
+  # Enable audit event emission for state-modifying API requests. Requires
+  # observability_plane_ref.
+  enabled: false
+
+  # Settings applied when no policy below matches.
+  defaults:
+    publish: true
+
+  # Ordered, first-match-wins policy overrides. Empty by default.
+  policies: []
+
+  actor:
+    # Token claim recorded as actor.id and matched by policies[].match.actors.
+    id_claim: "sub"

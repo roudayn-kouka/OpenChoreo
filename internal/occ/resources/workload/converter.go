@@ -1,0 +1,605 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package synth
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+)
+
+// WorkloadDescriptor represents the structure of a workload.yaml file
+// This is the developer-maintained descriptor alongside source code
+type WorkloadDescriptor struct {
+	APIVersion     string                          `yaml:"apiVersion"`
+	Metadata       WorkloadDescriptorMetadata      `yaml:"metadata"`
+	Endpoints      []WorkloadDescriptorEndpoint    `yaml:"endpoints,omitempty"`
+	Dependencies   *WorkloadDescriptorDependencies `yaml:"dependencies,omitempty"`
+	Configurations WorkloadDescriptorConfiguration `yaml:"configurations,omitempty"`
+}
+
+type WorkloadDescriptorMetadata struct {
+	Name string `yaml:"name"`
+}
+
+type WorkloadDescriptorEndpoint struct {
+	Name        string   `yaml:"name"`
+	DisplayName string   `yaml:"displayName,omitempty"`
+	Port        int32    `yaml:"port"`
+	TargetPort  int32    `yaml:"targetPort,omitempty"`
+	Type        string   `yaml:"type"`
+	BasePath    string   `yaml:"basePath,omitempty"`
+	SchemaFile  string   `yaml:"schemaFile,omitempty"`
+	Context     string   `yaml:"context,omitempty"`
+	Visibility  []string `yaml:"visibility,omitempty"`
+}
+
+// WorkloadDescriptorDependencies represents the dependencies section in workload.yaml
+type WorkloadDescriptorDependencies struct {
+	// Endpoints define how this workload consumes endpoints from other components.
+	Endpoints []WorkloadDescriptorConnection `yaml:"endpoints,omitempty"`
+	// Resources define how this workload consumes outputs from project-bound Resources.
+	Resources []WorkloadDescriptorResourceDependency `yaml:"resources,omitempty"`
+}
+
+// WorkloadDescriptorResourceDependency represents a dependency on a project-bound Resource.
+// Output names declared on the referenced ResourceType are wired into the consuming container
+// as env vars (envBindings) and file mounts (fileBindings).
+type WorkloadDescriptorResourceDependency struct {
+	// Ref is the name of the Resource to consume.
+	Ref string `yaml:"ref"`
+	// EnvBindings maps a ResourceType output name to a container environment variable name.
+	EnvBindings map[string]string `yaml:"envBindings,omitempty"`
+	// FileBindings maps a ResourceType output name to a container mount path. The referenced
+	// output's source kind must be secretKeyRef or configMapKeyRef.
+	FileBindings map[string]string `yaml:"fileBindings,omitempty"`
+}
+
+type WorkloadDescriptorConnection struct {
+	// Project is the target component's project name (optional, defaults to same project).
+	Project string `yaml:"project,omitempty"`
+	// Component is the target component name.
+	Component string `yaml:"component"`
+	// Name is the target endpoint name.
+	Name string `yaml:"name"`
+	// Visibility is the visibility level for the connection.
+	Visibility string `yaml:"visibility"`
+	// EnvBindings maps connection address components to env var names.
+	EnvBindings WorkloadDescriptorConnectionEnvBindings `yaml:"envBindings"`
+}
+
+type WorkloadDescriptorConnectionEnvBindings struct {
+	Address  string `yaml:"address,omitempty"`
+	Host     string `yaml:"host,omitempty"`
+	Port     string `yaml:"port,omitempty"`
+	BasePath string `yaml:"basePath,omitempty"`
+}
+
+// WorkloadDescriptorConfiguration represents the configurations section in workload.yaml
+type WorkloadDescriptorConfiguration struct {
+	Env   []WorkloadDescriptorEnvVar  `yaml:"env,omitempty"`
+	Files []WorkloadDescriptorFileVar `yaml:"files,omitempty"`
+}
+
+// WorkloadDescriptorEnvVar represents an environment variable in the descriptor
+type WorkloadDescriptorEnvVar struct {
+	Name      string                          `yaml:"name"`
+	Value     string                          `yaml:"value,omitempty"`
+	ValueFrom *WorkloadDescriptorEnvVarSource `yaml:"valueFrom,omitempty"`
+}
+
+// WorkloadDescriptorEnvVarSource represents the source for an environment variable value
+type WorkloadDescriptorEnvVarSource struct {
+	SecretKeyRef *WorkloadDescriptorSecretKeyRef `yaml:"secretKeyRef,omitempty"`
+	Path         string                          `yaml:"path,omitempty"`
+}
+
+// WorkloadDescriptorSecretKeyRef represents a reference to a secret key
+type WorkloadDescriptorSecretKeyRef struct {
+	Name string `yaml:"name"`
+	Key  string `yaml:"key"`
+}
+
+// WorkloadDescriptorFileVar represents a file configuration in the descriptor
+type WorkloadDescriptorFileVar struct {
+	Name      string                          `yaml:"name"`
+	MountPath string                          `yaml:"mountPath"`
+	Value     string                          `yaml:"value,omitempty"`
+	ValueFrom *WorkloadDescriptorEnvVarSource `yaml:"valueFrom,omitempty"`
+}
+
+// ConversionParams holds the parameters needed for workload conversion
+type ConversionParams struct {
+	NamespaceName string
+	ProjectName   string
+	ComponentName string
+	ImageURL      string
+}
+
+// ConvertWorkloadDescriptorToWorkloadCR converts a workload.yaml descriptor to a Workload CR
+func ConvertWorkloadDescriptorToWorkloadCR(descriptorPath string, params CreateWorkloadParams) (*openchoreov1alpha1.Workload, error) {
+	// Read the workload descriptor file
+	descriptor, err := readWorkloadDescriptor(descriptorPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read workload descriptor: %w", err)
+	}
+
+	// Validate conversion parameters
+	if err := validateConversionParams(params); err != nil {
+		return nil, fmt.Errorf("invalid conversion parameters: %w", err)
+	}
+
+	// Convert descriptor to Workload CR with the base directory for resolving relative paths
+	workload, err := convertDescriptorToWorkload(descriptor, params, descriptorPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert descriptor to workload CR: %w", err)
+	}
+
+	return workload, nil
+}
+
+// readDescriptorFile reads relPath resolved against baseDir. It uses os.Root so a
+// descriptor only references files within its own directory: a relPath that resolves
+// outside baseDir — via "..", an absolute path, or a symlink pointing outside it —
+// returns an error instead of reading the target.
+func readDescriptorFile(baseDir, relPath string) ([]byte, error) {
+	root, err := os.OpenRoot(baseDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+
+	f, err := root.Open(relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return io.ReadAll(f)
+}
+
+// readSchemaFile reads an endpoint schema file named relative to the descriptor
+// directory (baseDir) via readDescriptorFile.
+func readSchemaFile(baseDir, relPath string) (string, error) {
+	content, err := readDescriptorFile(baseDir, relPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read schema file %s: %w", relPath, err)
+	}
+	return string(content), nil
+}
+
+func readWorkloadDescriptor(path string) (*WorkloadDescriptor, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %s: %w", path, err)
+	}
+	defer file.Close()
+
+	return readWorkloadDescriptorFromReader(file)
+}
+
+func readWorkloadDescriptorFromReader(reader io.Reader) (*WorkloadDescriptor, error) {
+	var descriptor WorkloadDescriptor
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read data: %w", err)
+	}
+	if err := yaml.Unmarshal(data, &descriptor); err != nil {
+		return nil, fmt.Errorf("failed to decode YAML: %w", err)
+	}
+
+	return &descriptor, nil
+}
+
+func validateConversionParams(params CreateWorkloadParams) error {
+	if params.NamespaceName == "" {
+		return fmt.Errorf("namespace name is required")
+	}
+	if params.ProjectName == "" {
+		return fmt.Errorf("project name is required")
+	}
+	if params.ComponentName == "" {
+		return fmt.Errorf("component name is required")
+	}
+	if params.ImageURL == "" {
+		return fmt.Errorf("image URL is required")
+	}
+	return nil
+}
+
+// createBaseWorkload creates the basic workload structure with common fields
+func createBaseWorkload(workloadName string, params CreateWorkloadParams) (*openchoreov1alpha1.Workload, error) {
+	source, err := SourceFromParams(params)
+	if err != nil {
+		return nil, err
+	}
+
+	workload := &openchoreov1alpha1.Workload{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "openchoreo.dev/v1alpha1",
+			Kind:       "Workload",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workloadName,
+			Namespace: params.NamespaceName,
+		},
+		Spec: openchoreov1alpha1.WorkloadSpec{
+			Owner: openchoreov1alpha1.WorkloadOwner{
+				ProjectName:   params.ProjectName,
+				ComponentName: params.ComponentName,
+			},
+			WorkloadTemplateSpec: openchoreov1alpha1.WorkloadTemplateSpec{
+				Container: openchoreov1alpha1.Container{
+					Image: params.ImageURL,
+				},
+				Source: source,
+			},
+		},
+	}
+
+	return workload, nil
+}
+
+// SourceFromParams builds the workload's commit provenance from CLI flags, or
+// nil when none were given (Source is optional: DF/CFR/MTTR compute without
+// it; only Lead Time for Changes needs it).
+func SourceFromParams(params CreateWorkloadParams) (*openchoreov1alpha1.WorkloadSource, error) {
+	if params.SourceCommit == "" && params.SourceBranch == "" &&
+		params.SourceRepository == "" && params.SourceAuthoredAt == "" {
+		return nil, nil
+	}
+
+	source := &openchoreov1alpha1.WorkloadSource{
+		Commit:     params.SourceCommit,
+		Branch:     params.SourceBranch,
+		Repository: params.SourceRepository,
+	}
+	if params.SourceAuthoredAt != "" {
+		authoredAt, err := time.Parse(time.RFC3339, params.SourceAuthoredAt)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --source-authored-at %q: must be RFC3339 (e.g. from "+
+				"'git show -s --format=%%aI <sha>'): %w", params.SourceAuthoredAt, err)
+		}
+		metaTime := metav1.NewTime(authoredAt)
+		source.AuthoredAt = &metaTime
+	}
+	return source, nil
+}
+
+func convertDescriptorToWorkload(descriptor *WorkloadDescriptor, params CreateWorkloadParams, descriptorPath string) (*openchoreov1alpha1.Workload, error) {
+	// Determine workload name
+	workloadName := params.ComponentName + "-workload"
+	if workloadName == "" {
+		return nil, fmt.Errorf("workload name must be provided either in params or descriptor metadata")
+	}
+
+	// Create the base workload structure
+	workload, err := createBaseWorkload(workloadName, params)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add endpoints from descriptor if present
+	if err := addEndpointsFromDescriptor(workload, descriptor, descriptorPath); err != nil {
+		return nil, fmt.Errorf("failed to add endpoints: %w", err)
+	}
+
+	// Add dependencies from descriptor if present
+	if err := addDependenciesFromDescriptor(workload, descriptor); err != nil {
+		return nil, fmt.Errorf("failed to add dependencies: %w", err)
+	}
+
+	// Add configurations from descriptor if present
+	if err := addConfigurationsFromDescriptor(workload, descriptor, descriptorPath); err != nil {
+		return nil, fmt.Errorf("failed to add configurations: %w", err)
+	}
+
+	return workload, nil
+}
+
+// addEndpointsFromDescriptor adds endpoints from the descriptor to the workload
+func addEndpointsFromDescriptor(workload *openchoreov1alpha1.Workload, descriptor *WorkloadDescriptor, descriptorPath string) error {
+	if len(descriptor.Endpoints) == 0 {
+		return nil
+	}
+
+	workload.Spec.Endpoints = make(map[string]openchoreov1alpha1.WorkloadEndpoint)
+	for _, descriptorEndpoint := range descriptor.Endpoints {
+		var visibility []openchoreov1alpha1.EndpointVisibility
+		for _, v := range descriptorEndpoint.Visibility {
+			vis := openchoreov1alpha1.EndpointVisibility(v)
+			if !validEndpointVisibilities[vis] {
+				return fmt.Errorf("invalid endpoint visibility %q for endpoint %q: must be one of [project, namespace, internal, external]",
+					v, descriptorEndpoint.Name)
+			}
+			visibility = append(visibility, vis)
+		}
+
+		endpoint := openchoreov1alpha1.WorkloadEndpoint{
+			DisplayName: descriptorEndpoint.DisplayName,
+			Port:        descriptorEndpoint.Port,
+			TargetPort:  descriptorEndpoint.TargetPort,
+			Type:        openchoreov1alpha1.EndpointType(descriptorEndpoint.Type),
+			BasePath:    descriptorEndpoint.BasePath,
+			Visibility:  visibility,
+		}
+
+		// Set the schema only when a schema file is provided. The schema type is
+		// derived from the endpoint protocol (e.g. HTTP -> openapi, gRPC -> proto)
+		// rather than copied from the endpoint type verbatim, so it matches the
+		// canonical formats understood by the rendering pipeline's schema extractor.
+		if descriptorEndpoint.SchemaFile != "" {
+			// Resolve the schema file relative to the workload descriptor directory.
+			baseDir := filepath.Dir(descriptorPath)
+
+			// Read schema file content and inline it
+			schemaContent, err := readSchemaFile(baseDir, descriptorEndpoint.SchemaFile)
+			if err != nil {
+				return err
+			}
+
+			endpoint.Schema = &openchoreov1alpha1.Schema{
+				Type:    schemaFormatByEndpointType[openchoreov1alpha1.EndpointType(descriptorEndpoint.Type)],
+				Content: schemaContent,
+			}
+		}
+
+		workload.Spec.Endpoints[descriptorEndpoint.Name] = endpoint
+	}
+	return nil
+}
+
+// schemaFormatByEndpointType maps an endpoint protocol to the canonical schema
+// format used for its API definition. These values mirror the canonical schema
+// types recognized by internal/pipeline/component/schemaextract. Endpoint types
+// with no API schema format (TCP, UDP, Websocket) are intentionally absent, so a
+// map lookup yields "" and no schema type is emitted for them.
+var schemaFormatByEndpointType = map[openchoreov1alpha1.EndpointType]string{
+	openchoreov1alpha1.EndpointTypeHTTP:    "openapi",
+	openchoreov1alpha1.EndpointTypeGRPC:    "proto",
+	openchoreov1alpha1.EndpointTypeGraphQL: "graphql",
+}
+
+// validEndpointVisibilities is the set of allowed visibility values for endpoints.
+var validEndpointVisibilities = map[openchoreov1alpha1.EndpointVisibility]bool{
+	openchoreov1alpha1.EndpointVisibilityProject:   true,
+	openchoreov1alpha1.EndpointVisibilityNamespace: true,
+	openchoreov1alpha1.EndpointVisibilityInternal:  true,
+	openchoreov1alpha1.EndpointVisibilityExternal:  true,
+}
+
+// validDependencyVisibilities is the set of allowed visibility values for dependency endpoint connections.
+// WorkloadConnection.Visibility is restricted to project and namespace by the CRD validation.
+var validDependencyVisibilities = map[openchoreov1alpha1.EndpointVisibility]bool{
+	openchoreov1alpha1.EndpointVisibilityProject:   true,
+	openchoreov1alpha1.EndpointVisibilityNamespace: true,
+}
+
+// addDependenciesFromDescriptor adds dependencies from the descriptor to the workload
+func addDependenciesFromDescriptor(workload *openchoreov1alpha1.Workload, descriptor *WorkloadDescriptor) error {
+	if descriptor.Dependencies == nil ||
+		(len(descriptor.Dependencies.Endpoints) == 0 && len(descriptor.Dependencies.Resources) == 0) {
+		return nil
+	}
+
+	connections, err := buildEndpointConnections(descriptor.Dependencies.Endpoints)
+	if err != nil {
+		return err
+	}
+	resources, err := buildResourceDependencies(descriptor.Dependencies.Resources)
+	if err != nil {
+		return err
+	}
+
+	if len(connections) == 0 && len(resources) == 0 {
+		return nil
+	}
+
+	if workload.Spec.Dependencies == nil {
+		workload.Spec.Dependencies = &openchoreov1alpha1.WorkloadDependencies{}
+	}
+	workload.Spec.Dependencies.Endpoints = connections
+	workload.Spec.Dependencies.Resources = resources
+	return nil
+}
+
+func buildEndpointConnections(entries []WorkloadDescriptorConnection) ([]openchoreov1alpha1.WorkloadConnection, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	connections := make([]openchoreov1alpha1.WorkloadConnection, 0, len(entries))
+	for i, dc := range entries {
+		if dc.Component == "" {
+			return nil, fmt.Errorf("dependency endpoint[%d]: component is required", i)
+		}
+		if dc.Name == "" {
+			return nil, fmt.Errorf("dependency endpoint[%d] (component %q): name is required", i, dc.Component)
+		}
+		if dc.Visibility == "" {
+			return nil, fmt.Errorf("dependency endpoint[%d] (component %q): visibility is required", i, dc.Component)
+		}
+		visibility := openchoreov1alpha1.EndpointVisibility(dc.Visibility)
+		if !validDependencyVisibilities[visibility] {
+			return nil, fmt.Errorf("invalid dependency endpoint visibility %q for component %q endpoint %q: must be one of [project, namespace]",
+				dc.Visibility, dc.Component, dc.Name)
+		}
+		connections = append(connections, openchoreov1alpha1.WorkloadConnection{
+			Project:    dc.Project,
+			Component:  dc.Component,
+			Name:       dc.Name,
+			Visibility: string(visibility),
+			EnvBindings: openchoreov1alpha1.ConnectionEnvBindings{
+				Address:  dc.EnvBindings.Address,
+				Host:     dc.EnvBindings.Host,
+				Port:     dc.EnvBindings.Port,
+				BasePath: dc.EnvBindings.BasePath,
+			},
+		})
+	}
+	return connections, nil
+}
+
+func buildResourceDependencies(entries []WorkloadDescriptorResourceDependency) ([]openchoreov1alpha1.WorkloadResourceDependency, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	resources := make([]openchoreov1alpha1.WorkloadResourceDependency, 0, len(entries))
+	for i, dr := range entries {
+		if dr.Ref == "" {
+			return nil, fmt.Errorf("dependency resource[%d]: ref is required", i)
+		}
+		for k, v := range dr.EnvBindings {
+			if k == "" || v == "" {
+				return nil, fmt.Errorf("dependency resource[%d] (ref %q): envBindings keys (output names) and values (env var names) cannot be empty", i, dr.Ref)
+			}
+		}
+		for k, v := range dr.FileBindings {
+			if k == "" || v == "" {
+				return nil, fmt.Errorf("dependency resource[%d] (ref %q): fileBindings keys (output names) and values (mount paths) cannot be empty", i, dr.Ref)
+			}
+		}
+		resources = append(resources, openchoreov1alpha1.WorkloadResourceDependency{
+			Ref:          dr.Ref,
+			EnvBindings:  dr.EnvBindings,
+			FileBindings: dr.FileBindings,
+		})
+	}
+	return resources, nil
+}
+
+// addConfigurationsFromDescriptor adds configurations (env vars and files) from the descriptor to the workload
+func addConfigurationsFromDescriptor(workload *openchoreov1alpha1.Workload, descriptor *WorkloadDescriptor, descriptorPath string) error {
+	// Add environment variables
+	if len(descriptor.Configurations.Env) > 0 {
+		workload.Spec.Container.Env = make([]openchoreov1alpha1.EnvVar, len(descriptor.Configurations.Env))
+		for i, envVar := range descriptor.Configurations.Env {
+			crEnvVar := openchoreov1alpha1.EnvVar{
+				Key: envVar.Name,
+			}
+
+			if envVar.ValueFrom != nil && envVar.ValueFrom.SecretKeyRef != nil {
+				crEnvVar.ValueFrom = convertEnvVarSource(envVar.ValueFrom)
+			} else if envVar.Value != "" {
+				crEnvVar.Value = envVar.Value
+			}
+
+			workload.Spec.Container.Env[i] = crEnvVar
+		}
+	}
+
+	// Add file configurations
+	if len(descriptor.Configurations.Files) > 0 {
+		workload.Spec.Container.Files = make([]openchoreov1alpha1.FileVar, 0, len(descriptor.Configurations.Files))
+		baseDir := filepath.Dir(descriptorPath)
+
+		for _, fileVar := range descriptor.Configurations.Files {
+			crFileVar := openchoreov1alpha1.FileVar{
+				Key:       fileVar.Name,
+				MountPath: fileVar.MountPath,
+			}
+
+			// Only set value OR valueFrom, never both
+			// Priority: SecretKeyRef > Path > inline Value
+			if fileVar.ValueFrom != nil && fileVar.ValueFrom.SecretKeyRef != nil {
+				// Reference to secret
+				crFileVar.ValueFrom = convertEnvVarSource(fileVar.ValueFrom)
+			} else if fileVar.ValueFrom != nil && fileVar.ValueFrom.Path != "" {
+				// Read file content, resolved relative to the descriptor directory.
+				content, err := readDescriptorFile(baseDir, fileVar.ValueFrom.Path)
+				if err != nil {
+					return fmt.Errorf("failed to read file %s: %w", fileVar.ValueFrom.Path, err)
+				}
+				crFileVar.Value = string(content)
+			} else if fileVar.Value != "" {
+				// Inline value
+				crFileVar.Value = fileVar.Value
+			}
+
+			workload.Spec.Container.Files = append(workload.Spec.Container.Files, crFileVar)
+		}
+	}
+
+	return nil
+}
+
+// convertEnvVarSource converts a descriptor env var source to a CR env var source
+func convertEnvVarSource(source *WorkloadDescriptorEnvVarSource) *openchoreov1alpha1.EnvVarValueFrom {
+	if source == nil {
+		return nil
+	}
+
+	result := &openchoreov1alpha1.EnvVarValueFrom{}
+
+	if source.SecretKeyRef != nil {
+		result.SecretKeyRef = &openchoreov1alpha1.SecretKeyRef{
+			Name: source.SecretKeyRef.Name,
+			Key:  source.SecretKeyRef.Key,
+		}
+	}
+
+	return result
+}
+
+// CreateBasicWorkload creates a basic Workload CR without reading from a descriptor file
+func CreateBasicWorkload(params CreateWorkloadParams) (*openchoreov1alpha1.Workload, error) {
+	// Validate conversion parameters
+	if err := validateConversionParams(params); err != nil {
+		return nil, fmt.Errorf("invalid conversion parameters: %w", err)
+	}
+
+	// Generate workload name from component name
+	workloadName := params.ComponentName + "-workload"
+
+	// Create the basic workload using shared function
+	workload, err := createBaseWorkload(workloadName, params)
+	if err != nil {
+		return nil, err
+	}
+
+	return workload, nil
+}
+
+// ConvertWorkloadCRToYAML converts a Workload CR to clean YAML bytes with proper field ordering
+func ConvertWorkloadCRToYAML(workload *openchoreov1alpha1.Workload) ([]byte, error) {
+	// Create a custom structure to control field ordering
+	// Note: sigs.k8s.io/yaml uses JSON tags, but we keep both for compatibility
+	type orderedWorkload struct {
+		APIVersion string `json:"apiVersion" yaml:"apiVersion"`
+		Kind       string `json:"kind" yaml:"kind"`
+		Metadata   struct {
+			Name      string `json:"name" yaml:"name"`
+			Namespace string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
+		} `json:"metadata" yaml:"metadata"`
+		Spec struct {
+			Owner        openchoreov1alpha1.WorkloadOwner               `json:"owner" yaml:"owner"`
+			Container    openchoreov1alpha1.Container                   `json:"container" yaml:"container"`
+			Endpoints    map[string]openchoreov1alpha1.WorkloadEndpoint `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+			Dependencies *openchoreov1alpha1.WorkloadDependencies       `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
+			Source       *openchoreov1alpha1.WorkloadSource             `json:"source,omitempty" yaml:"source,omitempty"`
+		} `json:"spec" yaml:"spec"`
+	}
+
+	// Create the ordered structure
+	ordered := orderedWorkload{
+		APIVersion: workload.APIVersion,
+		Kind:       workload.Kind,
+	}
+	ordered.Metadata.Name = workload.Name
+	ordered.Metadata.Namespace = workload.Namespace
+	ordered.Spec.Owner = workload.Spec.Owner
+	ordered.Spec.Container = workload.Spec.Container
+	ordered.Spec.Endpoints = workload.Spec.Endpoints
+	ordered.Spec.Dependencies = workload.Spec.Dependencies
+	ordered.Spec.Source = workload.Spec.Source
+
+	// Marshal with sigs.k8s.io/yaml for JSON tag support
+	return yaml.Marshal(ordered)
+}

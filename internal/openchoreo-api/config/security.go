@@ -1,0 +1,378 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"fmt"
+	"log/slog"
+	"sort"
+	"time"
+
+	"github.com/openchoreo/openchoreo/internal/authz"
+	"github.com/openchoreo/openchoreo/internal/config"
+	"github.com/openchoreo/openchoreo/internal/server/middleware/auth/jwt"
+	"github.com/openchoreo/openchoreo/internal/server/middleware/auth/subject"
+)
+
+// SecurityConfig defines all security-related settings.
+type SecurityConfig struct {
+	// Enabled enables all security checks (authentication and authorization).
+	// When false, authentication and authorization enforcement is skipped and
+	// requests are processed as anonymous without any access restrictions.
+	Enabled bool `koanf:"enabled"`
+	// Authentication defines authentication settings.
+	Authentication AuthenticationConfig `koanf:"authentication"`
+	// Subjects defines subject types for identity classification.
+	// Keys are subject type identifiers (e.g., "user", "service_account").
+	Subjects map[string]SubjectConfig `koanf:"subjects"`
+	// Authorization defines authorization (Casbin) settings.
+	Authorization AuthorizationConfig `koanf:"authorization"`
+}
+
+// SecurityDefaults returns the default security configuration.
+func SecurityDefaults() SecurityConfig {
+	return SecurityConfig{
+		Enabled:        true,
+		Authentication: AuthenticationDefaults(),
+		Subjects:       nil,
+		Authorization:  AuthorizationDefaults(),
+	}
+}
+
+// Validate validates the security configuration.
+func (c *SecurityConfig) Validate(path *config.Path) config.ValidationErrors {
+	if !c.Enabled {
+		return nil // skip all validation when security is disabled
+	}
+
+	var errs config.ValidationErrors
+
+	errs = append(errs, c.Authentication.Validate(path.Child("authentication"))...)
+	errs = append(errs, c.validateSubjects(path.Child("subjects"))...)
+	errs = append(errs, c.Authorization.Validate(path.Child("authorization"))...)
+
+	return errs
+}
+
+// KnownActorTypes returns every actor.Type value ExtractActor can produce:
+// "anonymous" (no subject context), "user" (a subject context with no Type
+// configured — audit.ExtractActor's fallback), and every configured subject
+// type name. Used to validate audit.policies[].match.actor_types against the
+// same set audit.Actor.Type is actually drawn from, so a typo there doesn't
+// silently produce a selector that never matches.
+func (c *SecurityConfig) KnownActorTypes() []string {
+	types := make([]string, 0, len(c.Subjects)+2)
+	types = append(types, "anonymous", "user")
+	subjectNames := make([]string, 0, len(c.Subjects))
+	for name := range c.Subjects {
+		subjectNames = append(subjectNames, name)
+	}
+	// Subjects is a map, so its iteration order is randomized per run —
+	// sorting keeps the "must be one of: ..." validation message (and any
+	// test asserting it) deterministic across runs.
+	sort.Strings(subjectNames)
+	return append(types, subjectNames...)
+}
+
+// validateSubjects validates the subjects map configuration.
+func (c *SecurityConfig) validateSubjects(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	// Check for duplicate priorities
+	prioritiesSeen := make(map[int]string)
+	for name, subj := range c.Subjects {
+		errs = append(errs, subj.Validate(path.Child(name))...)
+
+		if existingName, exists := prioritiesSeen[subj.Priority]; exists {
+			errs = append(errs, config.Invalid(path.Child(name).Child("priority"),
+				fmt.Sprintf("duplicate priority %d (also used by %q)", subj.Priority, existingName)))
+		} else {
+			prioritiesSeen[subj.Priority] = name
+		}
+	}
+
+	return errs
+}
+
+// AuthenticationConfig defines authentication settings.
+type AuthenticationConfig struct {
+	// JWT defines JWT authentication settings.
+	JWT JWTConfig `koanf:"jwt"`
+}
+
+// AuthenticationDefaults returns the default authentication configuration.
+func AuthenticationDefaults() AuthenticationConfig {
+	return AuthenticationConfig{
+		JWT: JWTDefaults(),
+	}
+}
+
+// Validate validates the authentication configuration.
+func (c *AuthenticationConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+	errs = append(errs, c.JWT.Validate(path.Child("jwt"))...)
+	return errs
+}
+
+// JWTConfig defines JWT authentication settings.
+type JWTConfig struct {
+	// Audiences is the list of acceptable token audiences (aud claim).
+	// Token must contain at least one of these audiences. Optional.
+	Audiences []string `koanf:"audiences"`
+	// ClockSkew is the allowed clock skew for token validation.
+	ClockSkew time.Duration `koanf:"clock_skew"`
+	// JWKS defines JSON Web Key Set operational settings.
+	JWKS JWKSConfig `koanf:"jwks"`
+}
+
+// JWTDefaults returns the default JWT configuration.
+func JWTDefaults() JWTConfig {
+	return JWTConfig{
+		ClockSkew: 0,
+		JWKS:      JWKSDefaults(),
+	}
+}
+
+// Validate validates the JWT configuration.
+func (c *JWTConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	if err := config.MustBeNonNegative(path.Child("clock_skew"), c.ClockSkew); err != nil {
+		errs = append(errs, err)
+	}
+
+	errs = append(errs, c.JWKS.Validate(path.Child("jwks"))...)
+
+	return errs
+}
+
+// ToJWTMiddlewareConfig converts to the JWT middleware library config.
+// The oidc parameter provides issuer and JWKS URL from identity configuration.
+// The securityEnabled parameter propagates the top-level security.enabled flag.
+func (c *JWTConfig) ToJWTMiddlewareConfig(oidc *OIDCConfig, logger *slog.Logger, resolver *jwt.Resolver, securityEnabled bool) jwt.Config {
+	return jwt.Config{
+		Disabled:                     !securityEnabled,
+		JWKSURL:                      oidc.JWKSURL,
+		JWKSRefreshInterval:          c.JWKS.RefreshInterval,
+		JWKSURLTLSInsecureSkipVerify: c.JWKS.SkipTLSVerify,
+		ValidateIssuer:               oidc.Issuer,
+		ValidateAudiences:            c.Audiences,
+		ClockSkew:                    c.ClockSkew,
+		Detector:                     resolver,
+		Logger:                       logger,
+	}
+}
+
+// JWKSConfig defines JWKS (JSON Web Key Set) operational settings.
+// Note: The JWKS URL comes from identity.oidc.jwks_url.
+type JWKSConfig struct {
+	// RefreshInterval is how often to refresh keys from the JWKS URL.
+	RefreshInterval time.Duration `koanf:"refresh_interval"`
+	// SkipTLSVerify skips TLS certificate verification for JWKS URL.
+	// WARNING: Only use for development/testing.
+	SkipTLSVerify bool `koanf:"skip_tls_verify"`
+}
+
+// JWKSDefaults returns the default JWKS configuration.
+func JWKSDefaults() JWKSConfig {
+	return JWKSConfig{
+		RefreshInterval: 1 * time.Hour,
+		SkipTLSVerify:   false,
+	}
+}
+
+// Validate validates the JWKS configuration.
+func (c *JWKSConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	if err := config.MustBeNonNegative(path.Child("refresh_interval"), c.RefreshInterval); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errs
+}
+
+// SubjectConfig defines a subject type for identity classification.
+type SubjectConfig struct {
+	// DisplayName is the human-readable name for this subject type.
+	DisplayName string `koanf:"display_name"`
+	// Priority determines check order (lower = higher priority).
+	Priority int `koanf:"priority"`
+	// Mechanisms defines authentication mechanisms and their entitlement extraction.
+	// Keys are mechanism types (e.g., "jwt").
+	Mechanisms map[string]MechanismConfig `koanf:"mechanisms"`
+}
+
+// Validate validates the subject configuration.
+func (c *SubjectConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	if c.DisplayName == "" {
+		errs = append(errs, config.Required(path.Child("display_name")))
+	}
+
+	if len(c.Mechanisms) == 0 {
+		errs = append(errs, config.Required(path.Child("mechanisms")))
+	}
+
+	for mechType, mech := range c.Mechanisms {
+		errs = append(errs, mech.Validate(path.Child("mechanisms").Child(mechType))...)
+	}
+
+	return errs
+}
+
+// MechanismConfig defines an authentication mechanism for a subject type.
+type MechanismConfig struct {
+	// ReadableIDClaim is the claim recorded as an audit event's actor.id.
+	// Optional: audit falls back to audit.actor.id_claim and then to sub.
+	ReadableIDClaim string `koanf:"readable_id_claim"`
+	// Entitlement defines how to extract entitlement claims.
+	Entitlement EntitlementConfig `koanf:"entitlement"`
+}
+
+// Validate validates the mechanism configuration.
+func (c *MechanismConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+	errs = append(errs, c.Entitlement.Validate(path.Child("entitlement"))...)
+	return errs
+}
+
+// EntitlementConfig defines how to extract entitlement claims from tokens.
+type EntitlementConfig struct {
+	// Claim is the claim name for entitlement extraction.
+	Claim string `koanf:"claim"`
+	// DisplayName is the human-readable name for the claim.
+	DisplayName string `koanf:"display_name"`
+}
+
+// Validate validates the entitlement configuration.
+func (c *EntitlementConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	if c.Claim == "" {
+		errs = append(errs, config.Required(path.Child("claim")))
+	}
+
+	if c.DisplayName == "" {
+		errs = append(errs, config.Required(path.Child("display_name")))
+	}
+
+	return errs
+}
+
+// ToSubjectUserTypeConfigs converts the map-based subjects config to the subject library's slice format.
+func (c *SecurityConfig) ToSubjectUserTypeConfigs() []subject.UserTypeConfig {
+	if len(c.Subjects) == 0 {
+		return nil
+	}
+
+	result := make([]subject.UserTypeConfig, 0, len(c.Subjects))
+	for typeName, subj := range c.Subjects {
+		mechanisms := make([]subject.AuthMechanismConfig, 0, len(subj.Mechanisms))
+		for mechType, mech := range subj.Mechanisms {
+			mechanisms = append(mechanisms, subject.AuthMechanismConfig{
+				Type:            mechType,
+				ReadableIDClaim: mech.ReadableIDClaim,
+				Entitlement: subject.EntitlementConfig{
+					Claim:       mech.Entitlement.Claim,
+					DisplayName: mech.Entitlement.DisplayName,
+				},
+			})
+		}
+
+		result = append(result, subject.UserTypeConfig{
+			Type:           typeName,
+			DisplayName:    subj.DisplayName,
+			Priority:       subj.Priority,
+			AuthMechanisms: mechanisms,
+		})
+	}
+
+	// Sort by priority to ensure deterministic order
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Priority < result[j].Priority
+	})
+
+	return result
+}
+
+// AuthorizationConfig defines authorization (Casbin) settings.
+// Policies are loaded from ClusterAuthzRole, AuthzRole, ClusterAuthzRoleBinding, and AuthzRoleBinding CRDs.
+type AuthorizationConfig struct {
+	// Enabled enables authorization enforcement.
+	Enabled bool `koanf:"enabled"`
+	// Cache defines caching settings for authorization decisions.
+	Cache AuthzCacheConfig `koanf:"cache"`
+	// ResyncInterval is the interval for informer cache resync.
+	// This triggers re-listing of CRDs and OnUpdate callbacks for reconciliation.
+	// Set to 0 to disable periodic resync (watch events still work).
+	ResyncInterval time.Duration `koanf:"resync_interval"`
+}
+
+// AuthzCacheConfig defines caching settings for authorization.
+type AuthzCacheConfig struct {
+	// Enabled enables the Casbin enforcer cache.
+	Enabled bool `koanf:"enabled"`
+	// TTL is the cache time-to-live duration.
+	TTL time.Duration `koanf:"ttl"`
+}
+
+// AuthzCacheDefaults returns the default cache configuration.
+func AuthzCacheDefaults() AuthzCacheConfig {
+	return AuthzCacheConfig{
+		Enabled: false,
+		TTL:     5 * time.Minute,
+	}
+}
+
+// AuthorizationDefaults returns the default authorization configuration.
+func AuthorizationDefaults() AuthorizationConfig {
+	return AuthorizationConfig{
+		Enabled:        false,
+		Cache:          AuthzCacheDefaults(),
+		ResyncInterval: 10 * time.Minute,
+	}
+}
+
+// Validate validates the authorization configuration.
+func (c *AuthorizationConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	if !c.Enabled {
+		return errs // skip validation if disabled
+	}
+
+	errs = append(errs, c.Cache.Validate(path.Child("cache"))...)
+
+	if c.ResyncInterval < 0 {
+		errs = append(errs, config.Invalid(path.Child("resync_interval"), "must be non-negative"))
+	}
+
+	return errs
+}
+
+// Validate validates the cache configuration.
+func (c *AuthzCacheConfig) Validate(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	if c.Enabled {
+		if err := config.MustBeGreaterThan(path.Child("ttl"), c.TTL, 0); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errs
+}
+
+// ToAuthzConfig converts to the authz library config.
+// The securityEnabled parameter propagates the top-level security.enabled flag.
+func (c *AuthorizationConfig) ToAuthzConfig(securityEnabled bool) authz.Config {
+	return authz.Config{
+		Enabled:        securityEnabled && c.Enabled,
+		CacheEnabled:   c.Cache.Enabled,
+		CacheTTL:       c.Cache.TTL,
+		ResyncInterval: c.ResyncInterval,
+	}
+}

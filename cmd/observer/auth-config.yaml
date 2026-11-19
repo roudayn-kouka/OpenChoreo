@@ -1,0 +1,22 @@
+# Observer Service Authentication Configuration
+
+auth:
+  subject_types:
+    - type: "user"
+      display_name: "User"
+      priority: 1
+      auth_mechanisms:
+        - type: "jwt"
+          readable_id_claim: "username"
+          entitlement:
+            claim: "groups"
+            display_name: "User Group"
+    - type: "service_account"
+      display_name: "Service Account"
+      priority: 2
+      auth_mechanisms:
+        - type: "jwt"
+          readable_id_claim: "client_id"
+          entitlement:
+            claim: "client_id"
+            display_name: "Client ID"

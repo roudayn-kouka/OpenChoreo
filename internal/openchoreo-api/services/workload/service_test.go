@@ -1,0 +1,346 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package workload
+
+import (
+	"context"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/labels"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services/testutil"
+)
+
+const (
+	testNamespace     = "test-ns"
+	testProjectName   = "test-project"
+	testComponentName = "test-comp"
+	testWorkloadName  = "test-workload"
+)
+
+func newService(t *testing.T, objs ...client.Object) Service {
+	t.Helper()
+	return NewService(testutil.NewFakeClient(objs...), testutil.TestLogger())
+}
+
+func TestCreateWorkload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("success", func(t *testing.T) {
+		comp := testutil.NewComponent(testNamespace, testProjectName, testComponentName)
+		svc := newService(t, comp)
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+
+		result, err := svc.CreateWorkload(ctx, testNamespace, w)
+		require.NoError(t, err)
+		assert.Equal(t, workloadTypeMeta, result.TypeMeta)
+		assert.Equal(t, testNamespace, result.Namespace)
+		assert.Equal(t, openchoreov1alpha1.WorkloadStatus{}, result.Status)
+		assert.Equal(t, testProjectName, result.Labels[labels.LabelKeyProjectName])
+		assert.Equal(t, testComponentName, result.Labels[labels.LabelKeyComponentName])
+	})
+
+	t.Run("nil input", func(t *testing.T) {
+		svc := newService(t)
+
+		_, err := svc.CreateWorkload(ctx, testNamespace, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot be nil")
+	})
+
+	t.Run("component not found", func(t *testing.T) {
+		svc := newService(t)
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+
+		_, err := svc.CreateWorkload(ctx, testNamespace, w)
+		require.ErrorIs(t, err, ErrComponentNotFound)
+	})
+
+	t.Run("already exists", func(t *testing.T) {
+		comp := testutil.NewComponent(testNamespace, testProjectName, testComponentName)
+		existing := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		svc := newService(t, comp, existing)
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+
+		_, err := svc.CreateWorkload(ctx, testNamespace, w)
+		require.ErrorIs(t, err, ErrWorkloadAlreadyExists)
+	})
+
+	t.Run("same name in other namespace succeeds", func(t *testing.T) {
+		existing := testutil.NewWorkload("other-ns", testProjectName, testComponentName, testWorkloadName)
+		comp := testutil.NewComponent(testNamespace, testProjectName, testComponentName)
+		svc := newService(t, existing, comp)
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+
+		result, err := svc.CreateWorkload(ctx, testNamespace, w)
+		require.NoError(t, err)
+		assert.Equal(t, testNamespace, result.Namespace)
+	})
+
+	t.Run("sets labels when labels are nil", func(t *testing.T) {
+		comp := testutil.NewComponent(testNamespace, testProjectName, testComponentName)
+		svc := newService(t, comp)
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		w.Labels = nil
+
+		result, err := svc.CreateWorkload(ctx, testNamespace, w)
+		require.NoError(t, err)
+		assert.Equal(t, testProjectName, result.Labels[labels.LabelKeyProjectName])
+		assert.Equal(t, testComponentName, result.Labels[labels.LabelKeyComponentName])
+	})
+}
+
+func TestUpdateWorkload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("success", func(t *testing.T) {
+		existing := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		svc := newService(t, existing)
+
+		update := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		update.Labels = map[string]string{"env": "prod"}
+		update.Annotations = map[string]string{"note": "updated"}
+
+		result, err := svc.UpdateWorkload(ctx, testNamespace, update)
+		require.NoError(t, err)
+		assert.Equal(t, workloadTypeMeta, result.TypeMeta)
+		assert.Equal(t, "prod", result.Labels["env"])
+		assert.Equal(t, "updated", result.Annotations["note"])
+		assert.Equal(t, testProjectName, result.Labels[labels.LabelKeyProjectName])
+		assert.Equal(t, testComponentName, result.Labels[labels.LabelKeyComponentName])
+	})
+
+	t.Run("nil input", func(t *testing.T) {
+		svc := newService(t)
+
+		_, err := svc.UpdateWorkload(ctx, testNamespace, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot be nil")
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		svc := newService(t)
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, "nonexistent")
+
+		_, err := svc.UpdateWorkload(ctx, testNamespace, w)
+		require.ErrorIs(t, err, ErrWorkloadNotFound)
+	})
+
+	t.Run("clears status from user input", func(t *testing.T) {
+		existing := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		svc := newService(t, existing)
+
+		update := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+
+		result, err := svc.UpdateWorkload(ctx, testNamespace, update)
+		require.NoError(t, err)
+		assert.Equal(t, openchoreov1alpha1.WorkloadStatus{}, result.Status)
+	})
+
+	t.Run("preserves special labels when user labels are nil", func(t *testing.T) {
+		existing := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		svc := newService(t, existing)
+
+		update := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		update.Labels = nil
+
+		result, err := svc.UpdateWorkload(ctx, testNamespace, update)
+		require.NoError(t, err)
+		assert.Equal(t, testProjectName, result.Labels[labels.LabelKeyProjectName])
+		assert.Equal(t, testComponentName, result.Labels[labels.LabelKeyComponentName])
+	})
+}
+
+func TestListWorkloads(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("success with items", func(t *testing.T) {
+		w1 := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, "wl-1")
+		w2 := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, "wl-2")
+		svc := newService(t, w1, w2)
+
+		result, err := svc.ListWorkloads(ctx, testNamespace, "", services.ListOptions{})
+		require.NoError(t, err)
+		assert.Len(t, result.Items, 2)
+		for _, item := range result.Items {
+			assert.Equal(t, workloadTypeMeta, item.TypeMeta)
+		}
+	})
+
+	t.Run("empty list", func(t *testing.T) {
+		svc := newService(t)
+
+		result, err := svc.ListWorkloads(ctx, testNamespace, "", services.ListOptions{})
+		require.NoError(t, err)
+		assert.Empty(t, result.Items)
+	})
+
+	t.Run("namespace isolation", func(t *testing.T) {
+		wInNs := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, "wl-in")
+		wOtherNs := testutil.NewWorkload("other-ns", testProjectName, testComponentName, "wl-out")
+		svc := newService(t, wInNs, wOtherNs)
+
+		result, err := svc.ListWorkloads(ctx, testNamespace, "", services.ListOptions{})
+		require.NoError(t, err)
+		assert.Len(t, result.Items, 1)
+		assert.Equal(t, "wl-in", result.Items[0].Name)
+	})
+
+	t.Run("filter by component name", func(t *testing.T) {
+		w1 := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, "wl-comp1")
+		w2 := testutil.NewWorkload(testNamespace, testProjectName, "other-comp", "wl-comp2")
+		svc := newService(t, w1, w2)
+
+		result, err := svc.ListWorkloads(ctx, testNamespace, testComponentName, services.ListOptions{})
+		require.NoError(t, err)
+		assert.Len(t, result.Items, 1)
+		assert.Equal(t, "wl-comp1", result.Items[0].Name)
+	})
+
+	t.Run("no component filter returns all", func(t *testing.T) {
+		w1 := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, "wl-a")
+		w2 := testutil.NewWorkload(testNamespace, testProjectName, "other-comp", "wl-b")
+		svc := newService(t, w1, w2)
+
+		result, err := svc.ListWorkloads(ctx, testNamespace, "", services.ListOptions{})
+		require.NoError(t, err)
+		assert.Len(t, result.Items, 2)
+	})
+}
+
+func TestGetWorkload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("found", func(t *testing.T) {
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		svc := newService(t, w)
+
+		result, err := svc.GetWorkload(ctx, testNamespace, testWorkloadName)
+		require.NoError(t, err)
+		assert.Equal(t, workloadTypeMeta, result.TypeMeta)
+		assert.Equal(t, testWorkloadName, result.Name)
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		svc := newService(t)
+
+		_, err := svc.GetWorkload(ctx, testNamespace, "nonexistent")
+		require.ErrorIs(t, err, ErrWorkloadNotFound)
+	})
+}
+
+func TestDeleteWorkload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("success", func(t *testing.T) {
+		w := testutil.NewWorkload(testNamespace, testProjectName, testComponentName, testWorkloadName)
+		svc := newService(t, w)
+
+		err := svc.DeleteWorkload(ctx, testNamespace, testWorkloadName)
+		require.NoError(t, err)
+
+		_, err = svc.GetWorkload(ctx, testNamespace, testWorkloadName)
+		require.ErrorIs(t, err, ErrWorkloadNotFound)
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		svc := newService(t)
+
+		err := svc.DeleteWorkload(ctx, testNamespace, "nonexistent")
+		require.ErrorIs(t, err, ErrWorkloadNotFound)
+	})
+}
+
+func TestGetWorkloadSchema(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns valid schema", func(t *testing.T) {
+		svc := newService(t)
+
+		schema, err := svc.GetWorkloadSchema(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "object", schema.Type)
+		assert.Contains(t, schema.Required, "container")
+
+		container, ok := schema.Properties["container"]
+		require.True(t, ok)
+		assert.Contains(t, container.Required, "image")
+	})
+
+	t.Run("exposes endpoint and resource dependencies", func(t *testing.T) {
+		svc := newService(t)
+
+		schema, err := svc.GetWorkloadSchema(ctx)
+		require.NoError(t, err)
+
+		deps, ok := schema.Properties["dependencies"]
+		require.True(t, ok, "schema must define dependencies")
+		assert.Equal(t, "object", deps.Type)
+
+		// Endpoint dependencies on other components.
+		endpoints, ok := deps.Properties["endpoints"]
+		require.True(t, ok, "dependencies must define endpoints")
+		assert.Equal(t, "array", endpoints.Type)
+
+		// Resource dependencies on project-bound Resources.
+		resources, ok := deps.Properties["resources"]
+		require.True(t, ok, "dependencies must define resources")
+		assert.Equal(t, "array", resources.Type)
+		require.NotNil(t, resources.Items)
+		require.NotNil(t, resources.Items.Schema)
+
+		item := resources.Items.Schema
+		assert.Equal(t, "object", item.Type)
+		assert.Contains(t, item.Required, "ref")
+
+		ref, ok := item.Properties["ref"]
+		require.True(t, ok, "resource dependency must define ref")
+		assert.Equal(t, "string", ref.Type)
+
+		// envBindings and fileBindings are maps of output name -> target, so
+		// they use additionalProperties (string), not fixed properties.
+		for _, name := range []string{"envBindings", "fileBindings"} {
+			binding, ok := item.Properties[name]
+			require.True(t, ok, "resource dependency must define %s", name)
+			assert.Equal(t, "object", binding.Type)
+			require.NotNil(t, binding.AdditionalProperties, "%s must set additionalProperties", name)
+			require.NotNil(t, binding.AdditionalProperties.Schema, "%s additionalProperties must have a schema", name)
+			assert.Equal(t, "string", binding.AdditionalProperties.Schema.Type)
+		}
+	})
+}
+
+// TestWorkloadSpecSchemaCoversEveryField is a drift guard. workloadSpecSchema is
+// hand-written, and it is what GetWorkloadSchema advertises -- so a field added
+// to WorkloadTemplateSpec but not to the schema is invisible to every consumer
+// that discovers the workload shape from it, MCP included, with nothing failing
+// to say so.
+//
+// That has already happened: `source` was added to the spec and this schema was
+// not updated, so commit provenance could not be set through the advertised
+// shape at all. This fails instead of letting the next field go the same way.
+func TestWorkloadSpecSchemaCoversEveryField(t *testing.T) {
+	schema := workloadSpecSchema()
+	specType := reflect.TypeOf(openchoreov1alpha1.WorkloadTemplateSpec{})
+
+	for i := range specType.NumField() {
+		field := specType.Field(i)
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		_, ok := schema.Properties[name]
+		assert.Truef(t, ok,
+			"WorkloadTemplateSpec.%s is serialized as %q but workloadSpecSchema does not "+
+				"describe it, so no consumer reading the advertised schema can set it",
+			field.Name, name)
+	}
+}

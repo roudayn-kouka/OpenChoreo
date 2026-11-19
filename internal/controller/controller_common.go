@@ -1,0 +1,68 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"context"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// States for conditions
+const (
+	TypeAccepted    = "Accepted"
+	TypeProgressing = "Progressing"
+	TypeAvailable   = "Available"
+	TypeCreated     = "Created"
+	TypeReady       = "Ready"
+	TypeTerminating = "Terminating"
+)
+
+// Status update intervals
+const (
+	// StatusUpdateInterval is the interval at which controllers should refresh status fields
+	// This is used for periodic status updates like agent connection status
+	StatusUpdateInterval = 1 * time.Minute
+)
+
+// UpdateCondition updates or adds a condition to any resource that has a Status with Conditions
+func UpdateCondition(
+	ctx context.Context,
+	c client.StatusWriter,
+	resource client.Object,
+	conditions *[]metav1.Condition,
+	conditionType string,
+	status metav1.ConditionStatus,
+	reason, message string,
+) error {
+	logger := log.FromContext(ctx)
+
+	// Built through NewCondition so the message bound applies here too - this helper is
+	// the other way a condition reaches a status write.
+	condition := NewCondition(ConditionType(conditionType), status, ConditionReason(reason),
+		message, resource.GetGeneration())
+
+	changed := meta.SetStatusCondition(conditions, condition)
+	if changed {
+		logger.Info("Updating Resource status",
+			"Resource.Kind", resource.GetObjectKind().GroupVersionKind().Kind,
+			"Resource.Name", resource.GetName())
+
+		if err := c.Update(ctx, resource); err != nil {
+			logger.Error(err, "Failed to update resource status",
+				"Resource.Kind", resource.GetObjectKind().GroupVersionKind().Kind,
+				"Resource.Name", resource.GetName())
+			return err
+		}
+
+		logger.Info("Updated Resource status",
+			"Resource.Kind", resource.GetObjectKind().GroupVersionKind().Kind,
+			"Resource.Name", resource.GetName())
+	}
+	return nil
+}

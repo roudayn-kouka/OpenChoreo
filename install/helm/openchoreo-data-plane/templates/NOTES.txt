@@ -1,0 +1,22 @@
+OpenChoreo Data Plane installed in namespace "{{ .Release.Namespace }}".
+
+{{- if .Values.gateway.enabled }}
+
+Gateway:
+{{- if .Values.gateway.tls.enabled }}
+  Domain: {{ .Values.gateway.tls.hostname }}
+{{- end }}
+  HTTP:   {{ .Values.gateway.httpPort }}
+{{- if .Values.gateway.tls.enabled }}
+  HTTPS:  {{ .Values.gateway.httpsPort }}
+{{- end }}
+{{- end }}
+
+Cluster Agent:
+  Server:   {{ .Values.clusterAgent.serverUrl }}
+  Plane ID: {{ .Values.clusterAgent.planeID }}
+
+Components:
+  Gateway:       {{ ternary "enabled" "disabled" .Values.gateway.enabled }}
+  Cluster Agent: enabled
+  Networking:    {{ ternary "enabled" "disabled" .Values.networking.enabled }}

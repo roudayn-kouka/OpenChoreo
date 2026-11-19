@@ -1,0 +1,95 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package workflowpipeline
+
+import (
+	"time"
+
+	"github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/template"
+)
+
+// Pipeline orchestrates workflow rendering by combining WorkflowRun,
+// Workflow to generate fully resolved resources (e.g., Argo Workflow).
+type Pipeline struct {
+	templateEngine *template.Engine
+
+	// celCostLimit bounds the accumulated cost of a single CEL expression.
+	// Zero selects the template engine's built-in default.
+	celCostLimit uint64
+
+	// renderTimeout bounds the wall-clock duration of each public entry point on this
+	// pipeline. The deadline is derived per call, so a caller that renders more than once
+	// gets a fresh one each time. Zero or negative means no deadline.
+	renderTimeout time.Duration
+}
+
+// RenderInput contains all required inputs for workflow rendering.
+type RenderInput struct {
+	// WorkflowRun is the workflow execution instance with developer parameters (required).
+	WorkflowRun *v1alpha1.WorkflowRun
+
+	// Workflow contains the schema and resource template (required).
+	Workflow *v1alpha1.Workflow
+
+	// Context provides workflow execution context metadata (required).
+	Context WorkflowContext
+}
+
+// RenderOutput contains the rendered workflow resource and associated metadata.
+type RenderOutput struct {
+	// Resource is the fully rendered workflow resource as a map that can be converted
+	// to unstructured.Unstructured for Kubernetes API operations.
+	Resource map[string]any
+
+	// Resources contains additional rendered Kubernetes resources (e.g., secrets, configmaps)
+	// to be applied alongside the main workflow resource.
+	Resources []RenderedResource
+
+	// Metadata contains rendering process information such as warnings.
+	Metadata *RenderMetadata
+}
+
+// RenderedResource represents a rendered Kubernetes resource with its identifier.
+type RenderedResource struct {
+	// ID is the unique identifier for this resource from the Workflow spec.
+	ID string
+
+	// Resource is the fully rendered Kubernetes resource as a map.
+	Resource map[string]any
+}
+
+// RenderMetadata contains non-fatal information about the rendering process.
+type RenderMetadata struct {
+	// Warnings lists non-fatal issues encountered during rendering.
+	Warnings []string
+}
+
+// WorkflowContext provides contextual metadata for workflow rendering.
+// These values are injected into CEL expressions as ${metadata.*} variables.
+type WorkflowContext struct {
+	// NamespaceName is the namespace name.
+	NamespaceName string
+
+	// WorkflowRunName is the name of the workflow run CR.
+	WorkflowRunName string
+
+	// Labels contains the WorkflowRun labels, exposed to CEL as ${metadata.labels['key']}.
+	Labels map[string]string
+
+	// ExternalRefs contains resolved external CR specs keyed by their id.
+	// Entries are injected into the CEL context under the "externalRefs" map
+	// and accessed as ${externalRefs['<id>'].spec.*}, e.g. ${externalRefs['git-secret-reference'].spec.template.type}.
+	ExternalRefs map[string]any
+
+	// WorkflowPlane contains workflow plane configuration data exposed to CEL as ${workflowplane.*}.
+	WorkflowPlane WorkflowPlaneData
+}
+
+// WorkflowPlaneData contains workflow plane configuration exposed to CEL templates.
+type WorkflowPlaneData struct {
+	// SecretStore is the name of the ESO ClusterSecretStore configured on the workflow plane.
+	// Exposed as ${workflowplane.secretStore}.
+	SecretStore string
+}

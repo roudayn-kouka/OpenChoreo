@@ -1,0 +1,57 @@
+## Append samples of your project ##
+resources:
+  - openchoreo_v1alpha1_api.yaml
+  - openchoreo_v1alpha1_apibinding.yaml
+  - openchoreo_v1alpha1_apiclass.yaml
+  - openchoreo_v1alpha1_component.yaml
+  - openchoreo_v1alpha1_componenttype.yaml
+  - openchoreo_v1alpha1_resource.yaml
+  - openchoreo_v1alpha1_resourcetype.yaml
+  - openchoreo_v1alpha1_trait.yaml
+
+  - openchoreo_v1alpha1_dataplane.yaml
+  - openchoreo_v1alpha1_deployableartifact.yaml
+  - openchoreo_v1alpha1_deployment.yaml
+  - openchoreo_v1alpha1_deploymentpipeline.yaml
+
+  - openchoreo_v1alpha1_endpoint.yaml
+  - openchoreo_v1alpha1_environment.yaml
+
+  - openchoreo_v1alpha1_project.yaml
+  - openchoreo_v1alpha1_renderedrelease.yaml
+  - openchoreo_v1alpha1_scheduledtask.yaml
+  - openchoreo_v1alpha1_scheduledtaskbinding.yaml
+  - openchoreo_v1alpha1_scheduledtaskclass.yaml
+  - openchoreo_v1alpha1_service.yaml
+  - openchoreo_v1alpha1_servicebinding.yaml
+  - openchoreo_v1alpha1_serviceclass.yaml
+  - openchoreo_v1alpha1_webapplication.yaml
+  - openchoreo_v1alpha1_webapplicationbinding.yaml
+  - openchoreo_v1alpha1_webapplicationclass.yaml
+  - openchoreo_v1alpha1_workload.yaml
+
+  - openchoreo_v1alpha1_workflowplane.yaml
+  - openchoreo_v1alpha1_workflow.yaml
+  - openchoreo_v1alpha1_workflowrun.yaml
+  - openchoreo_v1alpha1_secretreference.yaml
+  - openchoreo_v1alpha1_componentrelease.yaml
+  - openchoreo_v1alpha1_resourcerelease.yaml
+  - openchoreo_v1alpha1_releasebinding.yaml
+  - openchoreo_v1alpha1_resourcereleasebinding.yaml
+  - openchoreo_v1alpha1_observabilityplane.yaml
+  - v1alpha1_observabilityalertsnotificationchannel.yaml
+  - v1alpha1_observabilityalertrule.yaml
+  - v1alpha1_authzrole.yaml
+  - v1alpha1_authzrolebinding.yaml
+  - v1alpha1_clusterauthzrole.yaml
+  - v1alpha1_clusterauthzrolebinding.yaml
+  - openchoreo_v1alpha1_clusterdataplane.yaml
+  - openchoreo_v1alpha1_clusterworkflowplane.yaml
+  - openchoreo_v1alpha1_clusterobservabilityplane.yaml
+  - openchoreo_v1alpha1_clustercomponenttype.yaml
+  - openchoreo_v1alpha1_clusterresourcetype.yaml
+  - v1alpha1_projecttype.yaml
+  - v1alpha1_clusterprojecttype.yaml
+  - v1alpha1_projectrelease.yaml
+  - v1alpha1_projectreleasebinding.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

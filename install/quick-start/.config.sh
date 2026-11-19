@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Shared configuration for OpenChoreo quick-start
+# This file is sourced by both interactive shells (.bashrc) and installation scripts
+# to maintain a single source of truth for configuration values
+
+# Cluster configuration
+CLUSTER_NAME="openchoreo-quick-start"
+KUBECONFIG_PATH="$HOME/.kube/config"
+
+# Namespace definitions
+CONTROL_PLANE_NS="openchoreo-control-plane"
+DATA_PLANE_NS="openchoreo-data-plane"
+WORKFLOW_PLANE_NS="openchoreo-workflow-plane"
+OBSERVABILITY_NS="openchoreo-observability-plane"
+THUNDER_NS="thunder"
+
+# Helm repository
+HELM_REPO="${OPENCHOREO_HELM_REPO:-oci://cr.openchoreo.dev/openchoreo/helm-charts}"
+MODULES_HELM_REPO="${OPENCHOREO_MODULES_HELM_REPO:-oci://cr.openchoreo.dev/openchoreo/helm-charts}"
+
+# Cert-manager configuration
+CERT_MANAGER_VERSION="v1.19.4"
+CERT_MANAGER_REPO="oci://quay.io/jetstack/charts"
+
+# External Secrets Operator configuration
+ESO_VERSION="v2.0.1"
+ESO_REPO="oci://ghcr.io/external-secrets/charts"
+
+# kgateway configuration
+KGATEWAY_VERSION="v2.3.1"
+
+# ThunderID configuration
+THUNDER_VERSION="1.0.1"
+
+# Observability module versions (community-modules): 0.0.0-latest-dev on main,
+# pinned on release branches by hack/pin-observability-modules.sh
+LOGS_OPENSEARCH_VERSION="0.0.0-latest-dev"
+TRACES_OPENSEARCH_VERSION="0.0.0-latest-dev"
+METRICS_PROMETHEUS_VERSION="0.0.0-latest-dev"
+EVENTS_OTEL_COLLECTOR_VERSION="0.0.0-latest-dev"
+FINOPS_OPENCOST_VERSION="0.0.0-latest-dev"

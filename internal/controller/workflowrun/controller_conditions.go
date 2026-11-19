@@ -1,0 +1,214 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package workflowrun
+
+import (
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/controller"
+)
+
+const (
+	ConditionWorkflowRunning   controller.ConditionType = "WorkflowRunning"
+	ConditionWorkflowFailed    controller.ConditionType = "WorkflowFailed"
+	ConditionWorkflowSucceeded controller.ConditionType = "WorkflowSucceeded"
+	ConditionWorkflowCompleted controller.ConditionType = "WorkflowCompleted"
+)
+
+const (
+	ReasonWorkflowPending               controller.ConditionReason = "WorkflowPending"
+	ReasonWorkflowRunning               controller.ConditionReason = "WorkflowRunning"
+	ReasonWorkflowSucceeded             controller.ConditionReason = "WorkflowSucceeded"
+	ReasonWorkflowFailed                controller.ConditionReason = "WorkflowFailed"
+	ReasonWorkflowPlaneNotFound         controller.ConditionReason = "WorkflowPlaneNotFound"
+	ReasonWorkflowPlaneResolutionFailed controller.ConditionReason = "WorkflowPlaneResolutionFailed"
+	ReasonWorkflowResolutionFailed      controller.ConditionReason = "WorkflowResolutionFailed"
+	ReasonComponentValidationFailed     controller.ConditionReason = "ComponentValidationFailed"
+	ReasonWorkflowRenderingFailed       controller.ConditionReason = "WorkflowRenderingFailed"
+)
+
+func setWorkflowPendingCondition(workflowRun *openchoreov1alpha1.WorkflowRun) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowPending),
+		Message:            "Workflow has not completed yet",
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+func setWorkflowRunningCondition(workflowRun *openchoreov1alpha1.WorkflowRun) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowRunning),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonWorkflowRunning),
+		Message:            "Argo Workflow is running",
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+func setWorkflowSucceededCondition(workflowRun *openchoreov1alpha1.WorkflowRun) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowRunning),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowRunning),
+		Message:            "Argo Workflow running has completed",
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowSucceeded),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonWorkflowSucceeded),
+		Message:            "Workflow completed successfully",
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonWorkflowSucceeded),
+		Message:            "Workflow has completed successfully",
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+func setWorkflowFailedCondition(workflowRun *openchoreov1alpha1.WorkflowRun) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowRunning),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowRunning),
+		Message:            "Argo Workflow running has completed",
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowFailed),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonWorkflowFailed),
+		Message:            "Workflow execution failed",
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonWorkflowFailed),
+		Message:            "Workflow has completed with failure",
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+func setWorkflowPlaneNotFoundCondition(workflowRun *openchoreov1alpha1.WorkflowRun) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowPlaneNotFound),
+		Message:            "No workflow plane found for the workflow associated with this workflow run",
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+func setWorkflowPlaneResolutionFailedCondition(workflowRun *openchoreov1alpha1.WorkflowRun, err error) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowPlaneResolutionFailed),
+		Message:            "Failed to resolve workflow plane: " + err.Error(),
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+func setWorkflowNotFoundCondition(workflowRun *openchoreov1alpha1.WorkflowRun) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowRunning),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowRunning),
+		Message:            "Workflow is not found in the cluster",
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowFailed),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonWorkflowFailed),
+		Message:            "Workflow is not found in the cluster",
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonWorkflowFailed),
+		Message:            "Workflow is not found in the cluster",
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+func setWorkflowResolutionFailedCondition(workflowRun *openchoreov1alpha1.WorkflowRun, err error) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowResolutionFailed),
+		Message:            "Failed to resolve workflow: " + err.Error(),
+		ObservedGeneration: workflowRun.Generation,
+	})
+}
+
+// setWorkflowRenderingFailedCondition records a failure to render the workflow — either
+// while resolving externalRefs or in the pipeline itself. WorkflowCompleted stays False
+// (nothing was submitted, so the run has not finished) with the render error as the
+// message; WorkflowFailed is deliberately untouched because that condition is
+// True-on-failure and reserved for a run that actually executed.
+//
+// Unlike its neighbors here, this one builds the condition through controller.NewCondition:
+// a render error quotes tenant-authored template text, and that builder is where the message
+// bound lives. The other setters carry API errors of their own making and keep the literal.
+func setWorkflowRenderingFailedCondition(workflowRun *openchoreov1alpha1.WorkflowRun, err error) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, controller.NewCondition(
+		ConditionWorkflowCompleted,
+		metav1.ConditionFalse,
+		ReasonWorkflowRenderingFailed,
+		"Failed to render workflow: "+err.Error(),
+		workflowRun.Generation,
+	))
+}
+
+func isWorkflowInitiated(workflowRun *openchoreov1alpha1.WorkflowRun) bool {
+	return meta.FindStatusCondition(workflowRun.Status.Conditions, string(ConditionWorkflowCompleted)) != nil
+}
+
+func isWorkflowCompleted(workflowRun *openchoreov1alpha1.WorkflowRun) bool {
+	return meta.IsStatusConditionTrue(workflowRun.Status.Conditions, string(ConditionWorkflowCompleted))
+}
+
+func isWorkflowSucceeded(workflowRun *openchoreov1alpha1.WorkflowRun) bool {
+	return meta.IsStatusConditionTrue(workflowRun.Status.Conditions, string(ConditionWorkflowSucceeded))
+}
+
+func isWorkflowRunning(workflowRun *openchoreov1alpha1.WorkflowRun) bool {
+	return meta.IsStatusConditionTrue(workflowRun.Status.Conditions, string(ConditionWorkflowRunning))
+}
+
+// setComponentValidationFailedCondition marks the workflow run as permanently failed
+// due to a component workflow validation error.
+func setComponentValidationFailedCondition(workflowRun *openchoreov1alpha1.WorkflowRun, message string) {
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowRunning),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(ReasonWorkflowRunning),
+		Message:            message,
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowFailed),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonComponentValidationFailed),
+		Message:            message,
+		ObservedGeneration: workflowRun.Generation,
+	})
+	meta.SetStatusCondition(&workflowRun.Status.Conditions, metav1.Condition{
+		Type:               string(ConditionWorkflowCompleted),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(ReasonComponentValidationFailed),
+		Message:            message,
+		ObservedGeneration: workflowRun.Generation,
+	})
+}

@@ -1,0 +1,1118 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "properties": {
+    "clusterAgent": {
+      "additionalProperties": true,
+      "description": "Cluster Agent configuration for WebSocket connection to control plane cluster gateway",
+      "properties": {
+        "affinity": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Affinity rules for pod scheduling",
+          "required": [],
+          "title": "affinity",
+          "type": "object"
+        },
+        "extraEnvs": {
+          "default": [],
+          "description": "Additional environment variables to set in the cluster agent container. Each entry must specify exactly one of 'value' (literal) or 'valueFrom.secretKeyRef' (reference to an existing Kubernetes Secret).",
+          "items": {
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "name",
+                  "value"
+                ]
+              },
+              {
+                "required": [
+                  "name",
+                  "valueFrom"
+                ]
+              }
+            ],
+            "properties": {
+              "name": {
+                "description": "Name of the environment variable",
+                "type": "string"
+              },
+              "value": {
+                "description": "Literal value of the environment variable. Avoid for secret material; use valueFrom.secretKeyRef instead.",
+                "type": "string"
+              },
+              "valueFrom": {
+                "additionalProperties": false,
+                "description": "Source the value from an existing Kubernetes resource. Currently only secretKeyRef is supported.",
+                "properties": {
+                  "secretKeyRef": {
+                    "additionalProperties": false,
+                    "description": "Reference to a key in an existing Kubernetes Secret.",
+                    "properties": {
+                      "key": {
+                        "description": "Key within the Secret whose value to inject.",
+                        "type": "string"
+                      },
+                      "name": {
+                        "description": "Name of the Secret (must exist in the cluster-agent's namespace).",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "key"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "secretKeyRef"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          },
+          "title": "extraEnvs",
+          "type": "array"
+        },
+        "heartbeatInterval": {
+          "default": "30s",
+          "description": "Interval between heartbeat messages to control plane",
+          "title": "heartbeatInterval",
+          "type": "string"
+        },
+        "image": {
+          "additionalProperties": false,
+          "description": "Container image configuration for cluster agent",
+          "properties": {
+            "pullPolicy": {
+              "default": "IfNotPresent",
+              "description": "Image pull policy",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
+              "required": [],
+              "title": "pullPolicy"
+            },
+            "repository": {
+              "default": "cr.openchoreo.dev/openchoreo/cluster-agent",
+              "description": "Cluster agent image repository",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "description": "Image tag. Empty uses Chart.AppVersion.",
+              "title": "tag",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "image",
+          "type": "object"
+        },
+        "logLevel": {
+          "default": "info",
+          "description": "Log level for cluster agent",
+          "enum": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ],
+          "required": [],
+          "title": "logLevel"
+        },
+        "name": {
+          "default": "cluster-agent-dataplane",
+          "description": "Name of the cluster agent deployment",
+          "title": "name",
+          "type": "string"
+        },
+        "nodeSelector": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Node selector for pod scheduling",
+          "required": [],
+          "title": "nodeSelector",
+          "type": "object"
+        },
+        "planeID": {
+          "default": "default",
+          "description": "Logical plane identifier shared across multiple CRs connecting to the same physical plane.\nShips as the literal \"default\"; falls back to Helm release name if set as \"\". Rendered as\nthe openchoreo.dev/plane-id pod label, so it must be a valid Kubernetes label value.\n",
+          "maxLength": 63,
+          "pattern": "^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$",
+          "title": "planeID",
+          "type": "string"
+        },
+        "planeType": {
+          "default": "dataplane",
+          "description": "Type of plane this agent manages",
+          "enum": [
+            "dataplane",
+            "workflowplane",
+            "observabilityplane"
+          ],
+          "required": [],
+          "title": "planeType"
+        },
+        "podAnnotations": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Annotations to add to cluster agent pods",
+          "required": [],
+          "title": "podAnnotations",
+          "type": "object"
+        },
+        "podDisruptionBudget": {
+          "additionalProperties": false,
+          "description": "Pod Disruption Budget configuration for cluster agent",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "Enable PodDisruptionBudget for cluster agent",
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "maxUnavailable": {
+              "default": "null",
+              "description": "Maximum number of pods that can be unavailable",
+              "minimum": 0,
+              "required": [],
+              "title": "maxUnavailable",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "minAvailable": {
+              "default": 1,
+              "description": "Minimum number of pods that must be available",
+              "minimum": 0,
+              "title": "minAvailable",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "podDisruptionBudget",
+          "type": "object"
+        },
+        "podSecurityContext": {
+          "additionalProperties": false,
+          "description": "Pod-level security context",
+          "properties": {
+            "fsGroup": {
+              "default": 1000,
+              "description": "Group ID for volume mounts",
+              "title": "fsGroup",
+              "type": "integer"
+            },
+            "runAsNonRoot": {
+              "default": true,
+              "description": "Run container as non-root user",
+              "title": "runAsNonRoot",
+              "type": "boolean"
+            },
+            "runAsUser": {
+              "default": 1000,
+              "description": "User ID to run container as",
+              "title": "runAsUser",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "podSecurityContext",
+          "type": "object"
+        },
+        "priorityClass": {
+          "additionalProperties": false,
+          "description": "Priority class configuration for cluster agent pods",
+          "properties": {
+            "create": {
+              "default": false,
+              "description": "Create a PriorityClass for cluster agent",
+              "title": "create",
+              "type": "boolean"
+            },
+            "name": {
+              "default": "cluster-agent-dataplane",
+              "description": "PriorityClass name",
+              "title": "name",
+              "type": "string"
+            },
+            "value": {
+              "default": 900000,
+              "description": "Priority value (higher = more important)",
+              "title": "value",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "priorityClass",
+          "type": "object"
+        },
+        "rbac": {
+          "additionalProperties": false,
+          "description": "RBAC configuration for cluster agent",
+          "properties": {
+            "create": {
+              "default": true,
+              "description": "Create RBAC resources (ClusterRole, ClusterRoleBinding)",
+              "title": "create",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "title": "rbac",
+          "type": "object"
+        },
+        "reconnectDelay": {
+          "default": "5s",
+          "description": "Delay before attempting reconnection after disconnect",
+          "title": "reconnectDelay",
+          "type": "string"
+        },
+        "replicas": {
+          "default": 1,
+          "description": "Number of cluster agent replicas (typically 1 per data plane)",
+          "minimum": 0,
+          "title": "replicas",
+          "type": "integer"
+        },
+        "resources": {
+          "additionalProperties": false,
+          "description": "Resource limits and requests for cluster agent",
+          "properties": {
+            "limits": {
+              "additionalProperties": false,
+              "description": "Maximum resources the agent can consume",
+              "properties": {
+                "cpu": {
+                  "default": "100m",
+                  "description": "CPU limit for the agent",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "256Mi",
+                  "description": "Memory limit for the agent",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "limits",
+              "type": "object"
+            },
+            "requests": {
+              "additionalProperties": false,
+              "description": "Minimum resources guaranteed for the agent",
+              "properties": {
+                "cpu": {
+                  "default": "50m",
+                  "description": "CPU request for the agent",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "128Mi",
+                  "description": "Memory request for the agent",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "requests",
+              "type": "object"
+            }
+          },
+          "required": [],
+          "title": "resources",
+          "type": "object"
+        },
+        "securityContext": {
+          "additionalProperties": false,
+          "description": "Container-level security context",
+          "properties": {
+            "allowPrivilegeEscalation": {
+              "default": false,
+              "description": "Prevent privilege escalation",
+              "title": "allowPrivilegeEscalation",
+              "type": "boolean"
+            },
+            "capabilities": {
+              "additionalProperties": false,
+              "description": "Linux capabilities configuration",
+              "properties": {
+                "drop": {
+                  "default": [
+                    "ALL"
+                  ],
+                  "description": "Capabilities to drop from container",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "drop",
+                  "type": "array"
+                }
+              },
+              "required": [],
+              "title": "capabilities",
+              "type": "object"
+            },
+            "readOnlyRootFilesystem": {
+              "default": true,
+              "description": "Mount root filesystem as read-only",
+              "title": "readOnlyRootFilesystem",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "title": "securityContext",
+          "type": "object"
+        },
+        "serverUrl": {
+          "default": "wss://cluster-gateway.openchoreo-control-plane.svc.cluster.local:8443/ws",
+          "description": "WebSocket URL of the cluster gateway in control plane",
+          "title": "serverUrl",
+          "type": "string"
+        },
+        "serviceAccount": {
+          "additionalProperties": false,
+          "description": "Service account configuration for cluster agent",
+          "properties": {
+            "annotations": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Annotations to add to the service account",
+              "required": [],
+              "title": "annotations",
+              "type": "object"
+            },
+            "create": {
+              "default": true,
+              "description": "Create a service account for the cluster agent",
+              "title": "create",
+              "type": "boolean"
+            },
+            "name": {
+              "default": "cluster-agent-dataplane",
+              "description": "Service account name",
+              "title": "name",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "serviceAccount",
+          "type": "object"
+        },
+        "tls": {
+          "additionalProperties": false,
+          "description": "TLS configuration for secure agent-gateway communication",
+          "properties": {
+            "caSecretName": {
+              "default": "cluster-gateway-ca",
+              "description": "CA secret name for signing agent client certificates. If empty, self-signed certs will be generated (required for multi-cluster setup).",
+              "title": "caSecretName",
+              "type": "string"
+            },
+            "clientSecretName": {
+              "default": "cluster-agent-tls",
+              "description": "Secret name for client certificate (typically same as secretName)",
+              "title": "clientSecretName",
+              "type": "string"
+            },
+            "duration": {
+              "default": "2160h",
+              "description": "Certificate validity duration",
+              "title": "duration",
+              "type": "string"
+            },
+            "enabled": {
+              "default": true,
+              "description": "Enable TLS for agent-gateway communication",
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "generateCerts": {
+              "default": true,
+              "description": "Generate client certificates locally using cert-manager with a self-signed CA",
+              "title": "generateCerts",
+              "type": "boolean"
+            },
+            "renewBefore": {
+              "default": "360h",
+              "description": "Time before expiry to renew certificate",
+              "title": "renewBefore",
+              "type": "string"
+            },
+            "secretName": {
+              "default": "cluster-agent-tls",
+              "description": "Secret name for client certificate and key",
+              "title": "secretName",
+              "type": "string"
+            },
+            "serverCAConfigMap": {
+              "default": "cluster-gateway-ca",
+              "description": "ConfigMap name containing server CA certificate for verifying gateway",
+              "title": "serverCAConfigMap",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "tls",
+          "type": "object"
+        },
+        "tolerations": {
+          "default": [],
+          "description": "Tolerations for pod scheduling",
+          "items": {
+            "properties": {
+              "effect": {
+                "enum": [
+                  "NoSchedule",
+                  "PreferNoSchedule",
+                  "NoExecute"
+                ],
+                "required": []
+              },
+              "key": {
+                "type": "string"
+              },
+              "operator": {
+                "enum": [
+                  "Exists",
+                  "Equal"
+                ],
+                "required": []
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "title": "tolerations",
+          "type": "array"
+        },
+        "topologySpreadConstraints": {
+          "default": [],
+          "description": "Topology spread constraints for pod distribution across failure domains",
+          "items": {
+            "required": [],
+            "type": "object"
+          },
+          "title": "topologySpreadConstraints",
+          "type": "array"
+        }
+      },
+      "required": [],
+      "title": "clusterAgent",
+      "type": "object"
+    },
+    "gateway": {
+      "additionalProperties": true,
+      "description": "KGateway API gateway configuration. Provides HTTP/HTTPS traffic routing using Kubernetes Gateway API and Envoy proxy.",
+      "properties": {
+        "agentgateway": {
+          "additionalProperties": true,
+          "description": "Agent Gateway configuration for MCP server and REST API connectivity",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "Enable Agent Gateway for AI agent connectivity",
+              "title": "enabled",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "title": "agentgateway",
+          "type": "object"
+        },
+        "annotations": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Annotations added to the Gateway resource. Use this to configure cert-manager, external-dns, or other integrations.",
+          "required": [],
+          "title": "annotations",
+          "type": "object"
+        },
+        "controller": {
+          "additionalProperties": true,
+          "description": "KGateway controller configuration for managing Gateway API resources",
+          "properties": {
+            "image": {
+              "additionalProperties": true,
+              "description": "Container image configuration for the gateway controller",
+              "properties": {
+                "pullPolicy": {
+                  "default": "IfNotPresent",
+                  "description": "Image pull policy for the controller container",
+                  "enum": [
+                    "Always",
+                    "IfNotPresent",
+                    "Never"
+                  ],
+                  "required": [],
+                  "title": "pullPolicy"
+                },
+                "registry": {
+                  "default": "",
+                  "description": "Container registry for the controller image. Empty uses default registry.",
+                  "title": "registry",
+                  "type": "string"
+                },
+                "repository": {
+                  "default": "kgateway",
+                  "description": "Image repository name for the gateway controller",
+                  "title": "repository",
+                  "type": "string"
+                },
+                "tag": {
+                  "default": "",
+                  "description": "Image tag. Empty uses Chart.AppVersion.",
+                  "title": "tag",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "title": "image",
+              "type": "object"
+            },
+            "logLevel": {
+              "default": "info",
+              "description": "Log level for the gateway controller",
+              "enum": [
+                "trace",
+                "debug",
+                "info",
+                "warn",
+                "error"
+              ],
+              "required": [],
+              "title": "logLevel"
+            },
+            "replicaCount": {
+              "default": 1,
+              "description": "Number of gateway controller replicas",
+              "minimum": 1,
+              "title": "replicaCount",
+              "type": "integer"
+            },
+            "resources": {
+              "additionalProperties": true,
+              "description": "Resource limits and requests for the gateway controller",
+              "properties": {
+                "limits": {
+                  "additionalProperties": true,
+                  "description": "Maximum resources the controller can consume",
+                  "properties": {
+                    "cpu": {
+                      "default": "200m",
+                      "description": "CPU limit for the controller",
+                      "title": "cpu",
+                      "type": "string"
+                    },
+                    "memory": {
+                      "default": "256Mi",
+                      "description": "Memory limit for the controller",
+                      "title": "memory",
+                      "type": "string"
+                    }
+                  },
+                  "required": [],
+                  "title": "limits",
+                  "type": "object"
+                },
+                "requests": {
+                  "additionalProperties": true,
+                  "description": "Minimum resources guaranteed for the controller",
+                  "properties": {
+                    "cpu": {
+                      "default": "100m",
+                      "description": "CPU request for the controller",
+                      "title": "cpu",
+                      "type": "string"
+                    },
+                    "memory": {
+                      "default": "128Mi",
+                      "description": "Memory request for the controller",
+                      "title": "memory",
+                      "type": "string"
+                    }
+                  },
+                  "required": [],
+                  "title": "requests",
+                  "type": "object"
+                }
+              },
+              "required": [],
+              "title": "resources",
+              "type": "object"
+            },
+            "service": {
+              "additionalProperties": true,
+              "description": "Kubernetes service configuration for the gateway controller",
+              "properties": {
+                "ports": {
+                  "additionalProperties": true,
+                  "description": "Service port mappings for the gateway controller",
+                  "properties": {
+                    "agwGrpc": {
+                      "default": 9978,
+                      "description": "Agent gateway gRPC port",
+                      "title": "agwGrpc",
+                      "type": "integer"
+                    },
+                    "grpc": {
+                      "default": 9977,
+                      "description": "gRPC port for xDS communication",
+                      "title": "grpc",
+                      "type": "integer"
+                    },
+                    "health": {
+                      "default": 9093,
+                      "description": "Health check endpoint port",
+                      "title": "health",
+                      "type": "integer"
+                    },
+                    "metrics": {
+                      "default": 9092,
+                      "description": "Metrics endpoint port",
+                      "title": "metrics",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [],
+                  "title": "ports",
+                  "type": "object"
+                },
+                "type": {
+                  "default": "ClusterIP",
+                  "description": "Service type for the gateway controller",
+                  "enum": [
+                    "ClusterIP",
+                    "NodePort",
+                    "LoadBalancer"
+                  ],
+                  "required": [],
+                  "title": "type"
+                }
+              },
+              "required": [],
+              "title": "service",
+              "type": "object"
+            }
+          },
+          "required": [],
+          "title": "controller",
+          "type": "object"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Enable Gateway CR creation",
+          "title": "enabled",
+          "type": "boolean"
+        },
+        "gatewayClassName": {
+          "default": "kgateway",
+          "description": "GatewayClass name to reference in the Gateway CR",
+          "title": "gatewayClassName",
+          "type": "string"
+        },
+        "httpPort": {
+          "default": 80,
+          "description": "Port for the HTTP listener on the gateway",
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "httpPort",
+          "type": "integer"
+        },
+        "httpsPort": {
+          "default": 443,
+          "description": "Port for the HTTPS listener on the gateway",
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "httpsPort",
+          "type": "integer"
+        },
+        "infrastructure": {
+          "additionalProperties": true,
+          "description": "Gateway infrastructure configuration passed to the generated Service.\nUsed to configure cloud provider load balancer settings via annotations.\nExample for AWS with Elastic IP:\n  infrastructure:\n    annotations:\n      service.beta.kubernetes.io/aws-load-balancer-type: \"external\"\n      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: \"ip\"\n      service.beta.kubernetes.io/aws-load-balancer-scheme: \"internet-facing\"\n      service.beta.kubernetes.io/aws-load-balancer-eip-allocations: \"eipalloc-xxx\"\n\nThe chart always renders spec.infrastructure so platform identity labels\nreach the kgateway proxy pods. That field needs Gateway API \u003e= v1.2 - on\nolder CRDs it is pruned and the proxy pods lose plane attribution.\nlabels is capped at 8 entries by Gateway API, platform identity included.",
+          "properties": {
+            "labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {
+                "openchoreo.dev/system-component": "gateway"
+              },
+              "required": [],
+              "title": "labels",
+              "type": "object"
+            }
+          },
+          "required": [],
+          "title": "infrastructure",
+          "type": "object"
+        },
+        "tls": {
+          "additionalProperties": false,
+          "description": "TLS configuration for the HTTPS listener",
+          "properties": {
+            "certificateRefs": {
+              "description": "TLS certificate references for the HTTPS listener. Each entry references a Secret containing the TLS cert/key pair.",
+              "items": {
+                "properties": {
+                  "name": {
+                    "description": "Secret name containing the TLS certificate",
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              },
+              "title": "certificateRefs",
+              "type": "array"
+            },
+            "enabled": {
+              "default": true,
+              "description": "Enable HTTPS listener on the gateway. When false, only the HTTP listener is created.",
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "hostname": {
+              "default": "*.openchoreoapis.invalid",
+              "description": "Hostname pattern for the HTTPS listener (SNI matching)",
+              "title": "hostname",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "tls",
+          "type": "object"
+        },
+        "tlsPassthrough": {
+          "additionalProperties": false,
+          "description": "TLS passthrough (SNI) configuration. Adds a Gateway listener (protocol TLS, mode Passthrough)\nthat routes encrypted traffic by SNI without terminating TLS; the workload terminates TLS itself.\nRequired by TLSRoute-based ComponentTypes such as the component-tls-service sample.",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "Enable the TLS passthrough listener. When false, no passthrough listener is created.",
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "hostname": {
+              "default": "*.openchoreoapis.invalid",
+              "description": "Hostname pattern for the TLS passthrough listener (SNI matching). When empty, the listener\nmatches all SNIs. Must encompass the TLSRoute hostnames (e.g. \"*.openchoreoapis.invalid\").\n",
+              "title": "hostname",
+              "type": "string"
+            },
+            "port": {
+              "default": 8443,
+              "description": "Port for the TLS passthrough listener. Must differ from httpsPort when the HTTPS (Terminate) listener is also enabled.",
+              "maximum": 65535,
+              "minimum": 1,
+              "title": "port",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "title": "tlsPassthrough",
+          "type": "object"
+        }
+      },
+      "required": [],
+      "title": "gateway",
+      "type": "object"
+    },
+    "global": {
+      "additionalProperties": false,
+      "description": "Global values shared across all components in the data plane",
+      "properties": {
+        "commonLabels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Common labels applied to all resources deployed by this chart",
+          "required": [],
+          "title": "commonLabels",
+          "type": "object"
+        },
+        "imagePullSecrets": {
+          "default": [],
+          "description": "Image pull secrets applied to all first-party pods, for pulling images from authenticated private registries. Entries are LocalObjectReferences (name only).",
+          "items": {
+            "required": [],
+            "type": "object"
+          },
+          "title": "imagePullSecrets",
+          "type": "array"
+        },
+        "imageRegistry": {
+          "default": "",
+          "description": "Registry override for all first-party container images. When set, it replaces the registry host of each image repository. May include a path (e.g. registry.example.com/ghcr.io) for path-preserving mirrors. Empty uses each image's default registry.",
+          "title": "imageRegistry",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "title": "global",
+      "type": "object"
+    },
+    "kubernetesClusterDomain": {
+      "default": "cluster.local",
+      "description": "Kubernetes cluster DNS domain used for service discovery and certificate generation",
+      "title": "kubernetesClusterDomain",
+      "type": "string"
+    },
+    "networking": {
+      "additionalProperties": false,
+      "description": "Network configuration for the data plane",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Enable networking features (network policies, service mesh integration)",
+          "title": "enabled",
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "title": "networking",
+      "type": "object"
+    },
+    "remoteAgentRouter": {
+      "additionalProperties": false,
+      "description": "remote-connect SNI router: a single per-data-plane L4 entrypoint for `occ remote`.\nIt SNI-routes each occ tunnel to the matching per-project+env remote-agent\n(TLS terminates at the agent, not here). One exposed port for all agents.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Enable the shared remote-connect SNI router.",
+          "title": "enabled",
+          "type": "boolean"
+        },
+        "image": {
+          "additionalProperties": false,
+          "description": "Container image configuration for the remote-connect SNI router",
+          "properties": {
+            "pullPolicy": {
+              "default": "IfNotPresent",
+              "description": "Image pull policy for the router container.",
+              "title": "pullPolicy",
+              "type": "string"
+            },
+            "repository": {
+              "default": "cr.openchoreo.dev/openchoreo/remote-agent-router",
+              "description": "Remote-connect SNI router image repository",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "description": "Image tag. Empty uses Chart.AppVersion.",
+              "title": "tag",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "image"
+        },
+        "listenPort": {
+          "default": 8443,
+          "description": "L4 port the router listens on (occ dials this via the Service below).",
+          "title": "listenPort",
+          "type": "integer"
+        },
+        "logLevel": {
+          "default": "info",
+          "description": "Router log level: debug, info, warn, error.",
+          "title": "logLevel",
+          "type": "string"
+        },
+        "podSecurityContext": {
+          "additionalProperties": false,
+          "description": "Pod security context for the router",
+          "properties": {
+            "fsGroup": {
+              "default": 1000,
+              "title": "fsGroup",
+              "type": "integer"
+            },
+            "runAsNonRoot": {
+              "default": true,
+              "title": "runAsNonRoot",
+              "type": "boolean"
+            },
+            "runAsUser": {
+              "default": 1000,
+              "title": "runAsUser",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "runAsNonRoot",
+            "runAsUser",
+            "fsGroup"
+          ],
+          "title": "podSecurityContext"
+        },
+        "resources": {
+          "additionalProperties": false,
+          "description": "Resource requests and limits for the router container",
+          "properties": {
+            "limits": {
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "default": "200m",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "128Mi",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "title": "limits",
+              "type": "object"
+            },
+            "requests": {
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "default": "50m",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "64Mi",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "title": "requests",
+              "type": "object"
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ],
+          "title": "resources"
+        },
+        "securityContext": {
+          "additionalProperties": false,
+          "description": "Container security context for the router",
+          "properties": {
+            "allowPrivilegeEscalation": {
+              "default": false,
+              "title": "allowPrivilegeEscalation",
+              "type": "boolean"
+            },
+            "capabilities": {
+              "additionalProperties": false,
+              "properties": {
+                "drop": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "required": []
+                  },
+                  "title": "drop",
+                  "type": "array"
+                }
+              },
+              "required": [
+                "drop"
+              ],
+              "title": "capabilities",
+              "type": "object"
+            },
+            "readOnlyRootFilesystem": {
+              "default": true,
+              "title": "readOnlyRootFilesystem",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "allowPrivilegeEscalation",
+            "capabilities",
+            "readOnlyRootFilesystem"
+          ],
+          "title": "securityContext"
+        },
+        "service": {
+          "additionalProperties": false,
+          "description": "Service exposing the router as the single per-data-plane entrypoint.",
+          "properties": {
+            "nodePort": {
+              "default": 30443,
+              "description": "Fixed nodePort when type is NodePort (must match the k3d host port mapping and\nopenchoreoApi.config.remoteConnect.entrypointAddress). Ignored for LoadBalancer.\n",
+              "title": "nodePort",
+              "type": "integer"
+            },
+            "type": {
+              "default": "LoadBalancer",
+              "description": "LoadBalancer for cloud (one internal LB), NodePort for k3d/bare-metal.",
+              "title": "type",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "title": "service",
+          "type": "object"
+        }
+      },
+      "required": [],
+      "title": "remoteAgentRouter",
+      "type": "object"
+    },
+    "security": {
+      "additionalProperties": false,
+      "description": "Security configuration for the data plane",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Enable security features (certificate issuers, TLS configuration)",
+          "title": "enabled",
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "title": "security",
+      "type": "object"
+    }
+  },
+  "required": [],
+  "type": "object"
+}

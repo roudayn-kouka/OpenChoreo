@@ -1,0 +1,193 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package clusterdataplane
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services"
+)
+
+// clusterDataPlaneService handles cluster data plane-related business logic without authorization checks.
+// Other services within this layer should use this directly to avoid double authz.
+type clusterDataPlaneService struct {
+	k8sClient client.Client
+	logger    *slog.Logger
+}
+
+var _ Service = (*clusterDataPlaneService)(nil)
+
+var clusterDataPlaneTypeMeta = metav1.TypeMeta{
+	APIVersion: openchoreov1alpha1.GroupVersion.String(),
+	Kind:       "ClusterDataPlane",
+}
+
+// NewService creates a new cluster data plane service without authorization.
+func NewService(k8sClient client.Client, logger *slog.Logger) Service {
+	return &clusterDataPlaneService{
+		k8sClient: k8sClient,
+		logger:    logger,
+	}
+}
+
+func (s *clusterDataPlaneService) ListClusterDataPlanes(ctx context.Context, opts services.ListOptions) (*services.ListResult[openchoreov1alpha1.ClusterDataPlane], error) {
+	s.logger.Debug("Listing cluster data planes", "limit", opts.Limit, "cursor", opts.Cursor)
+
+	listOpts, err := services.BuildListOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var clusterDataPlaneList openchoreov1alpha1.ClusterDataPlaneList
+	if err := s.k8sClient.List(ctx, &clusterDataPlaneList, listOpts...); err != nil {
+		s.logger.Error("Failed to list cluster data planes", "error", err)
+		return nil, fmt.Errorf("failed to list cluster data planes: %w", err)
+	}
+
+	for i := range clusterDataPlaneList.Items {
+		clusterDataPlaneList.Items[i].TypeMeta = clusterDataPlaneTypeMeta
+	}
+
+	result := &services.ListResult[openchoreov1alpha1.ClusterDataPlane]{
+		Items:      clusterDataPlaneList.Items,
+		NextCursor: clusterDataPlaneList.Continue,
+	}
+	if clusterDataPlaneList.RemainingItemCount != nil {
+		remaining := *clusterDataPlaneList.RemainingItemCount
+		result.RemainingCount = &remaining
+	}
+
+	s.logger.Debug("Listed cluster data planes", "count", len(clusterDataPlaneList.Items))
+	return result, nil
+}
+
+func (s *clusterDataPlaneService) GetClusterDataPlane(ctx context.Context, name string) (*openchoreov1alpha1.ClusterDataPlane, error) {
+	s.logger.Debug("Getting cluster data plane", "clusterDataPlane", name)
+
+	cdp := &openchoreov1alpha1.ClusterDataPlane{}
+	key := client.ObjectKey{Name: name}
+
+	if err := s.k8sClient.Get(ctx, key, cdp); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Cluster data plane not found", "clusterDataPlane", name)
+			return nil, ErrClusterDataPlaneNotFound
+		}
+		s.logger.Error("Failed to get cluster data plane", "error", err)
+		return nil, fmt.Errorf("failed to get cluster data plane: %w", err)
+	}
+
+	cdp.TypeMeta = clusterDataPlaneTypeMeta
+	return cdp, nil
+}
+
+func (s *clusterDataPlaneService) CreateClusterDataPlane(ctx context.Context, cdp *openchoreov1alpha1.ClusterDataPlane) (*openchoreov1alpha1.ClusterDataPlane, error) {
+	if cdp == nil {
+		return nil, ErrClusterDataPlaneNil
+	}
+
+	s.logger.Debug("Creating cluster data plane", "clusterDataPlane", cdp.Name)
+
+	exists, err := s.clusterDataPlaneExists(ctx, cdp.Name)
+	if err != nil {
+		s.logger.Error("Failed to check cluster data plane existence", "error", err)
+		return nil, fmt.Errorf("failed to check cluster data plane existence: %w", err)
+	}
+	if exists {
+		s.logger.Warn("Cluster data plane already exists", "clusterDataPlane", cdp.Name)
+		return nil, ErrClusterDataPlaneAlreadyExists
+	}
+
+	// Set defaults
+	cdp.Status = openchoreov1alpha1.ClusterDataPlaneStatus{}
+
+	if err := s.k8sClient.Create(ctx, cdp); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			s.logger.Warn("Cluster data plane already exists", "clusterDataPlane", cdp.Name)
+			return nil, ErrClusterDataPlaneAlreadyExists
+		}
+		if vErr := services.ExtractValidationError(err); vErr != nil {
+			return nil, vErr
+		}
+		s.logger.Error("Failed to create cluster data plane CR", "error", err)
+		return nil, fmt.Errorf("failed to create cluster data plane: %w", err)
+	}
+
+	s.logger.Debug("Cluster data plane created successfully", "clusterDataPlane", cdp.Name)
+	cdp.TypeMeta = clusterDataPlaneTypeMeta
+	return cdp, nil
+}
+
+func (s *clusterDataPlaneService) UpdateClusterDataPlane(ctx context.Context, cdp *openchoreov1alpha1.ClusterDataPlane) (*openchoreov1alpha1.ClusterDataPlane, error) {
+	if cdp == nil {
+		return nil, ErrClusterDataPlaneNil
+	}
+
+	s.logger.Debug("Updating cluster data plane", "clusterDataPlane", cdp.Name)
+
+	existing := &openchoreov1alpha1.ClusterDataPlane{}
+	if err := s.k8sClient.Get(ctx, client.ObjectKey{Name: cdp.Name}, existing); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			return nil, ErrClusterDataPlaneNotFound
+		}
+		s.logger.Error("Failed to get cluster data plane", "error", err)
+		return nil, fmt.Errorf("failed to get cluster data plane: %w", err)
+	}
+
+	// Only apply user-mutable fields to the existing object, preserving server-managed fields
+	cdp.Status = openchoreov1alpha1.ClusterDataPlaneStatus{}
+	existing.Spec = cdp.Spec
+	existing.Labels = cdp.Labels
+	existing.Annotations = cdp.Annotations
+
+	if err := s.k8sClient.Update(ctx, existing); err != nil {
+		if vErr := services.ExtractValidationError(err); vErr != nil {
+			return nil, vErr
+		}
+		s.logger.Error("Failed to update cluster data plane CR", "error", err)
+		return nil, fmt.Errorf("failed to update cluster data plane: %w", err)
+	}
+
+	s.logger.Debug("Cluster data plane updated successfully", "clusterDataPlane", cdp.Name)
+	existing.TypeMeta = clusterDataPlaneTypeMeta
+	return existing, nil
+}
+
+func (s *clusterDataPlaneService) DeleteClusterDataPlane(ctx context.Context, name string) error {
+	s.logger.Debug("Deleting cluster data plane", "clusterDataPlane", name)
+
+	cdp := &openchoreov1alpha1.ClusterDataPlane{}
+	cdp.Name = name
+
+	if err := s.k8sClient.Delete(ctx, cdp); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ErrClusterDataPlaneNotFound
+		}
+		s.logger.Error("Failed to delete cluster data plane CR", "error", err)
+		return fmt.Errorf("failed to delete cluster data plane: %w", err)
+	}
+
+	s.logger.Debug("Cluster data plane deleted successfully", "clusterDataPlane", name)
+	return nil
+}
+
+func (s *clusterDataPlaneService) clusterDataPlaneExists(ctx context.Context, name string) (bool, error) {
+	cdp := &openchoreov1alpha1.ClusterDataPlane{}
+	key := client.ObjectKey{Name: name}
+
+	err := s.k8sClient.Get(ctx, key, cdp)
+	if err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking existence of cluster data plane %s: %w", name, err)
+	}
+	return true, nil
+}

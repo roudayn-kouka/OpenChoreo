@@ -1,0 +1,208 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package observabilityalertsnotificationchannel
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services"
+)
+
+var observabilityAlertsNotificationChannelTypeMeta = metav1.TypeMeta{
+	APIVersion: openchoreov1alpha1.GroupVersion.String(),
+	Kind:       "ObservabilityAlertsNotificationChannel",
+}
+
+// observabilityAlertsNotificationChannelService handles business logic without authorization checks.
+// Other services within this layer should use this directly to avoid double authz.
+type observabilityAlertsNotificationChannelService struct {
+	k8sClient client.Client
+	logger    *slog.Logger
+}
+
+var _ Service = (*observabilityAlertsNotificationChannelService)(nil)
+
+// NewService creates a new observability alerts notification channel service without authorization.
+func NewService(k8sClient client.Client, logger *slog.Logger) Service {
+	return &observabilityAlertsNotificationChannelService{
+		k8sClient: k8sClient,
+		logger:    logger,
+	}
+}
+
+func (s *observabilityAlertsNotificationChannelService) CreateObservabilityAlertsNotificationChannel(ctx context.Context, namespaceName string, nc *openchoreov1alpha1.ObservabilityAlertsNotificationChannel) (*openchoreov1alpha1.ObservabilityAlertsNotificationChannel, error) {
+	if nc == nil {
+		return nil, fmt.Errorf("observability alerts notification channel cannot be nil")
+	}
+
+	s.logger.Debug("Creating observability alerts notification channel", "namespace", namespaceName, "channel", nc.Name)
+
+	exists, err := s.channelExists(ctx, namespaceName, nc.Name)
+	if err != nil {
+		s.logger.Error("Failed to check observability alerts notification channel existence", "error", err)
+		return nil, fmt.Errorf("failed to check observability alerts notification channel existence: %w", err)
+	}
+	if exists {
+		s.logger.Warn("Observability alerts notification channel already exists", "namespace", namespaceName, "channel", nc.Name)
+		return nil, ErrObservabilityAlertsNotificationChannelAlreadyExists
+	}
+
+	// Set defaults
+	nc.Namespace = namespaceName
+	nc.Status = openchoreov1alpha1.ObservabilityAlertsNotificationChannelStatus{}
+	if err := s.k8sClient.Create(ctx, nc); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			s.logger.Warn("Observability alerts notification channel already exists", "namespace", namespaceName, "channel", nc.Name)
+			return nil, ErrObservabilityAlertsNotificationChannelAlreadyExists
+		}
+		if vErr := services.ExtractValidationError(err); vErr != nil {
+			return nil, vErr
+		}
+		s.logger.Error("Failed to create observability alerts notification channel CR", "error", err)
+		return nil, fmt.Errorf("failed to create observability alerts notification channel: %w", err)
+	}
+
+	nc.TypeMeta = observabilityAlertsNotificationChannelTypeMeta
+	s.logger.Debug("Observability alerts notification channel created successfully", "namespace", namespaceName, "channel", nc.Name)
+	return nc, nil
+}
+
+func (s *observabilityAlertsNotificationChannelService) UpdateObservabilityAlertsNotificationChannel(ctx context.Context, namespaceName string, nc *openchoreov1alpha1.ObservabilityAlertsNotificationChannel) (*openchoreov1alpha1.ObservabilityAlertsNotificationChannel, error) {
+	if nc == nil {
+		return nil, fmt.Errorf("observability alerts notification channel cannot be nil")
+	}
+
+	s.logger.Debug("Updating observability alerts notification channel", "namespace", namespaceName, "channel", nc.Name)
+
+	existing := &openchoreov1alpha1.ObservabilityAlertsNotificationChannel{}
+	if err := s.k8sClient.Get(ctx, client.ObjectKey{Name: nc.Name, Namespace: namespaceName}, existing); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Observability alerts notification channel not found", "namespace", namespaceName, "channel", nc.Name)
+			return nil, ErrObservabilityAlertsNotificationChannelNotFound
+		}
+		s.logger.Error("Failed to get observability alerts notification channel", "error", err)
+		return nil, fmt.Errorf("failed to get observability alerts notification channel: %w", err)
+	}
+
+	// Reject attempts to change the immutable environment field
+	if nc.Spec.Environment != existing.Spec.Environment {
+		return nil, &services.ValidationError{Msg: "spec.environment is immutable"}
+	}
+
+	nc.Status = openchoreov1alpha1.ObservabilityAlertsNotificationChannelStatus{}
+
+	// Only apply user-mutable fields to the existing object, preserving server-managed fields
+	existing.Spec = nc.Spec
+	existing.Labels = nc.Labels
+	existing.Annotations = nc.Annotations
+
+	if err := s.k8sClient.Update(ctx, existing); err != nil {
+		if vErr := services.ExtractValidationError(err); vErr != nil {
+			return nil, vErr
+		}
+		s.logger.Error("Failed to update observability alerts notification channel CR", "error", err)
+		return nil, fmt.Errorf("failed to update observability alerts notification channel: %w", err)
+	}
+
+	existing.TypeMeta = observabilityAlertsNotificationChannelTypeMeta
+	s.logger.Debug("Observability alerts notification channel updated successfully", "namespace", namespaceName, "channel", nc.Name)
+	return existing, nil
+}
+
+func (s *observabilityAlertsNotificationChannelService) ListObservabilityAlertsNotificationChannels(ctx context.Context, namespaceName string, opts services.ListOptions) (*services.ListResult[openchoreov1alpha1.ObservabilityAlertsNotificationChannel], error) {
+	s.logger.Debug("Listing observability alerts notification channels", "namespace", namespaceName, "limit", opts.Limit, "cursor", opts.Cursor)
+
+	commonOpts, err := services.BuildListOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	listOpts := append([]client.ListOption{client.InNamespace(namespaceName)}, commonOpts...)
+
+	var ncList openchoreov1alpha1.ObservabilityAlertsNotificationChannelList
+	if err := s.k8sClient.List(ctx, &ncList, listOpts...); err != nil {
+		s.logger.Error("Failed to list observability alerts notification channels", "error", err)
+		return nil, fmt.Errorf("failed to list observability alerts notification channels: %w", err)
+	}
+
+	for i := range ncList.Items {
+		ncList.Items[i].TypeMeta = observabilityAlertsNotificationChannelTypeMeta
+	}
+
+	result := &services.ListResult[openchoreov1alpha1.ObservabilityAlertsNotificationChannel]{
+		Items:      ncList.Items,
+		NextCursor: ncList.Continue,
+	}
+	if ncList.RemainingItemCount != nil {
+		remaining := *ncList.RemainingItemCount
+		result.RemainingCount = &remaining
+	}
+
+	s.logger.Debug("Listed observability alerts notification channels", "namespace", namespaceName, "count", len(ncList.Items))
+	return result, nil
+}
+
+func (s *observabilityAlertsNotificationChannelService) GetObservabilityAlertsNotificationChannel(ctx context.Context, namespaceName, channelName string) (*openchoreov1alpha1.ObservabilityAlertsNotificationChannel, error) {
+	s.logger.Debug("Getting observability alerts notification channel", "namespace", namespaceName, "channel", channelName)
+
+	nc := &openchoreov1alpha1.ObservabilityAlertsNotificationChannel{}
+	key := client.ObjectKey{
+		Name:      channelName,
+		Namespace: namespaceName,
+	}
+
+	if err := s.k8sClient.Get(ctx, key, nc); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Observability alerts notification channel not found", "namespace", namespaceName, "channel", channelName)
+			return nil, ErrObservabilityAlertsNotificationChannelNotFound
+		}
+		s.logger.Error("Failed to get observability alerts notification channel", "error", err)
+		return nil, fmt.Errorf("failed to get observability alerts notification channel: %w", err)
+	}
+
+	nc.TypeMeta = observabilityAlertsNotificationChannelTypeMeta
+	return nc, nil
+}
+
+func (s *observabilityAlertsNotificationChannelService) DeleteObservabilityAlertsNotificationChannel(ctx context.Context, namespaceName, channelName string) error {
+	s.logger.Debug("Deleting observability alerts notification channel", "namespace", namespaceName, "channel", channelName)
+
+	nc := &openchoreov1alpha1.ObservabilityAlertsNotificationChannel{}
+	nc.Name = channelName
+	nc.Namespace = namespaceName
+
+	if err := s.k8sClient.Delete(ctx, nc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ErrObservabilityAlertsNotificationChannelNotFound
+		}
+		s.logger.Error("Failed to delete observability alerts notification channel CR", "error", err)
+		return fmt.Errorf("failed to delete observability alerts notification channel: %w", err)
+	}
+
+	s.logger.Debug("Observability alerts notification channel deleted successfully", "namespace", namespaceName, "channel", channelName)
+	return nil
+}
+
+func (s *observabilityAlertsNotificationChannelService) channelExists(ctx context.Context, namespaceName, channelName string) (bool, error) {
+	nc := &openchoreov1alpha1.ObservabilityAlertsNotificationChannel{}
+	key := client.ObjectKey{
+		Name:      channelName,
+		Namespace: namespaceName,
+	}
+
+	err := s.k8sClient.Get(ctx, key, nc)
+	if err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking existence of observability alerts notification channel %s/%s: %w", namespaceName, channelName, err)
+	}
+	return true, nil
+}

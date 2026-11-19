@@ -1,0 +1,33 @@
+componentName: my-api
+namespace: acme-corp
+projectName: online-store
+includeFieldDescriptions: true
+includeStructuralComments: true
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: web-app
+spec:
+  workloadType: deployment
+  parameters:
+    openAPIV3Schema:
+      type: object
+      required:
+        - port
+        - protocol
+      properties:
+        port:
+          type: integer
+          description: "Container port"
+        replicas:
+          type: integer
+          default: 2
+          description: "Number of pod replicas"
+        protocol:
+          type: string
+          enum:
+            - http
+            - https
+            - grpc
+          description: "Service protocol"

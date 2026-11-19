@@ -1,0 +1,154 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package mcphandlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/controller"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/api/gen"
+	"github.com/openchoreo/openchoreo/internal/server/middleware/audit"
+	"github.com/openchoreo/openchoreo/pkg/mcp/tools"
+)
+
+func (h *MCPHandler) ListProjects(ctx context.Context, namespaceName string, opts tools.ListOpts) (any, error) {
+	result, err := h.services.ProjectService.ListProjects(ctx, namespaceName, toServiceListOptions(opts))
+	if err != nil {
+		return nil, err
+	}
+	return wrapTransformedList("projects", result.Items, result.NextCursor, projectSummary), nil
+}
+
+// CreateProject creates the Project CR only. ProjectReleaseBindings, which bind
+// the project to an environment, are created separately via
+// CreateProjectReleaseBinding so this tool's required authz stays exactly
+// project:create rather than also depending on projectreleasebinding:create.
+func (h *MCPHandler) CreateProject(
+	ctx context.Context, namespaceName string, req *gen.CreateProjectJSONRequestBody,
+) (any, error) {
+	annotations := map[string]string{}
+	if req.Metadata.Annotations != nil {
+		for key, value := range *req.Metadata.Annotations {
+			annotations[key] = value
+		}
+	}
+
+	deploymentPipelineRef := openchoreov1alpha1.DeploymentPipelineRef{
+		Kind: openchoreov1alpha1.DeploymentPipelineRefKindDeploymentPipeline,
+	}
+	if req.Spec != nil && req.Spec.DeploymentPipelineRef != nil {
+		deploymentPipelineRef.Name = req.Spec.DeploymentPipelineRef.Name
+		if req.Spec.DeploymentPipelineRef.Kind != nil && *req.Spec.DeploymentPipelineRef.Kind != "" {
+			deploymentPipelineRef.Kind = openchoreov1alpha1.DeploymentPipelineRefKind(*req.Spec.DeploymentPipelineRef.Kind)
+		}
+	}
+
+	project := &openchoreov1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        req.Metadata.Name,
+			Namespace:   namespaceName,
+			Annotations: annotations,
+		},
+		Spec: openchoreov1alpha1.ProjectSpec{
+			DeploymentPipelineRef: deploymentPipelineRef,
+		},
+	}
+
+	if req.Spec != nil && req.Spec.Type != nil {
+		project.Spec.Type = openchoreov1alpha1.ProjectTypeRef{
+			Name: req.Spec.Type.Name,
+		}
+		if req.Spec.Type.Kind != nil {
+			project.Spec.Type.Kind = openchoreov1alpha1.ProjectTypeRefKind(*req.Spec.Type.Kind)
+		}
+	}
+
+	if req.Spec != nil && req.Spec.Parameters != nil {
+		paramsBytes, err := json.Marshal(*req.Spec.Parameters)
+		if err != nil {
+			return nil, fmt.Errorf("marshal parameters: %w", err)
+		}
+		project.Spec.Parameters = &runtime.RawExtension{Raw: paramsBytes}
+	}
+
+	if displayName, ok := project.Annotations[controller.AnnotationKeyDisplayName]; ok && displayName == "" {
+		delete(project.Annotations, controller.AnnotationKeyDisplayName)
+	}
+	if description, ok := project.Annotations[controller.AnnotationKeyDescription]; ok && description == "" {
+		delete(project.Annotations, controller.AnnotationKeyDescription)
+	}
+
+	created, err := h.services.ProjectService.CreateProject(ctx, namespaceName, project)
+	if err != nil {
+		return nil, err
+	}
+	setAuditResource(ctx, created)
+	return mutationResult(created, "created"), nil
+}
+
+func (h *MCPHandler) UpdateProject(
+	ctx context.Context,
+	namespaceName, projectName string, req *gen.PatchProjectRequest,
+) (any, error) {
+	if req == nil {
+		req = &gen.PatchProjectRequest{}
+	}
+
+	project, err := h.services.ProjectService.GetProject(ctx, namespaceName, projectName)
+	if err != nil {
+		return nil, fmt.Errorf("UpdateProject: GetProject namespace=%s project=%s: %w", namespaceName, projectName, err)
+	}
+
+	updatedProject := project.DeepCopy()
+	if updatedProject.Annotations == nil {
+		updatedProject.Annotations = map[string]string{}
+	}
+	if req.DisplayName != nil && *req.DisplayName != "" {
+		updatedProject.Annotations[controller.AnnotationKeyDisplayName] = *req.DisplayName
+	}
+	if req.Description != nil && *req.Description != "" {
+		updatedProject.Annotations[controller.AnnotationKeyDescription] = *req.Description
+	}
+
+	deploymentPipeline := ""
+	if req.DeploymentPipeline != nil && *req.DeploymentPipeline != "" {
+		deploymentPipeline = *req.DeploymentPipeline
+		updatedProject.Spec.DeploymentPipelineRef = openchoreov1alpha1.DeploymentPipelineRef{
+			Kind: openchoreov1alpha1.DeploymentPipelineRefKindDeploymentPipeline,
+			Name: deploymentPipeline,
+		}
+	}
+
+	updated, err := h.services.ProjectService.UpdateProject(ctx, namespaceName, updatedProject)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"UpdateProject: UpdateProject namespace=%s project=%s deploymentPipeline=%s: %w",
+			namespaceName, projectName, deploymentPipeline, err,
+		)
+	}
+	setAuditResource(ctx, updated)
+	return mutationResult(updated, "updated", map[string]any{
+		"deploymentPipelineRef": updated.Spec.DeploymentPipelineRef.Name,
+	}), nil
+}
+
+func (h *MCPHandler) DeleteProject(ctx context.Context, namespaceName, projectName string) (any, error) {
+	if err := h.services.ProjectService.DeleteProject(ctx, namespaceName, projectName); err != nil {
+		return nil, err
+	}
+	// No UID here: ProjectService.DeleteProject returns only an error, not the
+	// deleted object, so the identifier that survives the deletion is the name.
+	audit.SetResource(ctx, &audit.Resource{Namespace: namespaceName, Name: projectName})
+	return map[string]any{
+		"name":      projectName,
+		"namespace": namespaceName,
+		"action":    "deleted",
+	}, nil
+}

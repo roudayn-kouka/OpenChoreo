@@ -1,0 +1,69 @@
+# Sample: Web Application Component using the default deployment/web-application ComponentType
+#
+# This sample demonstrates:
+# - Using the default deployment/web-application ComponentType
+# - Web applications require HTTP endpoints
+# - Environment-specific resource overrides via ReleaseBinding
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: demo-app-web-service
+  namespace: default
+spec:
+  owner:
+    projectName: default
+
+  autoDeploy: true
+  componentType:
+    kind: ClusterComponentType
+    name: deployment/web-application
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: demo-app-web-service-workload
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app-web-service
+
+  endpoints:
+    http:
+      type: HTTP
+      port: 8080
+      visibility: [external]
+
+  container:
+    image: "choreoanonymouspullable.azurecr.io/react-spa:v0.9"
+    env:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8080"
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ReleaseBinding
+metadata:
+  name: demo-app-web-service-development
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app-web-service
+
+  environment: development
+
+  componentTypeEnvironmentConfigs:
+    replicas: 2
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"

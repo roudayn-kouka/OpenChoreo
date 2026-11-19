@@ -1,0 +1,12 @@
+# Helm values for OpenChoreo Workflow Plane in k3d multi-cluster setup
+
+clusterAgent:
+  serverUrl: "wss://cluster-gateway.openchoreo.localhost:8443/ws"
+
+argo-workflows:
+  server:
+    enabled: true
+    serviceType: LoadBalancer
+    servicePort: 10081
+    authModes:
+      - server

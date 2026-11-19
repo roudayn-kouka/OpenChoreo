@@ -1,0 +1,364 @@
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "openchoreo-control-plane.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+If release name contains chart name it will be used as a full name.
+*/}}
+{{- define "openchoreo-control-plane.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "openchoreo-control-plane.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create the name of the service account to use
+*/}}
+{{- define "openchoreo-control-plane.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "openchoreo-control-plane.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Common labels
+These labels should be applied to all resources and include:
+- helm.sh/chart: Chart name and version
+- app.kubernetes.io/name: Name of the application
+- app.kubernetes.io/instance: Unique name identifying the instance of an application
+- app.kubernetes.io/version: Current version of the application
+- app.kubernetes.io/managed-by: Tool being used to manage the application
+- app.kubernetes.io/part-of: Name of a higher level application this one is part of
+*/}}
+{{- define "openchoreo-control-plane.labels" -}}
+helm.sh/chart: {{ include "openchoreo-control-plane.chart" . }}
+{{ include "openchoreo-control-plane.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: openchoreo
+{{- with .Values.global.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Selector labels
+These labels are used for pod selectors and should be stable across upgrades.
+They should NOT include version or chart labels as these change with upgrades.
+*/}}
+{{- define "openchoreo-control-plane.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "openchoreo-control-plane.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Component labels
+Extends common labels with component-specific identification.
+This should be used in the metadata.labels section of all component resources.
+
+The component label (app.kubernetes.io/component) is used to identify different
+components within the same application (e.g., controller-manager, api-server).
+
+Usage:
+  {{ include "openchoreo-control-plane.componentLabels" (dict "context" . "component" "my-component") }}
+
+Example with values:
+  {{ include "openchoreo-control-plane.componentLabels" (dict "context" . "component" .Values.myComponent.name) }}
+
+Parameters:
+  - context: The current Helm context (usually .)
+  - component: The component name (e.g., "api-server", "controller", "worker")
+*/}}
+{{- define "openchoreo-control-plane.componentLabels" -}}
+{{ include "openchoreo-control-plane.labels" .context }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Component selector labels
+Extends selector labels with component identification.
+This should be used for:
+  - spec.selector.matchLabels in Deployments, StatefulSets, DaemonSets
+  - spec.selector in Services
+  - metadata.labels in Pod templates
+
+These labels must be stable and should not include version information.
+
+Usage:
+  {{ include "openchoreo-control-plane.componentSelectorLabels" (dict "context" . "component" "my-component") }}
+
+Example with values:
+  {{ include "openchoreo-control-plane.componentSelectorLabels" (dict "context" . "component" .Values.myComponent.name) }}
+
+Parameters:
+  - context: The current Helm context (usually .)
+  - component: The component name (e.g., "api-server", "controller", "worker")
+*/}}
+{{- define "openchoreo-control-plane.componentSelectorLabels" -}}
+{{ include "openchoreo-control-plane.selectorLabels" .context }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Platform identity labels
+Attribution labels for platform components observability. They let the
+observability plane tell which OpenChoreo plane a log record came from.
+The control plane is a singleton, so it carries no plane-id.
+
+MUST be applied to pod templates ONLY - never to spec.selector.matchLabels or a
+Service's spec.selector. Selectors are immutable, so a label that reaches one
+makes `helm upgrade` fail on an existing install instead of adding the label.
+
+Usage:
+  {{ include "openchoreo-control-plane.platformIdentityLabels" . }}
+
+Parameters:
+  - The current Helm context (usually .)
+*/}}
+{{- define "openchoreo-control-plane.platformIdentityLabels" -}}
+openchoreo.dev/plane: controlplane
+{{- end }}
+
+{{/*
+Gateway infrastructure labels
+
+The labels kgateway stamps on the proxy pods it renders from the Gateway CR.
+Platform identity wins over values-supplied labels: an operator override must
+not be able to silently mis-attribute a proxy pod to the wrong plane.
+
+Gateway API caps spec.infrastructure.labels at 8 entries. The count is checked
+in validateGatewayLabels so an overflow fails with a readable message instead
+of an opaque CRD rejection at apply time.
+
+Usage:
+  {{ include "openchoreo-control-plane.gatewayInfrastructureLabels" . }}
+
+Parameters:
+  - The current Helm context (usually .)
+*/}}
+{{- define "openchoreo-control-plane.gatewayInfrastructureLabels" -}}
+{{- $infra := .Values.gateway.infrastructure | default dict -}}
+{{- $platform := include "openchoreo-control-plane.platformIdentityLabels" . | fromYaml -}}
+{{- toYaml (merge (dict) $platform ($infra.labels | default dict)) -}}
+{{- end }}
+
+{{/*
+Gateway infrastructure label count validation
+
+Usage:
+  {{ include "openchoreo-control-plane.validateGatewayLabels" . }}
+
+Parameters:
+  - The current Helm context (usually .)
+*/}}
+{{- define "openchoreo-control-plane.validateGatewayLabels" -}}
+{{- if .Values.gateway.enabled -}}
+{{- $labels := include "openchoreo-control-plane.gatewayInfrastructureLabels" . | fromYaml -}}
+{{- if gt (len $labels) 8 -}}
+  {{- $platform := include "openchoreo-control-plane.platformIdentityLabels" . | fromYaml -}}
+  {{- fail (printf "gateway.infrastructure.labels renders %d entries once the %d platform identity label(s) are merged in, but Gateway API caps spec.infrastructure.labels at 8. Remove %d label(s) from gateway.infrastructure.labels." (len $labels) (len $platform) (sub (len $labels) 8)) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Backstage resource name
+*/}}
+{{- define "openchoreo-control-plane.backstage.name" -}}
+{{- default "backstage" .Values.backstage.name }}
+{{- end }}
+
+{{/*
+Backstage service account name
+Always returns openchoreo-backstage (or custom name from values).
+Service account is always created when backstage is enabled for security.
+*/}}
+{{- define "openchoreo-control-plane.backstage.serviceAccountName" -}}
+{{- default "openchoreo-backstage" .Values.backstage.serviceAccount.name }}
+{{- end }}
+
+{{/*
+OpenChoreo API service account name
+*/}}
+{{- define "openchoreo-control-plane.openchoreoApi.serviceAccountName" -}}
+{{- default "openchoreo-api" .Values.openchoreoApi.serviceAccount.name }}
+{{- end }}
+
+{{/*
+OpenChoreo API resource name
+Returns a static name for openchoreo-api resources (Service, Deployment, ClusterRole, etc.)
+This keeps resource names clean and consistent (e.g., "openchoreo-api" instead of "my-release-openchoreo-control-plane-api")
+*/}}
+{{- define "openchoreo-control-plane.openchoreoApi.name" -}}
+{{- default "openchoreo-api" .Values.openchoreoApi.name }}
+{{- end }}
+
+{{/*
+Cluster Gateway resource name
+*/}}
+{{- define "openchoreo-control-plane.clusterGateway.name" -}}
+{{- default "cluster-gateway" .Values.clusterGateway.name }}
+{{- end }}
+
+{{/*
+Cluster Gateway must run as a singleton.
+
+The gateway keeps every cluster agent's live WebSocket connection (and the
+authorization state derived from its client certificate) in process memory via
+the in-memory ConnectionManager. That state is not shared between pods, so
+running more than one replica would split agent connections across pods: a
+request routed to a pod that does not hold the target agent's connection
+fails. Until the gateway supports shared/sticky connection state it must be
+deployed with exactly one replica.
+
+Include this from any template that consumes clusterGateway.replicas to
+fail-fast (at `helm template`/`helm install` time) on an invalid value.
+*/}}
+{{- define "openchoreo-control-plane.clusterGateway.validateReplicas" -}}
+{{- $replicas := int .Values.clusterGateway.replicas -}}
+{{- if and (ne $replicas 1) (not .Values.clusterGateway.mesh.enabled) -}}
+{{- fail (printf "\n\nINVALID VALUE: clusterGateway.replicas=%d\n\nWith the gateway mesh disabled (clusterGateway.mesh.enabled=false) the cluster\ngateway must run as a singleton: it holds cluster-agent WebSocket connections in\nprocess memory, so multiple replicas would split that connection state across\npods and break agent connectivity. Either set clusterGateway.replicas=1 or\nenable the gateway mesh (clusterGateway.mesh.enabled=true), which replicates the\nconnection registry across replicas and forwards requests between them.\n" $replicas) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Cluster Gateway service account name
+*/}}
+{{- define "openchoreo-control-plane.clusterGateway.serviceAccountName" -}}
+{{- if .Values.clusterGateway.serviceAccount.create }}
+{{- default "cluster-gateway" .Values.clusterGateway.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.clusterGateway.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Event-forwarder resource name
+*/}}
+{{- define "openchoreo-control-plane.event-forwarder.name" -}}
+{{- default "event-forwarder" .Values.eventForwarder.name }}
+{{- end }}
+
+{{/*
+Event-forwarder service account name
+*/}}
+{{- define "openchoreo-control-plane.event-forwarder.serviceAccountName" -}}
+{{- if .Values.eventForwarder.serviceAccount.create }}
+{{- default "event-forwarder" .Values.eventForwarder.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.eventForwarder.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Portal Assistant resource name
+*/}}
+{{- define "openchoreo-control-plane.portalAssistant.name" -}}
+{{- default "portal-assistant" .Values.portalAssistant.name }}
+{{- end }}
+
+{{/*
+Portal Assistant service account name
+*/}}
+{{- define "openchoreo-control-plane.portalAssistant.serviceAccountName" -}}
+{{- default "portal-assistant" .Values.portalAssistant.name }}
+{{- end }}
+
+{{/*
+Name of the ConfigMap holding the Portal Assistant's auth-config.yaml, or an
+empty string when it should fall back to the file bundled in the image.
+
+An explicitly configured ConfigMap wins, so an operator can still supply a
+whole auth-config of their own. Otherwise the chart derives one from
+openchoreoApi.config.security.subjects, keeping the assistant on the same
+subject types as the API rather than on whatever the image happens to bundle.
+*/}}
+{{- define "openchoreo-control-plane.portalAssistant.authConfigMapName" -}}
+{{- if .Values.portalAssistant.authConfigConfigMap -}}
+{{- .Values.portalAssistant.authConfigConfigMap -}}
+{{- else if .Values.openchoreoApi.config.security.subjects -}}
+{{- printf "%s-auth-config" (include "openchoreo-control-plane.portalAssistant.name" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Validate that placeholder .invalid hostnames have been replaced with real domains.
+*/}}
+{{- define "openchoreo-control-plane.validateHostnames" -}}
+{{- $errors := list -}}
+{{- if and .Values.gateway.enabled .Values.openchoreoApi.enabled .Values.openchoreoApi.http.enabled (contains ".invalid" (join "," .Values.openchoreoApi.http.hostnames)) -}}
+  {{- $errors = append $errors "openchoreoApi.http.hostnames contains placeholder domain (.invalid)" -}}
+{{- end -}}
+{{- if and .Values.gateway.enabled .Values.backstage.enabled .Values.backstage.http.enabled (contains ".invalid" (join "," .Values.backstage.http.hostnames)) -}}
+  {{- $errors = append $errors "backstage.http.hostnames contains placeholder domain (.invalid)" -}}
+{{- end -}}
+{{- if and .Values.backstage.enabled (contains ".invalid" .Values.backstage.baseUrl) -}}
+  {{- $errors = append $errors "backstage.baseUrl contains placeholder domain (.invalid)" -}}
+{{- end -}}
+{{- if and .Values.gateway.enabled .Values.gateway.tls.enabled (contains ".invalid" .Values.gateway.tls.hostname) -}}
+  {{- $errors = append $errors "gateway.tls.hostname contains placeholder domain (.invalid)" -}}
+{{- end -}}
+{{- if and .Values.security.enabled (contains ".invalid" .Values.security.oidc.issuer) -}}
+  {{- $errors = append $errors "security.oidc.issuer contains placeholder domain (.invalid)" -}}
+{{- end -}}
+{{- if and .Values.backstage.enabled (not .Values.backstage.secretName) -}}
+  {{- $errors = append $errors "backstage.secretName is required when backstage is enabled" -}}
+{{- end -}}
+{{- if gt (len $errors) 0 -}}
+  {{- fail (printf "Placeholder domains found. Set real hostnames for:\n  - %s" (join "\n  - " $errors)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Container image reference for a component.
+
+Renders "<repository>:<tag>", with the tag defaulting to .Chart.AppVersion.
+When global.imageRegistry is set, the registry host of the repository is
+replaced with it so every first-party image resolves from a single private
+or mirror registry. A leading path segment counts as a registry host only
+if it contains "." or ":" or equals "localhost", the same rule Docker and
+containerd use to parse image references. The override may itself carry a
+path (e.g. "registry.example.com/ghcr.io") for path-preserving mirrors.
+
+Usage:
+  {{ include "openchoreo-control-plane.image" (dict "context" . "image" .Values.controllerManager.image) }}
+
+Parameters:
+  - context: The current Helm context (usually .)
+  - image: The component image block (repository, tag)
+*/}}
+{{- define "openchoreo-control-plane.image" -}}
+{{- $repo := .image.repository -}}
+{{- with .context.Values.global.imageRegistry -}}
+{{- $parts := splitList "/" $repo -}}
+{{- $first := first $parts -}}
+{{- if and (gt (len $parts) 1) (or (contains "." $first) (contains ":" $first) (eq $first "localhost")) -}}
+{{- $repo = join "/" (rest $parts) -}}
+{{- end -}}
+{{- $repo = printf "%s/%s" . $repo -}}
+{{- end -}}
+{{- printf "%s:%s" $repo (.image.tag | default .context.Chart.AppVersion) -}}
+{{- end }}

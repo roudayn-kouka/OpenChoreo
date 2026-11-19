@@ -1,0 +1,224 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package component
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	authz "github.com/openchoreo/openchoreo/internal/authz/core"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services"
+)
+
+const (
+	resourceTypeComponent        = "component"
+	resourceTypeComponentRelease = "componentrelease"
+)
+
+// componentServiceWithAuthz wraps a Service and adds authorization checks.
+// Handlers should use this. Other services should use the unwrapped Service directly.
+type componentServiceWithAuthz struct {
+	internal Service
+	authz    *services.AuthzChecker
+}
+
+var _ Service = (*componentServiceWithAuthz)(nil)
+
+// NewServiceWithAuthz creates a component service with authorization checks.
+func NewServiceWithAuthz(k8sClient client.Client, authzPDP authz.PDP, logger *slog.Logger) Service {
+	return &componentServiceWithAuthz{
+		internal: NewService(k8sClient, logger),
+		authz:    services.NewAuthzChecker(authzPDP, logger),
+	}
+}
+
+// formatComponentTypeAttr returns the authz-engine identifier for the ComponentType
+// (or ClusterComponentType) referenced by a Component, suitable for the
+// resource.componentType ABAC attribute. ref.Name is "{workloadType}/{componentTypeName}";
+// only the componentTypeName segment identifies the (Cluster)ComponentType resource.
+func formatComponentTypeAttr(namespace string, ref openchoreov1alpha1.ComponentTypeRef) string {
+	_, name, ok := strings.Cut(ref.Name, "/")
+	if !ok {
+		name = ref.Name
+	}
+	isClusterScoped := ref.Kind == openchoreov1alpha1.ComponentTypeRefKindClusterComponentType
+	return services.FormatDualScopedResourceName(namespace, name, isClusterScoped)
+}
+
+func (s *componentServiceWithAuthz) CreateComponent(ctx context.Context, namespaceName string, component *openchoreov1alpha1.Component) (*openchoreov1alpha1.Component, error) {
+	if err := s.authz.Check(ctx, services.CheckRequest{
+		Action:       authz.ActionCreateComponent,
+		ResourceType: resourceTypeComponent,
+		ResourceID:   component.Name,
+		Hierarchy: authz.ResourceHierarchy{
+			Namespace: namespaceName,
+			Project:   component.Spec.Owner.ProjectName,
+			Component: component.Name,
+		},
+		Context: authz.Context{
+			Resource: authz.ResourceAttribute{
+				ComponentType: formatComponentTypeAttr(namespaceName, component.Spec.ComponentType),
+			},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return s.internal.CreateComponent(ctx, namespaceName, component)
+}
+
+func (s *componentServiceWithAuthz) UpdateComponent(ctx context.Context, namespaceName string, component *openchoreov1alpha1.Component) (*openchoreov1alpha1.Component, error) {
+	if err := s.authz.Check(ctx, services.CheckRequest{
+		Action:       authz.ActionUpdateComponent,
+		ResourceType: resourceTypeComponent,
+		ResourceID:   component.Name,
+		Hierarchy: authz.ResourceHierarchy{
+			Namespace: namespaceName,
+			Project:   component.Spec.Owner.ProjectName,
+			Component: component.Name,
+		},
+		Context: authz.Context{
+			Resource: authz.ResourceAttribute{
+				ComponentType: formatComponentTypeAttr(namespaceName, component.Spec.ComponentType),
+			},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return s.internal.UpdateComponent(ctx, namespaceName, component)
+}
+
+func (s *componentServiceWithAuthz) ListComponents(ctx context.Context, namespaceName, projectName string, opts services.ListOptions) (*services.ListResult[openchoreov1alpha1.Component], error) {
+	return services.FilteredList(ctx, opts, s.authz,
+		func(ctx context.Context, pageOpts services.ListOptions) (*services.ListResult[openchoreov1alpha1.Component], error) {
+			return s.internal.ListComponents(ctx, namespaceName, projectName, pageOpts)
+		},
+		func(c openchoreov1alpha1.Component) services.CheckRequest {
+			return services.CheckRequest{
+				Action:       authz.ActionViewComponent,
+				ResourceType: resourceTypeComponent,
+				ResourceID:   c.Name,
+				Hierarchy: authz.ResourceHierarchy{
+					Namespace: namespaceName,
+					Project:   c.Spec.Owner.ProjectName,
+					Component: c.Name,
+				},
+			}
+		},
+	)
+}
+
+func (s *componentServiceWithAuthz) GetComponent(ctx context.Context, namespaceName, componentName string) (*openchoreov1alpha1.Component, error) {
+	// Fetch first to get the project for authz hierarchy
+	comp, err := s.internal.GetComponent(ctx, namespaceName, componentName)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authz.Check(ctx, services.CheckRequest{
+		Action:       authz.ActionViewComponent,
+		ResourceType: resourceTypeComponent,
+		ResourceID:   componentName,
+		Hierarchy: authz.ResourceHierarchy{
+			Namespace: namespaceName,
+			Project:   comp.Spec.Owner.ProjectName,
+			Component: componentName,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return comp, nil
+}
+
+func (s *componentServiceWithAuthz) DeleteComponent(ctx context.Context, namespaceName, componentName string) error {
+	// Fetch first to get the project for authz hierarchy
+	comp, err := s.internal.GetComponent(ctx, namespaceName, componentName)
+	if err != nil {
+		return err
+	}
+	if err := s.authz.Check(ctx, services.CheckRequest{
+		Action:       authz.ActionDeleteComponent,
+		ResourceType: resourceTypeComponent,
+		ResourceID:   componentName,
+		Hierarchy: authz.ResourceHierarchy{
+			Namespace: namespaceName,
+			Project:   comp.Spec.Owner.ProjectName,
+			Component: componentName,
+		},
+		Context: authz.Context{
+			Resource: authz.ResourceAttribute{
+				ComponentType: formatComponentTypeAttr(namespaceName, comp.Spec.ComponentType),
+			},
+		},
+	}); err != nil {
+		return err
+	}
+	return s.internal.DeleteComponent(ctx, namespaceName, componentName)
+}
+
+func (s *componentServiceWithAuthz) GenerateRelease(ctx context.Context, namespaceName, componentName string, req *GenerateReleaseRequest) (*openchoreov1alpha1.ComponentRelease, error) {
+	// Fetch first to get the project for authz hierarchy
+	comp, err := s.internal.GetComponent(ctx, namespaceName, componentName)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authz.Check(ctx, services.CheckRequest{
+		Action:       authz.ActionCreateComponentRelease,
+		ResourceType: resourceTypeComponentRelease,
+		ResourceID:   componentName,
+		Hierarchy: authz.ResourceHierarchy{
+			Namespace: namespaceName,
+			Project:   comp.Spec.Owner.ProjectName,
+			Component: componentName,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return s.internal.GenerateRelease(ctx, namespaceName, componentName, req)
+}
+
+func (s *componentServiceWithAuthz) GetComponentSchema(ctx context.Context, namespaceName, componentName string) (*extv1.JSONSchemaProps, error) {
+	// Fetch first to get the project for authz hierarchy
+	comp, err := s.internal.GetComponent(ctx, namespaceName, componentName)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authz.Check(ctx, services.CheckRequest{
+		Action:       authz.ActionViewComponent,
+		ResourceType: resourceTypeComponent,
+		ResourceID:   componentName,
+		Hierarchy: authz.ResourceHierarchy{
+			Namespace: namespaceName,
+			Project:   comp.Spec.Owner.ProjectName,
+			Component: componentName,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return s.internal.GetComponentSchema(ctx, namespaceName, componentName)
+}
+
+func (s *componentServiceWithAuthz) GetComponentReleaseSchema(ctx context.Context, namespaceName, releaseName, componentName string) (*extv1.JSONSchemaProps, error) {
+	// Fetch component to get the project for authz hierarchy
+	comp, err := s.internal.GetComponent(ctx, namespaceName, componentName)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authz.Check(ctx, services.CheckRequest{
+		Action:       authz.ActionViewComponent,
+		ResourceType: resourceTypeComponent,
+		ResourceID:   componentName,
+		Hierarchy: authz.ResourceHierarchy{
+			Namespace: namespaceName,
+			Project:   comp.Spec.Owner.ProjectName,
+			Component: componentName,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return s.internal.GetComponentReleaseSchema(ctx, namespaceName, releaseName, componentName)
+}

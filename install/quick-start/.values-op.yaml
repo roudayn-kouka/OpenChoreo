@@ -1,0 +1,36 @@
+# Helm values for OpenChoreo Observability Plane in quick-start container. This file overrides the default
+# values of the openchoreo-observability-plane Helm chart to suit the quick-start k3d environment.
+
+global:
+  installationMode: quickStart
+
+# OpenChoreo Observer Service Configuration
+observer:
+  secretName: observer-secret
+  controlPlaneApiUrl: "http://api.openchoreo.localhost:8080"
+  http:
+    hostnames:
+    - host.k3d.internal
+    - observer.openchoreo.localhost
+  extraEnvs:
+    - name: OBSERVER_BASE_URL
+      value: "http://observer.openchoreo.localhost:11080"
+  resources:
+    limits:
+      cpu: 50m
+      memory: 40Mi
+    requests:
+      cpu: 20m
+      memory: 20Mi
+
+# Gateway configuration for quick-start
+gateway:
+  httpPort: 11080
+  httpsPort: 11085
+  tls:
+    enabled: false
+
+security:
+  oidc:
+    jwksUrl: "http://thunder-service.thunder.svc.cluster.local:8090/oauth2/jwks"
+    authServerBaseUrl: "http://thunder.openchoreo.localhost:8080"

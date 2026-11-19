@@ -1,0 +1,42 @@
+{{- if and .Values.gateway.enabled .Values.rca.enabled .Values.rca.http.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .Values.rca.name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  parentRefs:
+  - name: gateway-default
+  {{- with .Values.rca.http.hostnames }}
+  hostnames:
+    {{- range . }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- end }}
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api/v1alpha1/rca-agent/chat
+    timeouts:
+      request: "450s"
+      backendRequest: "450s"
+    backendRefs:
+    - name: {{ .Values.rca.name }}
+      port: {{ .Values.rca.service.port }}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api/v1/rca-agent/reports
+    backendRefs:
+    - name: {{ .Values.rca.name }}
+      port: {{ .Values.rca.service.port }}
+  - name: mcp
+    matches:
+    - path:
+        type: PathPrefix
+        value: /mcp
+    backendRefs:
+    - name: {{ .Values.rca.name }}
+      port: {{ .Values.rca.service.port }}
+{{- end }}

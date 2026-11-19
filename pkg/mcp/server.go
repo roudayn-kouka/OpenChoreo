@@ -1,0 +1,148 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	authzcore "github.com/openchoreo/openchoreo/internal/authz/core"
+	"github.com/openchoreo/openchoreo/pkg/mcp/mcpaudit"
+	"github.com/openchoreo/openchoreo/pkg/mcp/tools"
+)
+
+// HTTP query parameter names recognized by the MCP HTTP handler. These are
+// optional and read on every HTTP request.
+const (
+	// QueryParamToolsets narrows the toolsets visible via tools/list to a
+	// comma-separated subset (e.g. ?toolsets=namespace,component,pe). Unknown
+	// or disabled toolset names are silently ignored. When the param is
+	// absent or empty, all registered toolsets are returned.
+	QueryParamToolsets = "toolsets"
+	// QueryParamFilterByAuthz controls whether MCP-layer authz filtering is
+	// applied to tools/list and tools/call (e.g. ?filterByAuthz=false).
+	// Defaults to true. The service layer enforces authz independently
+	// regardless of this flag.
+	QueryParamFilterByAuthz = "filterByAuthz"
+)
+
+// NewHTTPServer creates an MCP HTTP handler backed by a single shared server.
+//
+// All configured toolsets are registered up front. Per-request narrowing
+// happens via query parameters parsed from each HTTP request:
+//   - ?toolsets=ns1,ns2              — only show tools from those toolsets in tools/list
+//   - ?filterByAuthz=false           — disable MCP-layer authz filtering for the request
+//
+// When pdp is non-nil the server installs a receiving middleware that filters
+// tools/list results and guards tools/call invocations based on the
+// authenticated user's permissions derived from their JWT token. When pdp is
+// nil (authz disabled) all registered tools are visible and callable — the
+// service layer still enforces authz independently. The toolset filter is
+// always applied when the client requests it, regardless of pdp.
+//
+// auditOpts is passed straight through to mcpaudit.NewMiddleware. Its Emitter
+// is the same *audit.Emitter the REST adapter uses, so one policy applies
+// identically on both surfaces; its Bindings should come from the same
+// operation table the REST adapter defines (e.g. apiaudit.MCPBindings()).
+//
+// This function is the single place the MCP receiving-middleware chain is
+// composed. A wiring test drives exactly this AddReceivingMiddleware call;
+// rebuilding the chain elsewhere risks silently un-guarding MCP audit (#2588).
+//
+// Returns an error rather than panicking if auditOpts is misconfigured (e.g.
+// a nil Emitter, or a binding with a nil Operation), so the caller can fail
+// startup cleanly instead.
+//
+// logger is bound into the authz filter middleware at construction — it's
+// used only for server-side detail on a PDP failure that must not reach the
+// MCP client (see tools.NewToolFilterMiddleware). Pass the same logger used
+// for the rest of the service's application logs, not a one-off.
+func NewHTTPServer(
+	logger *slog.Logger, toolsets *tools.Toolsets, pdp authzcore.PDP, auditOpts mcpaudit.MiddlewareOptions,
+) (http.Handler, error) {
+	server := mcp.NewServer(&mcp.Implementation{
+		Name:    "openchoreo-api",
+		Version: "1.0.0",
+	}, nil)
+	perms, toolToToolsets := toolsets.Register(server)
+
+	auditMw, err := mcpaudit.NewMiddleware(auditOpts)
+	if err != nil {
+		return nil, err
+	}
+	filterMw, err := tools.NewToolFilterMiddleware(logger, pdp, perms, toolToToolsets)
+	if err != nil {
+		return nil, err
+	}
+
+	// go-sdk wraps middleware[0] outermost in AddReceivingMiddleware — the
+	// opposite of OpenAPIMiddlewares' last-is-outermost convention. Audit goes
+	// first so it observes the authz filter's denials as well as tool
+	// successes and failures.
+	server.AddReceivingMiddleware(auditMw, filterMw)
+
+	streamable := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+		return server
+	}, &mcp.StreamableHTTPOptions{Stateless: true})
+	return withRequestQueryParams(streamable), nil
+}
+
+// NewSTDIO creates an MCP server for STDIO transport (local CLI usage).
+// Permission filtering is intentionally skipped for STDIO: there is no
+// HTTP request, no JWT token, and no authenticated user identity available.
+// The service layer still enforces authz for any operations that require it.
+func NewSTDIO(toolsets *tools.Toolsets) *mcp.Server {
+	server := mcp.NewServer(&mcp.Implementation{
+		Name:    "openchoreo-cli",
+		Version: "1.0.0",
+	}, nil)
+	toolsets.Register(server)
+	return server
+}
+
+// withRequestQueryParams reads toolsets and filterByAuthz from each HTTP
+// request and passes them to the MCP middleware through its context.
+// Stateless requests must supply their own scope; no previous request's
+// query parameters are retained.
+func withRequestQueryParams(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		ctx := r.Context()
+
+		if raw := q.Get(QueryParamToolsets); raw != "" {
+			if requested := parseRequestedToolsets(raw); len(requested) > 0 {
+				ctx = tools.WithRequestedToolsets(ctx, requested)
+			}
+		}
+
+		if raw := q.Get(QueryParamFilterByAuthz); raw != "" {
+			if v, err := strconv.ParseBool(raw); err == nil {
+				ctx = tools.WithFilterByAuthz(ctx, v)
+			}
+		}
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// parseRequestedToolsets parses a comma-separated list of toolset names into a
+// set. Empty entries (from `,,` or trailing commas) are skipped. Unknown
+// toolset names are kept in the set as-is — the filter middleware silently
+// ignores them when none of the registered tools belong to that toolset, so an
+// unknown name simply matches nothing.
+func parseRequestedToolsets(raw string) map[tools.ToolsetType]bool {
+	out := map[tools.ToolsetType]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		out[tools.ToolsetType(name)] = true
+	}
+	return out
+}

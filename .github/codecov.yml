@@ -1,0 +1,38 @@
+# Codecov configuration for OpenChoreo
+# Validate: curl -X POST --data-binary @.github/codecov.yml https://codecov.io/validate
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 70%
+        informational: true
+
+ignore:
+  # Generated code
+  - "cmd"                                                      # Application entrypoints
+  - "tools/helm-gen"                                           # Generated helm files
+  - "**/zz_generated.*.go"                                     # Generated deepcopy and register files
+  - "**/mocks/**"                                               # Generated mock files (mockery)
+  - "api/v1alpha1/groupversion_info.go"                        # Generated CRD group/version boilerplate
+  - "internal/openchoreo-api/api/gen"                          # Generated OpenAPI server, client, and models
+  - "internal/observer/api/gen"                                # Generated observer, client, and models
+  - "internal/observer/api/internalgen"                        # Generated observer internal API server and models
+  - "internal/observer/api/logsadapterclientgen"
+  - "internal/observer/api/finopsadapterclientgen"
+  # Test utilities
+  - "test"                                                     # Test helpers and utilities
+  - "internal/openchoreo-api/services/testutil"
+  - "internal/controller/testutils"
+  - "internal/occ/testutil"                                    # CLI test helpers
+  # Copied from upstream open-source projects
+  - "internal/dataplane/kubernetes/types/argoproj.io"          # Copied from Argo project
+  - "internal/dataplane/kubernetes/types/cilium.io"            # Copied from Cilium project
+
+comment:
+  layout: "header, diff, files, footer"
+  hide_project_coverage: false
+

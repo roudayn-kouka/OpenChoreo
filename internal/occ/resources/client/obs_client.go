@@ -1,0 +1,174 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// ObserverClient provides HTTP client for Observer API
+type ObserverClient struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+}
+
+// LogEntry represents a single log entry from observer
+type LogEntry struct {
+	Timestamp string       `json:"timestamp"`
+	Log       string       `json:"log"`
+	Level     string       `json:"level,omitempty"`
+	Stream    string       `json:"stream,omitempty"`
+	Metadata  *LogMetadata `json:"metadata,omitempty"`
+}
+
+// LogMetadata carries per-entry metadata returned by the observer.
+type LogMetadata struct {
+	ContainerName string `json:"containerName,omitempty"`
+	PodName       string `json:"podName,omitempty"`
+}
+
+// ContainerName returns the container that produced the log entry, or "" if unknown.
+func (e LogEntry) ContainerName() string {
+	if e.Metadata != nil {
+		return e.Metadata.ContainerName
+	}
+	return ""
+}
+
+// LogResponse represents the response from the observer logs API
+type LogResponse struct {
+	Logs       []LogEntry `json:"logs"`
+	TotalCount int        `json:"totalCount"`
+	TookMs     int        `json:"tookMs"`
+}
+
+// ComponentLogsRequest represents the request body for component logs API
+type ComponentLogsRequest struct {
+	StartTime       string   `json:"startTime"`
+	EndTime         string   `json:"endTime"`
+	EnvironmentID   string   `json:"environmentId"`
+	ComponentName   string   `json:"componentName"`
+	ProjectName     string   `json:"projectName"`
+	NamespaceName   string   `json:"namespaceName"`
+	EnvironmentName string   `json:"environmentName"`
+	Limit           int64    `json:"limit"`
+	SortOrder       string   `json:"sortOrder"`
+	LogType         string   `json:"logType"`
+	SearchPhrase    string   `json:"searchPhrase,omitempty"`
+	LogLevels       []string `json:"logLevels,omitempty"`
+}
+
+// NewObserverClient creates a new Observer API client
+func NewObserverClient(observerURL, token string) *ObserverClient {
+	return &ObserverClient{
+		baseURL:    observerURL,
+		token:      token,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// FetchComponentLogs fetches logs for a component from the observer API
+func (c *ObserverClient) FetchComponentLogs(ctx context.Context, req ComponentLogsRequest) (*LogResponse, error) {
+	// Build LogsQueryRequest payload according to observer-api.yaml
+	payload := map[string]interface{}{
+		"startTime": req.StartTime,
+		"endTime":   req.EndTime,
+		"limit":     req.Limit,
+		"sortOrder": req.SortOrder,
+		"searchScope": map[string]interface{}{
+			"namespace":   req.NamespaceName,
+			"project":     req.ProjectName,
+			"component":   req.ComponentName,
+			"environment": req.EnvironmentName,
+		},
+	}
+
+	path := "/api/v1/logs/query"
+	resp, err := c.doRequest(ctx, "POST", path, payload)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("observer API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var logResponse LogResponse
+	if err := json.Unmarshal(body, &logResponse); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &logResponse, nil
+}
+
+// WorkflowRunLogsRequest represents the request body for workflow run logs API
+type WorkflowRunLogsRequest struct {
+	NamespaceName string `json:"namespaceName"`
+	StartTime     string `json:"startTime"`
+	EndTime       string `json:"endTime"`
+	Limit         int    `json:"limit,omitempty"`
+	SortOrder     string `json:"sortOrder,omitempty"`
+}
+
+// FetchWorkflowRunLogs fetches archived logs for a workflow run from the observer API
+func (c *ObserverClient) FetchWorkflowRunLogs(ctx context.Context, runName string, req WorkflowRunLogsRequest) (*LogResponse, error) {
+	// Build LogsQueryRequest payload for workflow search scope
+	payload := map[string]interface{}{
+		"startTime": req.StartTime,
+		"endTime":   req.EndTime,
+		"limit":     req.Limit,
+		"sortOrder": req.SortOrder,
+		"searchScope": map[string]interface{}{
+			"namespace":       req.NamespaceName,
+			"workflowRunName": runName,
+		},
+	}
+
+	path := "/api/v1/logs/query"
+	resp, err := c.doRequest(ctx, "POST", path, payload)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("observer API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var logResponse LogResponse
+	if err := json.Unmarshal(body, &logResponse); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &logResponse, nil
+}
+
+// doRequest performs HTTP request with proper headers
+func (c *ObserverClient) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	// Reuse legacy_client.go's APIClient doRequest logic
+	legacyClient := &APIClient{
+		baseURL:    c.baseURL,
+		token:      c.token,
+		httpClient: c.httpClient,
+	}
+
+	return legacyClient.doRequest(ctx, method, path, body)
+}

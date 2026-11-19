@@ -1,0 +1,271 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+)
+
+// Shared field index keys for use across controllers.
+// These constants ensure consistency when multiple controllers need to use the same field index.
+const (
+	// IndexKeyReleaseBindingOwnerComponentName indexes ReleaseBinding by owner component name.
+	IndexKeyReleaseBindingOwnerComponentName = "releasebinding.spec.owner.componentName"
+
+	// IndexKeyReleaseBindingOwnerEnv indexes ReleaseBinding by the composite key
+	// (projectName, componentName, environment) for efficient lookups.
+	IndexKeyReleaseBindingOwnerEnv = "releasebinding.spec.owner.projectName/componentName/environment"
+
+	// IndexKeyComponentOwnerProjectName indexes Component by owner project name.
+	IndexKeyComponentOwnerProjectName = "component.spec.owner.projectName"
+
+	// IndexKeyResourceOwnerProjectName indexes Resource by owner project name.
+	IndexKeyResourceOwnerProjectName = "resource.spec.owner.projectName"
+
+	// IndexKeyProjectDeploymentPipelineRef indexes Project by deploymentPipelineRef.
+	IndexKeyProjectDeploymentPipelineRef = "project.spec.deploymentPipelineRef"
+
+	// IndexKeyDeploymentPipelineEnvironmentRef indexes DeploymentPipeline by the environment names
+	// referenced in its promotionPaths (both source and target environments).
+	IndexKeyDeploymentPipelineEnvironmentRef = "deploymentpipeline.spec.promotionPaths.environmentRefs"
+
+	// IndexKeyResourceReleaseOwnerResourceName indexes ResourceRelease by owner resource name.
+	IndexKeyResourceReleaseOwnerResourceName = "resourcerelease.spec.owner.resourceName"
+
+	// IndexKeyResourceReleaseBindingOwnerResourceName indexes ResourceReleaseBinding by owner resource name.
+	IndexKeyResourceReleaseBindingOwnerResourceName = "resourcereleasebinding.spec.owner.resourceName"
+
+	// IndexKeyResourceReleaseBindingOwnerEnv indexes ResourceReleaseBinding by the composite key
+	// (projectName, resourceName, environment) so consumer ReleaseBindings can locate the
+	// matching provider for a (project, ref, env) tuple in O(1).
+	IndexKeyResourceReleaseBindingOwnerEnv = "resourcereleasebinding.spec.owner.projectName/resourceName/environment"
+
+	// IndexKeyProjectReleaseBindingOwner indexes ProjectReleaseBinding by owner project name
+	// so the Project controller can list all bindings of a project regardless of author
+	// (labels are optional on externally authored bindings).
+	IndexKeyProjectReleaseBindingOwner = "projectreleasebinding.spec.owner.projectName"
+
+	// IndexKeyProjectReleaseOwner indexes ProjectRelease by owner project name
+	// so the Project controller can list and delete all releases of a project.
+	IndexKeyProjectReleaseOwner = "projectrelease.spec.owner.projectName"
+)
+
+// MakeReleaseBindingOwnerEnvKey creates the composite index key for ReleaseBinding lookups
+// by (project, component, environment).
+func MakeReleaseBindingOwnerEnvKey(projectName, componentName, environment string) string {
+	return projectName + "/" + componentName + "/" + environment
+}
+
+// MakeResourceReleaseBindingOwnerEnvKey creates the composite index key for
+// ResourceReleaseBinding lookups by (project, resource, environment). Used by consumer
+// ReleaseBindings to locate the matching provider for a (project, ref, env) tuple.
+func MakeResourceReleaseBindingOwnerEnvKey(projectName, resourceName, environment string) string {
+	return projectName + "/" + resourceName + "/" + environment
+}
+
+// SetupSharedIndexes registers field indexes that are shared across multiple controllers.
+// This must be called before any controllers are set up with the manager.
+func SetupSharedIndexes(ctx context.Context, mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.ReleaseBinding{},
+		IndexKeyReleaseBindingOwnerComponentName, func(obj client.Object) []string {
+			binding := obj.(*openchoreov1alpha1.ReleaseBinding)
+			if binding.Spec.Owner.ComponentName == "" {
+				return nil
+			}
+			return []string{binding.Spec.Owner.ComponentName}
+		}); err != nil {
+		return fmt.Errorf("failed to setup ReleaseBinding owner index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.ReleaseBinding{},
+		IndexKeyReleaseBindingOwnerEnv, func(obj client.Object) []string {
+			rb := obj.(*openchoreov1alpha1.ReleaseBinding)
+			if rb.Spec.Owner.ProjectName == "" || rb.Spec.Owner.ComponentName == "" || rb.Spec.Environment == "" {
+				return nil
+			}
+			return []string{MakeReleaseBindingOwnerEnvKey(
+				rb.Spec.Owner.ProjectName,
+				rb.Spec.Owner.ComponentName,
+				rb.Spec.Environment,
+			)}
+		}); err != nil {
+		return fmt.Errorf("failed to setup ReleaseBinding owner+env index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.Component{},
+		IndexKeyComponentOwnerProjectName, func(obj client.Object) []string {
+			component := obj.(*openchoreov1alpha1.Component)
+			if component.Spec.Owner.ProjectName == "" {
+				return nil
+			}
+			return []string{component.Spec.Owner.ProjectName}
+		}); err != nil {
+		return fmt.Errorf("failed to setup Component owner project index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.Resource{},
+		IndexKeyResourceOwnerProjectName, func(obj client.Object) []string {
+			resource := obj.(*openchoreov1alpha1.Resource)
+			if resource.Spec.Owner.ProjectName == "" {
+				return nil
+			}
+			return []string{resource.Spec.Owner.ProjectName}
+		}); err != nil {
+		return fmt.Errorf("failed to setup Resource owner project index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.Project{},
+		IndexKeyProjectDeploymentPipelineRef, func(obj client.Object) []string {
+			project := obj.(*openchoreov1alpha1.Project)
+			if project.Spec.DeploymentPipelineRef.Name == "" {
+				return nil
+			}
+			return []string{project.Spec.DeploymentPipelineRef.Name}
+		}); err != nil {
+		return fmt.Errorf("failed to setup Project deploymentPipelineRef index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.DeploymentPipeline{},
+		IndexKeyDeploymentPipelineEnvironmentRef, func(obj client.Object) []string {
+			pipeline := obj.(*openchoreov1alpha1.DeploymentPipeline)
+			envNames := make(map[string]struct{})
+			for _, path := range pipeline.Spec.PromotionPaths {
+				if path.SourceEnvironmentRef.Name != "" {
+					envNames[path.SourceEnvironmentRef.Name] = struct{}{}
+				}
+				for _, target := range path.TargetEnvironmentRefs {
+					if target.Name != "" {
+						envNames[target.Name] = struct{}{}
+					}
+				}
+			}
+			result := make([]string, 0, len(envNames))
+			for name := range envNames {
+				result = append(result, name)
+			}
+			return result
+		}); err != nil {
+		return fmt.Errorf("failed to setup DeploymentPipeline environment ref index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.ResourceRelease{},
+		IndexKeyResourceReleaseOwnerResourceName, IndexResourceReleaseOwner); err != nil {
+		return fmt.Errorf("failed to setup ResourceRelease owner index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.ResourceReleaseBinding{},
+		IndexKeyResourceReleaseBindingOwnerResourceName, IndexResourceReleaseBindingOwner); err != nil {
+		return fmt.Errorf("failed to setup ResourceReleaseBinding owner index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.ResourceReleaseBinding{},
+		IndexKeyResourceReleaseBindingOwnerEnv, IndexResourceReleaseBindingOwnerEnv); err != nil {
+		return fmt.Errorf("failed to setup ResourceReleaseBinding owner+env index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.ProjectReleaseBinding{},
+		IndexKeyProjectReleaseBindingOwner, IndexProjectReleaseBindingOwner); err != nil {
+		return fmt.Errorf("failed to setup ProjectReleaseBinding owner index: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &openchoreov1alpha1.ProjectRelease{},
+		IndexKeyProjectReleaseOwner, IndexProjectReleaseOwner); err != nil {
+		return fmt.Errorf("failed to setup ProjectRelease owner index: %w", err)
+	}
+
+	return nil
+}
+
+// IndexResourceReleaseOwner extracts the owner resource name from a
+// ResourceRelease. Exported for fake-client tests so they can register the
+// same indexer the production setup uses.
+func IndexResourceReleaseOwner(obj client.Object) []string {
+	rr := obj.(*openchoreov1alpha1.ResourceRelease)
+	if rr.Spec.Owner.ResourceName == "" {
+		return nil
+	}
+	return []string{rr.Spec.Owner.ResourceName}
+}
+
+// IndexResourceReleaseBindingOwner extracts the owner resource name from a
+// ResourceReleaseBinding. Exported for fake-client tests so they can register
+// the same indexer the production setup uses.
+func IndexResourceReleaseBindingOwner(obj client.Object) []string {
+	rrb := obj.(*openchoreov1alpha1.ResourceReleaseBinding)
+	if rrb.Spec.Owner.ResourceName == "" {
+		return nil
+	}
+	return []string{rrb.Spec.Owner.ResourceName}
+}
+
+// IndexResourceReleaseBindingOwnerEnv extracts the composite (project, resource, environment)
+// index key from a ResourceReleaseBinding. Exported for fake-client tests so they can
+// register the same indexer the production setup uses.
+func IndexResourceReleaseBindingOwnerEnv(obj client.Object) []string {
+	rrb := obj.(*openchoreov1alpha1.ResourceReleaseBinding)
+	if rrb.Spec.Owner.ProjectName == "" || rrb.Spec.Owner.ResourceName == "" || rrb.Spec.Environment == "" {
+		return nil
+	}
+	return []string{MakeResourceReleaseBindingOwnerEnvKey(
+		rrb.Spec.Owner.ProjectName,
+		rrb.Spec.Owner.ResourceName,
+		rrb.Spec.Environment,
+	)}
+}
+
+// IndexProjectReleaseBindingOwner extracts the owner project name from a
+// ProjectReleaseBinding. Exported for fake-client tests so they can register
+// the same indexer the production setup uses.
+func IndexProjectReleaseBindingOwner(obj client.Object) []string {
+	prb := obj.(*openchoreov1alpha1.ProjectReleaseBinding)
+	if prb.Spec.Owner.ProjectName == "" {
+		return nil
+	}
+	return []string{prb.Spec.Owner.ProjectName}
+}
+
+// IndexProjectReleaseOwner extracts the owner project name from a
+// ProjectRelease. Exported for fake-client tests so they can register
+// the same indexer the production setup uses.
+func IndexProjectReleaseOwner(obj client.Object) []string {
+	pr := obj.(*openchoreov1alpha1.ProjectRelease)
+	if pr.Spec.Owner.ProjectName == "" {
+		return nil
+	}
+	return []string{pr.Spec.Owner.ProjectName}
+}
+
+// HierarchyWatchHandler is a function that creates a watch handler for a specific hierarchy.
+// It can be used to watch from parent object for child object updates.
+// The hierarchyFunc should return the target object that is being watched given the source object.
+func HierarchyWatchHandler[From client.Object, To client.Object](
+	c client.Client,
+	hierarchyFunc HierarchyFunc[To],
+) func(ctx context.Context, obj client.Object) []reconcile.Request {
+	return func(ctx context.Context, obj client.Object) []reconcile.Request {
+		fromObj, ok := obj.(From)
+		if !ok {
+			return nil
+		}
+
+		toObj, err := hierarchyFunc(ctx, c, fromObj)
+		if err != nil {
+			return nil
+		}
+
+		return []reconcile.Request{{
+			NamespacedName: client.ObjectKey{
+				Namespace: toObj.GetNamespace(),
+				Name:      toObj.GetName(),
+			},
+		}}
+	}
+}

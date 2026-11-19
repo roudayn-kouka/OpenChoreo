@@ -1,0 +1,692 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package renderedrelease
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	kubernetesClient "github.com/openchoreo/openchoreo/internal/clients/kubernetes"
+	"github.com/openchoreo/openchoreo/internal/controller"
+	"github.com/openchoreo/openchoreo/internal/labels"
+)
+
+const (
+	// ControllerName is the name of the controller managing RenderedRelease resources
+	ControllerName = "renderedrelease-controller"
+
+	targetPlaneDataPlane          = "dataplane"
+	targetPlaneObservabilityPlane = "observabilityplane"
+
+	appsAPIGroup    = "apps"
+	deploymentKind  = "Deployment"
+	statefulSetKind = "StatefulSet"
+
+	batchAPIGroup = "batch"
+	cronJobKind   = "CronJob"
+
+	// reasonProgressDeadlineExceeded is the Deployment Progressing condition reason
+	// Kubernetes sets when a rollout exceeds progressDeadlineSeconds.
+	reasonProgressDeadlineExceeded = "ProgressDeadlineExceeded"
+
+	// ConditionResourcesApplied indicates whether resources were successfully applied to the target plane.
+	// When False, it contains the error message from the failed apply operation.
+	ConditionResourcesApplied = "ResourcesApplied"
+
+	// ReasonApplySucceeded indicates all resources were applied successfully
+	ReasonApplySucceeded = "ApplySucceeded"
+	// ReasonApplyFailed indicates one or more resources failed to apply
+	ReasonApplyFailed = "ApplyFailed"
+)
+
+// Reconciler reconciles a RenderedRelease object
+type Reconciler struct {
+	client.Client
+	PlaneClientProvider kubernetesClient.PlaneClientProvider
+	Scheme              *runtime.Scheme
+}
+
+// TODO: Optimize to apply resource only if spec has changed
+// TODO: Add events and conditions
+
+// +kubebuilder:rbac:groups=openchoreo.dev,resources=renderedreleases,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=openchoreo.dev,resources=renderedreleases/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=openchoreo.dev,resources=renderedreleases/finalizers,verbs=update
+// +kubebuilder:rbac:groups=openchoreo.dev,resources=clusterdataplanes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=openchoreo.dev,resources=clusterobservabilityplanes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=events,verbs=create
+// +kubebuilder:rbac:groups="networking.k8s.io",resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+
+// Reconcile is part of the main kubernetes reconciliation loop which aims to
+// move the current state of the cluster closer to the desired state.
+//
+// For more details, check Reconcile and its Result here:
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.1/pkg/reconcile
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// Fetch the RenderedRelease instance
+	release := &openchoreov1alpha1.RenderedRelease{}
+	if err := r.Get(ctx, req.NamespacedName, release); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("RenderedRelease resource not found. Ignoring since it must be deleted.")
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "Failed to get RenderedRelease")
+		return ctrl.Result{}, err
+	}
+
+	old := release.DeepCopy()
+
+	// Handle the deletion of the Release
+	if !release.DeletionTimestamp.IsZero() {
+		logger.Info("Finalizing Release")
+		return r.finalize(ctx, old, release)
+	}
+
+	// Ensure the finalizer is added to the Release
+	if finalizerAdded, err := r.ensureFinalizer(ctx, release); err != nil || finalizerAdded {
+		// Return after adding the finalizer to ensure the finalizer is persisted
+		return ctrl.Result{}, err
+	}
+
+	// Get plane client (dataplane or observabilityplane) for the environment based on targetPlane
+	targetPlane := release.Spec.TargetPlane
+	if targetPlane == "" {
+		targetPlane = targetPlaneDataPlane // Default to dataplane if not specified (avoid breaking change)
+	}
+
+	var planeClient client.Client
+	var err error
+	switch targetPlane {
+	case targetPlaneObservabilityPlane:
+		planeClient, err = r.getOPClient(ctx, release.Namespace, release.Spec.EnvironmentName)
+		if err != nil {
+			logger.Error(err, "Failed to get observability plane client")
+			return ctrl.Result{}, err
+		}
+	case targetPlaneDataPlane:
+		fallthrough
+	default:
+		planeClient, err = r.getDPClient(ctx, release.Namespace, release.Spec.EnvironmentName)
+		if err != nil {
+			logger.Error(err, "Failed to get dataplane client")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Get desired resources from spec
+	desiredResources, err := r.makeDesiredResources(release)
+	if err != nil {
+		logger.Error(err, "Failed to make desired resources")
+		return ctrl.Result{}, err
+	}
+
+	// Ensure namespaces exist before applying resources on the observability plane only.
+	// The data plane's cell namespace is owned by the ProjectReleaseBinding, so the DP
+	// apply path must not regain implicit namespace creation. On the observability plane
+	// nothing else creates the target namespace, so we create it here.
+	if targetPlane == targetPlaneObservabilityPlane {
+		desiredNamespaces := r.makeDesiredNamespaces(release, desiredResources)
+		if err := r.ensureNamespaces(ctx, planeClient, desiredNamespaces); err != nil {
+			logger.Error(err, "Failed to ensure namespaces on observability plane")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// PHASE 1: Apply desired resources to the target plane
+	// This ensures all resources in the spec are created/updated with proper tracking labels
+	if err := r.applyResources(ctx, planeClient, desiredResources); err != nil {
+		logger.Error(err, "Failed to apply resources to target plane", "targetPlane", targetPlane)
+		// Persist the apply error in Release status so upstream controllers (e.g., ReleaseBinding) can surface it
+		changed := controller.MarkFalseCondition(release, controller.ConditionType(ConditionResourcesApplied),
+			controller.ConditionReason(ReasonApplyFailed),
+			fmt.Sprintf("Failed to apply resources to target plane: %v", err))
+		if changed {
+			if statusErr := r.Status().Update(ctx, release); statusErr != nil {
+				logger.Error(statusErr, "Failed to update Release status with apply error")
+			}
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Mark resources as successfully applied, but leave persisting it to the status
+	// update at the end of this reconcile.
+	// Writing it here would publish a state that contradicts itself: the condition
+	// would report this generation as applied while Status.Resources still holds
+	// the health of the generation being replaced. A consumer that reads the
+	// condition to decide whether the health beside it is current -- which is the
+	// only signal available for that -- would act on the previous revision's
+	// health. The delivery events built on it reported a rollout as succeeded
+	// before its pods existed.
+	//
+	// The apply-failure branch above still persists immediately, because there the
+	// point is to surface the error before returning.
+	controller.MarkTrueCondition(release, controller.ConditionType(ConditionResourcesApplied),
+		controller.ConditionReason(ReasonApplySucceeded), "All resources applied successfully")
+
+	// PHASE 2: Discover live resources that we manage in the target plane
+	// This queries both current resource types (from spec) and previous resource types (from status)
+	// to ensure we find all resources that might need cleanup, preventing resource leaks
+	gvks := findAllKnownGVKs(desiredResources, release.Status.Resources, targetPlane)
+	liveResources, err := r.listLiveResourcesByGVKs(ctx, planeClient, release, gvks)
+	if err != nil {
+		logger.Error(err, "Failed to list live resources from target plane", "targetPlane", targetPlane)
+		return ctrl.Result{}, err
+	}
+
+	// PHASE 3: Find and delete stale resources (cleanup orphaned resources)
+	// Stale = live resources that are no longer in the desired spec (e.g., user removed a ConfigMap)
+	// This implements Flux-style inventory cleanup to prevent resource accumulation over time
+	staleResources := r.findStaleResources(liveResources, desiredResources)
+	if err := r.deleteResources(ctx, planeClient, staleResources); err != nil {
+		logger.Error(err, "Failed to delete stale resources")
+		return ctrl.Result{}, err
+	}
+
+	// Build the resource statuses first so delivery events and the status update
+	// share one health evaluation
+	resourceStatuses := r.buildResourceStatus(ctx, old, desiredResources, liveResources)
+
+	// PHASE 4: Update status with applied resources inventory (done last after all operations)
+	// This maintains an inventory of what we applied for future cleanup operations
+	if statusUpdated, err := r.updateStatus(ctx, old, release, resourceStatuses); err != nil || statusUpdated {
+		// Return after updating the status to ensure it is persisted before continuing
+		return ctrl.Result{}, err
+	}
+
+	// Check if resources are transitioning to determine the appropriate requeue interval:
+	// - Transitioning resources: more frequent requeue to reflect changes quickly
+	// - Stable resources: longer requeue interval to avoid excessive load
+	if r.hasTransitioningResources(release.Status.Resources) {
+		requeueAfter := getProgressingRequeueInterval(release)
+		logger.Info("Resources are transitioning, requeuing with configured interval",
+			"requeueAfter", requeueAfter)
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	// Poll workloads scaled to zero faster so an autoscaler-driven scale-up is noticed promptly.
+	if hasResurrectableWorkload(desiredResources, liveResources) {
+		requeueAfter := getResurrectableRequeueInterval()
+		logger.Info("Workload is scaled to zero, requeuing to detect autoscaler-driven scale-up",
+			"requeueAfter", requeueAfter)
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	requeueAfter := getStableRequeueInterval(release)
+	logger.Info("Successfully applied the Release resources to the target plane",
+		"targetPlane", targetPlane, "requeueAfter", requeueAfter)
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// getDPClient gets the dataplane client for the specified environment
+func (r *Reconciler) getDPClient(ctx context.Context, namespaceName string, environmentName string) (client.Client, error) {
+	env := &openchoreov1alpha1.Environment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: environmentName, Namespace: namespaceName}, env); err != nil {
+		return nil, fmt.Errorf("failed to get environment %s: %w", environmentName, err)
+	}
+
+	dataPlaneResult, err := controller.GetDataPlaneFromRef(ctx, r.Client, env.Namespace, env.Spec.DataPlaneRef)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve dataplane for environment %s: %w", environmentName, err)
+	}
+
+	dpClient, err := dataPlaneResult.GetK8sClient(r.PlaneClientProvider)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dataplane client for %s: %w", dataPlaneResult.GetName(), err)
+	}
+
+	return dpClient, nil
+}
+
+// getOPClient gets the observability plane client for the specified environment
+// It follows the chain: Environment -> DataPlane -> ObservabilityPlane
+func (r *Reconciler) getOPClient(ctx context.Context, namespaceName string, environmentName string) (client.Client, error) {
+	env := &openchoreov1alpha1.Environment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: environmentName, Namespace: namespaceName}, env); err != nil {
+		return nil, fmt.Errorf("failed to get environment %s: %w", environmentName, err)
+	}
+
+	dataPlaneResult, err := controller.GetDataPlaneFromRef(ctx, r.Client, env.Namespace, env.Spec.DataPlaneRef)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve dataplane for environment %s: %w", environmentName, err)
+	}
+
+	obsResult, err := dataPlaneResult.GetObservabilityPlane(ctx, r.Client)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve observability plane for dataplane %s: %w", dataPlaneResult.GetName(), err)
+	}
+
+	opClient, err := obsResult.GetK8sClient(r.PlaneClientProvider)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create observability plane client for %s: %w", obsResult.GetName(), err)
+	}
+
+	return opClient, nil
+}
+
+// applyResources applies the given resources to the target plane
+func (r *Reconciler) applyResources(ctx context.Context, planeClient client.Client, resources []*unstructured.Unstructured) error {
+	for _, obj := range resources {
+		resourceID := obj.GetLabels()[labels.LabelKeyRenderedReleaseResourceID]
+
+		// Apply the resource using server-side apply
+		if err := planeClient.Patch(ctx, obj, client.Apply, client.ForceOwnership, client.FieldOwner(ControllerName)); err != nil {
+			return fmt.Errorf("failed to apply resource %s: %w", resourceID, err)
+		}
+	}
+
+	return nil
+}
+
+// makeDesiredResources creates the desired resources from the Release spec
+func (r *Reconciler) makeDesiredResources(release *openchoreov1alpha1.RenderedRelease) ([]*unstructured.Unstructured, error) {
+	desiredObjects := make([]*unstructured.Unstructured, 0, len(release.Spec.Resources))
+
+	restartedAt := release.Annotations[controller.AnnotationKeyRestartedAt]
+
+	for _, resource := range release.Spec.Resources {
+		// Convert RawExtension to Unstructured
+		obj := &unstructured.Unstructured{}
+		if err := obj.UnmarshalJSON(resource.Object.Raw); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal resource %s: %w", resource.ID, err)
+		}
+
+		// Add tracking labels
+		resourceLabels := obj.GetLabels()
+		if resourceLabels == nil {
+			resourceLabels = make(map[string]string)
+		}
+		resourceLabels[labels.LabelKeyManagedBy] = ControllerName
+		resourceLabels[labels.LabelKeyRenderedReleaseResourceID] = resource.ID
+		resourceLabels[labels.LabelKeyRenderedReleaseUID] = string(release.UID)
+		resourceLabels[labels.LabelKeyRenderedReleaseName] = release.Name
+		resourceLabels[labels.LabelKeyRenderedReleaseNamespace] = release.Namespace
+
+		obj.SetLabels(resourceLabels)
+
+		if restartedAt != "" {
+			if err := injectRestartedAt(obj, restartedAt); err != nil {
+				return nil, fmt.Errorf("failed to inject restartedAt on resource %s: %w", resource.ID, err)
+			}
+		}
+
+		desiredObjects = append(desiredObjects, obj)
+	}
+
+	return desiredObjects, nil
+}
+
+// injectRestartedAt sets openchoreo.dev/restartedAt on the pod template of an
+// apps/v1 Deployment so a change to the value causes the data plane to perform
+// a rolling restart. It is a no-op for any other kind. Returns an error if the
+// manifest is malformed (e.g. annotations is not a string map), so the caller
+// can surface it instead of silently dropping the restart trigger.
+func injectRestartedAt(obj *unstructured.Unstructured, value string) error {
+	gvk := obj.GroupVersionKind()
+	if gvk.Group != appsAPIGroup || gvk.Kind != deploymentKind {
+		return nil
+	}
+	annotations, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+	if err != nil {
+		return fmt.Errorf("read pod template annotations: %w", err)
+	}
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[controller.AnnotationKeyRestartedAt] = value
+	if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
+		return fmt.Errorf("set pod template annotations: %w", err)
+	}
+	return nil
+}
+
+// makeDesiredNamespaces creates namespace objects from the desired resources with proper labels
+func (r *Reconciler) makeDesiredNamespaces(release *openchoreov1alpha1.RenderedRelease, resources []*unstructured.Unstructured) []*corev1.Namespace {
+	namespaceMap := make(map[string]*corev1.Namespace)
+
+	for _, obj := range resources {
+		namespaceName := obj.GetNamespace()
+		if namespaceName != "" {
+			if _, exists := namespaceMap[namespaceName]; !exists {
+				namespaceMap[namespaceName] = &corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: namespaceName,
+						Labels: map[string]string{
+							// Audit labels - track which release created this namespace
+							labels.LabelKeyCreatedBy:                ControllerName,
+							labels.LabelKeyRenderedReleaseName:      release.Name,
+							labels.LabelKeyRenderedReleaseNamespace: release.Namespace,
+							labels.LabelKeyRenderedReleaseUID:       string(release.UID),
+
+							// Identification labels - track where this namespace belongs
+							labels.LabelKeyNamespaceName:   release.Namespace,
+							labels.LabelKeyEnvironmentName: release.Spec.EnvironmentName,
+							labels.LabelKeyProjectName:     release.Spec.Owner.ProjectName,
+						},
+					},
+				}
+			}
+		}
+	}
+
+	// Convert the map to a slice
+	namespaces := make([]*corev1.Namespace, 0, len(namespaceMap))
+	for _, ns := range namespaceMap {
+		namespaces = append(namespaces, ns)
+	}
+
+	return namespaces
+}
+
+// ensureNamespaces ensures all required namespaces exist in the target plane
+func (r *Reconciler) ensureNamespaces(ctx context.Context, planeClient client.Client, namespaces []*corev1.Namespace) error {
+	for _, namespace := range namespaces {
+		existingNs := &corev1.Namespace{}
+		err := planeClient.Get(ctx, client.ObjectKey{Name: namespace.Name}, existingNs)
+
+		// Namespace already exists, skip to next
+		if err == nil {
+			continue
+		}
+
+		// Error other than NotFound
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to check namespace %s: %w", namespace.Name, err)
+		}
+
+		// Namespace doesn't exist, create it
+		if err := planeClient.Create(ctx, namespace); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// Another controller/release created it concurrently - that's fine
+				continue
+			}
+			return fmt.Errorf("failed to create namespace %s: %w", namespace.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// findStaleResources finds resources that were previously managed but are no longer in the desired spec
+func (r *Reconciler) findStaleResources(liveResources, desiredResources []*unstructured.Unstructured) []*unstructured.Unstructured {
+	// Build a set of desired resource IDs for fast lookup
+	desiredResourceIDs := make(map[string]bool)
+	for _, obj := range desiredResources {
+		resourceID := obj.GetLabels()[labels.LabelKeyRenderedReleaseResourceID]
+		if resourceID != "" {
+			desiredResourceIDs[resourceID] = true
+		}
+	}
+
+	// Find live resources that are not in the desired set
+	var staleResources []*unstructured.Unstructured
+	for _, liveObj := range liveResources {
+		liveResourceID := liveObj.GetLabels()[labels.LabelKeyRenderedReleaseResourceID]
+		if liveResourceID != "" {
+			// If this live resource ID is not in the desired set, it's stale
+			if !desiredResourceIDs[liveResourceID] {
+				staleResources = append(staleResources, liveObj)
+			}
+		}
+	}
+
+	return staleResources
+}
+
+// deleteResources deletes the given stale resources from the target plane
+func (r *Reconciler) deleteResources(ctx context.Context, planeClient client.Client, staleResources []*unstructured.Unstructured) error {
+	for _, obj := range staleResources {
+		resourceID := obj.GetLabels()[labels.LabelKeyRenderedReleaseResourceID]
+
+		// Skip resources already terminating on the target plane (re-deleting over
+		// the gateway tunnel is a wasted round-trip on the most expensive I/O path).
+		if obj.GetDeletionTimestamp() != nil {
+			continue
+		}
+
+		// Delete the resource from the target plane
+		if err := planeClient.Delete(ctx, obj); err != nil {
+			return fmt.Errorf("failed to delete stale resource %s: %w", resourceID, err)
+		}
+	}
+
+	return nil
+}
+
+// wellKnownDataPlaneGVKs is the safety-net list for data-plane rendered releases.
+// It covers common Kubernetes resource types that the data-plane agent has permission
+// to list, so orphaned resources are caught even when status update fails.
+var wellKnownDataPlaneGVKs = []schema.GroupVersionKind{
+	// Core Kubernetes Resources
+	{Group: "", Version: "v1", Kind: "Service"},
+	{Group: "", Version: "v1", Kind: "ConfigMap"},
+	{Group: "", Version: "v1", Kind: "Secret"},
+	{Group: "", Version: "v1", Kind: "ServiceAccount"},
+	{Group: "", Version: "v1", Kind: "Namespace"},
+	{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"},
+
+	// Apps
+	{Group: appsAPIGroup, Version: "v1", Kind: deploymentKind},
+	{Group: appsAPIGroup, Version: "v1", Kind: statefulSetKind},
+
+	// Batch
+	{Group: "batch", Version: "v1", Kind: "Job"},
+	{Group: "batch", Version: "v1", Kind: "CronJob"},
+
+	// Autoscaling & Policy
+	{Group: "autoscaling", Version: "v2", Kind: "HorizontalPodAutoscaler"},
+	{Group: "policy", Version: "v1", Kind: "PodDisruptionBudget"},
+
+	// Networking
+	{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"},
+	{Group: "networking.k8s.io", Version: "v1", Kind: "Ingress"},
+
+	// RBAC
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "Role"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"},
+
+	// Gateway API
+	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"},
+	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"},
+}
+
+// wellKnownObservabilityPlaneGVKs is the safety-net list for observability-plane rendered
+// releases. It is intentionally narrow: only the CRDs that the observability-plane agent
+// reconciles and has RBAC permission to list. Broad Kubernetes types (Services, Deployments,
+// etc.) and control-plane-only CRDs (e.g. ObservabilityAlertsNotificationChannel) are
+// excluded because the observability-plane agent's RBAC does not cover them.
+var wellKnownObservabilityPlaneGVKs = []schema.GroupVersionKind{
+	{Group: "openchoreo.dev", Version: "v1alpha1", Kind: "ObservabilityAlertRule"},
+}
+
+// findAllKnownGVKs finds all GroupVersionKinds that we should query for cleanup.
+//
+// This function is critical for preventing resource leaks during cleanup. It combines resource types
+// from three sources to ensure comprehensive coverage:
+//
+// 1. DESIRED RESOURCES (current spec): Resource types the user wants now
+//   - Handles new resource types added to the spec
+//   - Ensures we query current resource types for updates
+//
+// 2. APPLIED RESOURCES (previously applied): Resource types we managed before
+//   - Handles resource types that were removed from the spec
+//   - Prevents orphaned resources when user removes entire resource types
+//
+// 3. WELL-KNOWN TYPES: Plane-specific resource types we typically manage
+//   - Handles edge cases where resources exist but status update failed
+//   - Provides safety net for orphaned resources from failed reconciliations
+//   - Scoped per target plane so only types the plane's agent can list are queried
+//
+// Example scenario:
+//   - Previous reconciliation: Applied ConfigMap + Secret
+//   - Current reconciliation: User removed ConfigMap, kept Secret
+//   - Without status: Would only query Secret, miss orphaned ConfigMap
+//   - With status: Queries both Secret + ConfigMap, finds and deletes orphaned ConfigMap
+func findAllKnownGVKs(desiredResources []*unstructured.Unstructured, appliedResources []openchoreov1alpha1.RenderedManifestStatus, targetPlane string) []schema.GroupVersionKind {
+	gvkSet := make(map[schema.GroupVersionKind]bool)
+
+	// Add GVKs from desired resources (current spec)
+	// This ensures we query resource types the user wants now
+	for _, obj := range desiredResources {
+		gvk := obj.GroupVersionKind()
+		gvkSet[gvk] = true
+	}
+
+	// Add GVKs from applied resources (previously applied)
+	// This ensures we query resource types we managed before, even if removed from spec
+	for _, appliedResource := range appliedResources {
+		gvk := schema.GroupVersionKind{
+			Group:   appliedResource.Group,
+			Version: appliedResource.Version,
+			Kind:    appliedResource.Kind,
+		}
+		gvkSet[gvk] = true
+	}
+
+	// Add plane-specific well-known GVKs as a safety net for orphaned resources.
+	// Using a plane-scoped list ensures we only probe types the plane agent can list,
+	// avoiding spurious RBAC errors from querying types the plane doesn't manage.
+	wellKnownGVKs := wellKnownDataPlaneGVKs
+	if targetPlane == targetPlaneObservabilityPlane {
+		wellKnownGVKs = wellKnownObservabilityPlaneGVKs
+	}
+	for _, gvk := range wellKnownGVKs {
+		gvkSet[gvk] = true
+	}
+
+	// Convert set to slice after all sources have been merged
+	gvks := make([]schema.GroupVersionKind, 0, len(gvkSet))
+	for gvk := range gvkSet {
+		gvks = append(gvks, gvk)
+	}
+
+	return gvks
+}
+
+// listLiveResourcesByGVKs queries specific resource types with label selector
+func (r *Reconciler) listLiveResourcesByGVKs(ctx context.Context, planeClient client.Client, release *openchoreov1alpha1.RenderedRelease, gvks []schema.GroupVersionKind) ([]*unstructured.Unstructured, error) {
+	var allLiveResources []*unstructured.Unstructured
+
+	// Query each GVK with our label selector
+	for _, gvk := range gvks {
+		// Create unstructured list for this GVK
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   gvk.Group,
+			Version: gvk.Version,
+			Kind:    gvk.Kind + "List", // e.g., "Deployment" -> "DeploymentList"
+		})
+
+		// Build label selector
+		labelSelector := metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				labels.LabelKeyManagedBy:          ControllerName,
+				labels.LabelKeyRenderedReleaseUID: string(release.UID),
+			},
+		}
+		selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create label selector: %w", err)
+		}
+
+		// List resources with label selector
+		if err := planeClient.List(ctx, list, &client.ListOptions{
+			LabelSelector: selector,
+		}); err != nil {
+			if apimeta.IsNoMatchError(err) {
+				// GVK is not registered in this cluster — silently skip
+				continue
+			}
+			return nil, fmt.Errorf("failed to list resources for %s: %w", gvk.String(), err)
+		}
+
+		// Add all items to result
+		for i := range list.Items {
+			allLiveResources = append(allLiveResources, &list.Items[i])
+		}
+	}
+
+	return allLiveResources, nil
+}
+
+// getStableRequeueInterval returns the requeue interval for stable resources
+// Returns zero duration if interval is set to 0 (no requeue)
+func getStableRequeueInterval(release *openchoreov1alpha1.RenderedRelease) time.Duration {
+	// Use configured interval or default to 5m
+	baseInterval := 5 * time.Minute
+	if release.Spec.Interval != nil {
+		baseInterval = release.Spec.Interval.Duration
+		// If set to 0, don't requeue
+		if baseInterval == 0 {
+			return 0
+		}
+	}
+
+	// Add 20% jitter
+	jitterMax := time.Duration(float64(baseInterval) * 0.2)
+	return addJitter(baseInterval, jitterMax)
+}
+
+// getResurrectableRequeueInterval returns the requeue interval for workloads scaled to zero
+// that an autoscaler may resurrect: faster than the stable cadence so a scale-up is noticed
+// promptly, but slow enough not to hammer the plane agent when many workloads sit idle.
+func getResurrectableRequeueInterval() time.Duration {
+	baseInterval := 1 * time.Minute
+	jitterMax := time.Duration(float64(baseInterval) * 0.2)
+	return addJitter(baseInterval, jitterMax)
+}
+
+// getProgressingRequeueInterval returns the requeue interval for transitioning resources
+// Returns zero duration if progressingInterval is set to 0 (no requeue)
+func getProgressingRequeueInterval(release *openchoreov1alpha1.RenderedRelease) time.Duration {
+	// Use configured progressingInterval or default to 10s
+	baseInterval := 10 * time.Second
+	if release.Spec.ProgressingInterval != nil {
+		baseInterval = release.Spec.ProgressingInterval.Duration
+		// If set to 0, don't requeue
+		if baseInterval == 0 {
+			return 0
+		}
+	}
+
+	// Add 20% jitter
+	jitterMax := time.Duration(float64(baseInterval) * 0.2)
+	return addJitter(baseInterval, jitterMax)
+}
+
+// addJitter adds a random jitter to the base duration to prevent thundering herd
+// For example, addJitter(10*time.Second, 5*time.Second) returns 10-15 seconds
+func addJitter(base time.Duration, maxJitter time.Duration) time.Duration {
+	if maxJitter <= 0 {
+		return base
+	}
+	jitter := time.Duration(rand.Intn(int(maxJitter))) //nolint:gosec // Non-cryptographic randomness is acceptable for jitter
+	return base + jitter
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&openchoreov1alpha1.RenderedRelease{}).
+		Named("renderedrelease").
+		Complete(r)
+}

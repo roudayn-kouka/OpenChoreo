@@ -1,0 +1,949 @@
+openapi: 3.1.0
+info:
+  title: OpenChoreo RCA Agent API
+  description: |
+    The OpenChoreo RCA Agent API provides endpoints to trigger RCA, retrieve RCA reports created by the RCA agent and 
+    provides conversational chat capabilities for RCA reports. Users can ask follow-up questions about RCA reports.
+  version: 1.0.0
+  contact:
+    name: OpenChoreo Team
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+tags:
+  - name: Agent
+    description: RCA analysis and conversational agent endpoints
+  - name: RCA Reports
+    description: Endpoints for retrieving RCA reports
+
+paths:
+  /api/v1alpha1/rca-agent/analyze:
+    post:
+      tags:
+        - Agent
+      summary: Trigger RCA analysis for an alert
+      description: |
+        Creates a pending RCA report and triggers background analysis for the given alert.
+        The analysis runs asynchronously and the report status can be checked via the reports endpoints.
+      operationId: analyze
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnalyzeRequest'
+      responses:
+        '200':
+          description: Analysis triggered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RCAResponse'
+        '400':
+          description: Bad request - invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1alpha1/rca-agent/chat:
+    post:
+      tags:
+        - Agent
+      summary: Chat about an RCA report
+      description: |
+        Conversational Q&A about an RCA report with streaming NDJSON response.
+        The agent can query observability data (logs, traces, metrics) to answer
+        follow-up questions about the report.
+
+        **Streaming Response Format (NDJSON):**
+        Each line is a JSON object with a `type` field indicating the event type.
+        Events are streamed in order: `message_chunk`* -> `tool_call`* -> `actions`? -> `done`
+      operationId: chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: Streaming NDJSON response with chat events
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/StreamEvent'
+              examples:
+                message_chunk:
+                  summary: Message chunk event
+                  value: '{"type": "message_chunk", "content": "Based on the logs"}'
+                tool_call:
+                  summary: Tool call event
+                  value: '{"type": "tool_call", "tool": "get_component_logs", "activeForm": "Fetching component logs...", "args": "{\"componentUid\": \"...\"}"}'
+                actions:
+                  summary: Actions event
+                  value: '{"type": "actions", "actions": [{"type": "suggest_amend", "reason": "Found new root cause"}]}'
+                done:
+                  summary: Done event
+                  value: '{"type": "done", "message": "The issue was caused by..."}'
+                error:
+                  summary: Error event
+                  value: '{"type": "error", "message": "Failed to fetch logs"}'
+        '400':
+          description: Bad request - invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized - invalid or missing authentication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Report not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/rca-agent/reports:
+    get:
+      tags:
+        - RCA Reports
+      summary: List RCA reports
+      operationId: listRCAReports
+      parameters:
+        - name: project
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: namespace
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: startTime
+          in: query
+          required: true
+          description: RFC3339 format
+          schema:
+            type: string
+            format: date-time
+        - name: endTime
+          in: query
+          required: true
+          description: RFC3339 format
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+            default: 100
+        - name: sort
+          in: query
+          description: Sort order by timestamp
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, completed, failed]
+      responses:
+        '200':
+          description: List of RCA reports
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RCAReportsResponse'
+        '400':
+          description: Bad request - invalid parameters (e.g., startTime after endTime)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized - invalid or missing authentication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error - missing or invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/rca-agent/reports/{report_id}:
+    get:
+      tags:
+        - RCA Reports
+      summary: Get RCA report by report ID
+      operationId: getRCAReport
+      parameters:
+        - name: report_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: RCA report details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RCAReportDetailed'
+        '401':
+          description: Unauthorized - invalid or missing authentication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden - insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Report not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags:
+        - RCA Reports
+      summary: Update action statuses
+      description: |
+        Updates the status of specific remediation actions in the stored report.
+        Accepts indices to mark as `applied` or `dismissed`.
+      operationId: updateReport
+      parameters:
+        - name: report_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReportUpdateRequest'
+      responses:
+        '200':
+          description: Actions updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden - insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Report not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    # --- Request / Response schemas ---
+
+    AnalyzeRequest:
+      type: object
+      required: [namespace, project, component, environment, alert]
+      properties:
+        namespace:
+          type: string
+        project:
+          type: string
+        component:
+          type: string
+        environment:
+          type: string
+        alert:
+          $ref: '#/components/schemas/AlertContext'
+        meta:
+          type: object
+          nullable: true
+          additionalProperties: true
+
+    AlertContext:
+      type: object
+      required: [id, value, timestamp, rule]
+      properties:
+        id:
+          type: string
+        value:
+          oneOf:
+            - type: integer
+            - type: string
+        timestamp:
+          type: string
+        rule:
+          $ref: '#/components/schemas/AlertRuleInfo'
+
+    AlertRuleInfo:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        severity:
+          type: string
+          nullable: true
+        source:
+          $ref: '#/components/schemas/AlertRuleSource'
+        condition:
+          $ref: '#/components/schemas/AlertRuleCondition'
+
+    AlertRuleSource:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: Source type (e.g., logs, metrics)
+        query:
+          type: string
+          nullable: true
+        metric:
+          type: string
+          nullable: true
+
+    AlertRuleCondition:
+      type: object
+      required: [window, interval, operator, threshold]
+      properties:
+        window:
+          type: string
+        interval:
+          type: string
+        operator:
+          type: string
+        threshold:
+          type: integer
+
+    RCAResponse:
+      type: object
+      required: [report_id, status]
+      properties:
+        report_id:
+          type: string
+        status:
+          type: string
+          enum: [pending]
+
+    ChatRequest:
+      type: object
+      required: [reportId, namespace, project, environment, messages]
+      properties:
+        reportId:
+          type: string
+        namespace:
+          type: string
+        project:
+          type: string
+        environment:
+          type: string
+        messages:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role:
+                type: string
+              content:
+                type: string
+                maxLength: 10000
+            additionalProperties: false
+
+    ErrorResponse:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+
+    # --- Streaming event schemas ---
+
+    StreamEvent:
+      description: |
+        A streaming event. Events are sent as newline-delimited JSON (NDJSON).
+        Use the `type` field to determine the event type.
+      oneOf:
+        - $ref: '#/components/schemas/MessageChunkEvent'
+        - $ref: '#/components/schemas/ToolCallEvent'
+        - $ref: '#/components/schemas/ActionsEvent'
+        - $ref: '#/components/schemas/DoneEvent'
+        - $ref: '#/components/schemas/ErrorEvent'
+      discriminator:
+        propertyName: type
+        mapping:
+          message_chunk: '#/components/schemas/MessageChunkEvent'
+          tool_call: '#/components/schemas/ToolCallEvent'
+          actions: '#/components/schemas/ActionsEvent'
+          done: '#/components/schemas/DoneEvent'
+          error: '#/components/schemas/ErrorEvent'
+
+    MessageChunkEvent:
+      type: object
+      required: [type, content]
+      properties:
+        type:
+          type: string
+          enum: [message_chunk]
+        content:
+          type: string
+
+    ToolCallEvent:
+      type: object
+      required: [type, tool]
+      properties:
+        type:
+          type: string
+          enum: [tool_call]
+        tool:
+          type: string
+          description: Name of the tool being called
+        activeForm:
+          type: string
+          description: Human-readable description of the tool action for UI display
+        args:
+          type: string
+          description: JSON-encoded arguments
+
+    ActionsEvent:
+      type: object
+      required: [type, actions]
+      properties:
+        type:
+          type: string
+          enum: [actions]
+        actions:
+          type: array
+          description: Structured actions for the UI to render
+          items:
+            type: object
+            additionalProperties: true
+
+    DoneEvent:
+      type: object
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [done]
+        message:
+          type: string
+          description: The complete response message
+
+    ErrorEvent:
+      type: object
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [error]
+        message:
+          type: string
+
+    # --- Report list/detail schemas ---
+
+    RCAReportsResponse:
+      type: object
+      required: [reports, totalCount]
+      properties:
+        reports:
+          type: array
+          items:
+            $ref: '#/components/schemas/RCAReportSummary'
+        totalCount:
+          type: integer
+
+    RCAReportSummary:
+      type: object
+      required: [alertId, reportId, timestamp, status]
+      properties:
+        alertId:
+          type: string
+        reportId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        summary:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [pending, completed, failed]
+
+    RCAReportDetailed:
+      type: object
+      required: [alertId, reportId, timestamp, status]
+      properties:
+        alertId:
+          type: string
+        reportId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        report:
+          nullable: true
+          description: The full RCA report content (null if status is pending or failed)
+          $ref: '#/components/schemas/RCAReport'
+
+    # --- RCA Report schemas ---
+
+    RCAReport:
+      type: object
+      required: [alert_context, summary, result, investigation_path]
+      properties:
+        alert_context:
+          $ref: '#/components/schemas/ReportAlertContext'
+        summary:
+          type: string
+        result:
+          oneOf:
+            - $ref: '#/components/schemas/RootCauseIdentified'
+            - $ref: '#/components/schemas/NoRootCauseIdentified'
+          discriminator:
+            propertyName: type
+            mapping:
+              root_cause_identified: '#/components/schemas/RootCauseIdentified'
+              no_root_cause_identified: '#/components/schemas/NoRootCauseIdentified'
+        investigation_path:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/InvestigationStep'
+
+    ReportAlertContext:
+      type: object
+      required: [alert_id, alert_name, triggered_at, trigger_value, condition, component, project, environment]
+      properties:
+        alert_id:
+          type: string
+        alert_name:
+          type: string
+        alert_description:
+          type: string
+          nullable: true
+        severity:
+          type: string
+          nullable: true
+        triggered_at:
+          type: string
+        trigger_value:
+          type: number
+        source_type:
+          type: string
+          nullable: true
+        source_query:
+          type: string
+          nullable: true
+        source_metric:
+          type: string
+          nullable: true
+        condition:
+          $ref: '#/components/schemas/ReportAlertCondition'
+        component:
+          type: string
+        project:
+          type: string
+        environment:
+          type: string
+
+    ReportAlertCondition:
+      type: object
+      required: [window, interval, operator, threshold]
+      properties:
+        window:
+          type: string
+        interval:
+          type: string
+        operator:
+          type: string
+        threshold:
+          type: integer
+
+    RootCauseIdentified:
+      type: object
+      required: [type, root_causes, timeline, recommendations]
+      properties:
+        type:
+          type: string
+          enum: [root_cause_identified]
+        root_causes:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RootCause'
+        timeline:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/TimelineEvent'
+        excluded_causes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExcludedCause'
+        recommendations:
+          $ref: '#/components/schemas/Recommendations'
+
+    NoRootCauseIdentified:
+      type: object
+      required: [type, outcome, explanation]
+      properties:
+        type:
+          type: string
+          enum: [no_root_cause_identified]
+        outcome:
+          type: string
+          enum: [no_anomaly_detected, insufficient_data, transient, external_dependency]
+        explanation:
+          type: string
+        recommendations:
+          nullable: true
+          $ref: '#/components/schemas/Recommendations'
+
+    RootCause:
+      type: object
+      required: [summary, confidence, analysis, supporting_findings]
+      properties:
+        summary:
+          type: string
+        confidence:
+          type: string
+          enum: [high, medium, low]
+        analysis:
+          type: string
+        supporting_findings:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Finding'
+
+    Finding:
+      type: object
+      required: [observation, component, time_range, evidence]
+      properties:
+        observation:
+          type: string
+        component:
+          type: string
+        time_range:
+          $ref: '#/components/schemas/TimeRange'
+        evidence:
+          oneOf:
+            - $ref: '#/components/schemas/LogEvidence'
+            - $ref: '#/components/schemas/MetricEvidence'
+            - $ref: '#/components/schemas/TraceEvidence'
+          discriminator:
+            propertyName: type
+            mapping:
+              log: '#/components/schemas/LogEvidence'
+              metric: '#/components/schemas/MetricEvidence'
+              trace: '#/components/schemas/TraceEvidence'
+
+    TimeRange:
+      type: object
+      required: [start, end]
+      properties:
+        start:
+          type: string
+        end:
+          type: string
+
+    LogEvidence:
+      type: object
+      required: [type, log_lines]
+      properties:
+        type:
+          type: string
+          enum: [log]
+        log_lines:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/LogLine'
+        repetition:
+          type: string
+          nullable: true
+
+    LogLine:
+      type: object
+      required: [timestamp, level, log]
+      properties:
+        timestamp:
+          type: string
+        level:
+          type: string
+          enum: [ERROR, WARN, INFO, DEBUG, UNDEFINED]
+        log:
+          type: string
+
+    MetricEvidence:
+      type: object
+      required: [type, summary]
+      properties:
+        type:
+          type: string
+          enum: [metric]
+        summary:
+          type: string
+
+    TraceEvidence:
+      type: object
+      required: [type, trace_id, summary]
+      properties:
+        type:
+          type: string
+          enum: [trace]
+        trace_id:
+          type: string
+        span_id:
+          type: string
+          nullable: true
+        summary:
+          type: string
+        is_error:
+          type: boolean
+          default: false
+        error_message:
+          type: string
+          nullable: true
+        repetition:
+          type: string
+          nullable: true
+
+    TimelineEvent:
+      type: object
+      required: [timestamp, event]
+      properties:
+        timestamp:
+          type: string
+        component:
+          type: string
+          nullable: true
+        event:
+          type: string
+
+    InvestigationStep:
+      type: object
+      required: [action, outcome]
+      properties:
+        action:
+          type: string
+        outcome:
+          type: string
+        rationale:
+          type: string
+          nullable: true
+
+    ExcludedCause:
+      type: object
+      required: [description, rationale]
+      properties:
+        description:
+          type: string
+        rationale:
+          type: string
+
+    Recommendations:
+      type: object
+      properties:
+        recommended_actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecommendedAction'
+        observability_recommendations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Action'
+
+    Action:
+      type: object
+      required: [description]
+      properties:
+        description:
+          type: string
+        rationale:
+          type: string
+          nullable: true
+
+    RecommendedAction:
+      type: object
+      required: [description, status]
+      allOf:
+        - $ref: '#/components/schemas/Action'
+        - type: object
+          properties:
+            status:
+              type: string
+              enum: [suggested, revised, applied, dismissed]
+              default: suggested
+            change:
+              nullable: true
+              $ref: '#/components/schemas/ResourceChange'
+
+    ResourceChange:
+      type: object
+      required: [release_binding]
+      properties:
+        target_kind:
+          type: string
+          enum: [ReleaseBinding, ResourceReleaseBinding]
+          default: ReleaseBinding
+          description: >-
+            Which binding kind to modify. 'ReleaseBinding' for a Component,
+            'ResourceReleaseBinding' for a Resource (e.g. a managed Postgres).
+            ResourceReleaseBinding targets support only `fields`
+            (paths under /spec/resourceTypeEnvironmentConfigs) — not `env` or `files`.
+            Defaults to 'ReleaseBinding' for older reports that predate this field.
+        release_binding:
+          type: string
+        env:
+          type: array
+          default: []
+          items:
+            $ref: '#/components/schemas/EnvVarChange'
+        files:
+          type: array
+          default: []
+          items:
+            $ref: '#/components/schemas/FileChange'
+        fields:
+          type: array
+          default: []
+          items:
+            $ref: '#/components/schemas/FieldChange'
+
+    EnvVarChange:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+
+    FileChange:
+      type: object
+      required: [key, mount_path, value]
+      properties:
+        key:
+          type: string
+        mount_path:
+          type: string
+        value:
+          type: string
+
+    FieldChange:
+      type: object
+      required: [json_pointer, value]
+      properties:
+        json_pointer:
+          type: string
+        value:
+          oneOf:
+            - type: string
+            - type: number
+            - type: boolean
+
+    ReportUpdateRequest:
+      type: object
+      properties:
+        appliedIndices:
+          type: array
+          default: []
+          items:
+            type: integer
+        dismissedIndices:
+          type: array
+          default: []
+          items:
+            type: integer
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+security:
+  - bearerAuth: []

@@ -1,0 +1,131 @@
+{{- if not .Values.observer.secretName }}
+{{- fail "observer.secretName is required. Create a Secret with keys matching the Observer's expected env vars (UID_RESOLVER_OAUTH_CLIENT_SECRET; ALERT_STORE_DSN is also required when alertStoreBackend=postgresql), then set observer.secretName." }}
+{{- end }}
+{{- if and (eq (.Values.observer.alertStoreBackend | default "sqlite") "sqlite") (gt (.Values.observer.replicas | int) 1) }}
+{{- fail "observer.replicas must be 1 when observer.alertStoreBackend=sqlite (ReadWriteOnce PVC). Set observer.replicas=1 or use observer.alertStoreBackend=postgresql." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: observer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openchoreo-observability-plane.componentLabels" (dict "context" . "component" "observer") | nindent 4 }}
+spec:
+  replicas: {{ .Values.observer.replicas | default 1 }}
+  strategy:
+    type: {{ ternary "Recreate" "RollingUpdate" (eq (.Values.observer.alertStoreBackend | default "sqlite") "sqlite") }}
+  selector:
+    matchLabels:
+      {{- include "openchoreo-observability-plane.componentSelectorLabels" (dict "context" . "component" "observer") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/observer/observer-config.yaml") . | sha256sum }}
+        checksum/observer-auth-config: {{ include (print $.Template.BasePath "/observer/observer-auth-configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "openchoreo-observability-plane.componentSelectorLabels" (dict "context" . "component" "observer") | nindent 8 }}
+        {{- include "openchoreo-observability-plane.platformIdentityLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: observer
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.observer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.observer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.observer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.observer.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      {{- $observerImage := dict "repository" "cr.openchoreo.dev/openchoreo/observer" }}
+      {{- if .Values.observer.image }}
+      {{- $observerImage = dict "repository" (.Values.observer.image.repository | default "cr.openchoreo.dev/openchoreo/observer") "tag" (.Values.observer.image.tag | default "") }}
+      {{- end }}
+      - name: observer
+        image: "{{ include "openchoreo-observability-plane.image" (dict "context" . "image" $observerImage) }}"
+        imagePullPolicy: {{ if .Values.observer.image }}{{ .Values.observer.image.pullPolicy | default "IfNotPresent" }}{{ else }}IfNotPresent{{ end }}
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: http-internal
+          containerPort: {{ if .Values.observer.internalService }}{{ .Values.observer.internalService.port | default 8081 }}{{ else }}8081{{ end }}
+          protocol: TCP
+        envFrom:
+        - secretRef:
+            name: {{ .Values.observer.secretName }}
+        - configMapRef:
+            name: observer-config
+        {{- if .Values.observer.extraEnvs }}
+        env:
+        {{- toYaml .Values.observer.extraEnvs | nindent 8 }}
+        {{- end }}
+        volumeMounts:
+        - name: auth-config
+          mountPath: /etc/openchoreo
+          readOnly: true
+        {{- if eq (.Values.observer.alertStoreBackend | default "sqlite") "sqlite" }}
+        - name: alert-store-data
+          mountPath: /data
+        {{- end }}
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          {{- if .Values.observer.resources }}
+          {{- toYaml .Values.observer.resources | nindent 10 }}
+          {{- else }}
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          {{- end }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65532
+      volumes:
+      - name: auth-config
+        configMap:
+          name: observer-auth-config
+      {{- if eq (.Values.observer.alertStoreBackend | default "sqlite") "sqlite" }}
+      - name: alert-store-data
+        persistentVolumeClaim:
+          claimName: observer-alerts-data
+      {{- end }}

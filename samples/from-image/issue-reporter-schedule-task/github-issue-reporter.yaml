@@ -1,0 +1,95 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: github-issue-reporter
+  namespace: default
+spec:
+  owner:
+    projectName: default
+
+  autoDeploy: true
+  componentType:
+    kind: ClusterComponentType
+    name: cronjob/scheduled-task
+
+  parameters:
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 1
+    concurrencyPolicy: "Forbid"
+    backoffLimit: 3
+    activeDeadlineSeconds: 300
+    restartPolicy: "OnFailure"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+---
+
+# Defines a workload that specifies the developer contract which describes the source code including
+# what configuration is needed to run, what endpoints are exposed, and how it connects to other components or platform resources.
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: github-issue-reporter-workload
+  namespace: default
+spec:
+  owner:
+    componentName: github-issue-reporter
+    projectName: default
+  container:
+    image: "cr.openchoreo.dev/openchoreo/samples/github-issue-reporter:latest"
+    env:
+      # GitHub Configuration (hardcoded values)
+      - key: GITHUB_REPOSITORY
+        value: "https://github.com/openchoreo/openchoreo"
+      - key: GITHUB_TOKEN
+        value: "your-github-token-here"
+      # MySQL Configuration (hardcoded values)
+      - key: MYSQL_HOST
+        value: "mysql.internal"
+      - key: MYSQL_PORT
+        value: "3306"
+      - key: MYSQL_USER
+        value: "github-reporter-user"
+      - key: MYSQL_PASSWORD
+        value: "secure-password-here"
+      - key: MYSQL_DATABASE
+        value: "github-issue-reporter"
+      # Email Configuration (hardcoded values)
+      - key: EMAIL_HOST
+        value: "smtp.internal"
+      - key: EMAIL_PORT
+        value: "587"
+      - key: EMAIL_SENDER
+        value: "no-reply@example.com"
+      - key: EMAIL_PASSWORD
+        value: "email-password-here"
+      - key: EMAIL_TO
+        value: "admin@example.com"
+
+---
+
+apiVersion: openchoreo.dev/v1alpha1
+kind: ReleaseBinding
+metadata:
+  name: github-issue-reporter-development
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: github-issue-reporter
+
+  environment: development
+
+  componentTypeEnvironmentConfigs:
+    schedule: "*/5 * * * *"  # Run every 5 minutes in development
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "100m"
+        memory: "128Mi"

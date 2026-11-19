@@ -1,0 +1,491 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package clustertrait
+
+import (
+	"context"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	openchoreodevv1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+)
+
+var _ = Describe("ClusterTrait Webhook", func() {
+	var (
+		ctx       context.Context
+		obj       *openchoreodevv1alpha1.ClusterTrait
+		oldObj    *openchoreodevv1alpha1.ClusterTrait
+		validator Validator
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		obj = &openchoreodevv1alpha1.ClusterTrait{}
+		oldObj = &openchoreodevv1alpha1.ClusterTrait{}
+		validator = Validator{}
+		Expect(validator).NotTo(BeNil(), "Expected validator to be initialized")
+		Expect(oldObj).NotTo(BeNil(), "Expected oldObj to be initialized")
+		Expect(obj).NotTo(BeNil(), "Expected obj to be initialized")
+	})
+
+	AfterEach(func() {
+		// TODO (user): Add any teardown logic common to all tests
+	})
+
+	Context("When validating with wrong object type", func() {
+		It("should reject non-ClusterTrait object on create", func() {
+			wrongObj := &openchoreodevv1alpha1.Trait{}
+			_, err := validator.ValidateCreate(ctx, wrongObj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("expected a ClusterTrait object"))
+		})
+
+		It("should reject non-ClusterTrait object on update", func() {
+			wrongObj := &openchoreodevv1alpha1.Trait{}
+			_, err := validator.ValidateUpdate(ctx, oldObj, wrongObj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("expected a ClusterTrait object"))
+		})
+
+		It("should reject non-ClusterTrait object on delete", func() {
+			wrongObj := &openchoreodevv1alpha1.Trait{}
+			_, err := validator.ValidateDelete(ctx, wrongObj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("expected a ClusterTrait object"))
+		})
+	})
+
+	Context("When deleting ClusterTrait", func() {
+		It("should admit deletion without error", func() {
+			_, err := validator.ValidateDelete(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
+	Context("When creating ClusterTrait with nil template in creates", func() {
+		It("should reject nil template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: nil,
+				},
+			}
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("template is required"))
+		})
+	})
+
+	Context("When creating or updating ClusterTrait under Validating Webhook", func() {
+		It("Should admit cluster trait with valid parameters and environmentConfigs", func() {
+			obj.Spec.Parameters = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":{"mountPath":{"type":"string"}},"required":["mountPath"]}`),
+				},
+			}
+
+			obj.Spec.EnvironmentConfigs = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":{"size":{"type":"string","default":"10Gi"},"storageClass":{"type":"string"}},"required":["storageClass"]}`),
+				},
+			}
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("Should reject cluster trait with invalid environmentConfigs schema", func() {
+			obj.Spec.Parameters = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":{"mountPath":{"type":"string"}}}`),
+				},
+			}
+			obj.Spec.EnvironmentConfigs = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":"not-an-object"}`), // invalid: properties must be an object
+				},
+			}
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to parse environmentConfigs schema"))
+		})
+
+		It("Should admit cluster trait with only environmentConfigs (no parameters)", func() {
+			obj.Spec.EnvironmentConfigs = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":{"size":{"type":"string","default":"10Gi"},"storageClass":{"type":"string","default":"local-path"}}}`),
+				},
+			}
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("Should reject cluster trait with malformed environmentConfigs YAML", func() {
+			obj.Spec.EnvironmentConfigs = &openchoreodevv1alpha1.SchemaSection{
+
+				OpenAPIV3Schema: &runtime.RawExtension{
+
+					Raw: []byte(`{malformed yaml`),
+				},
+			}
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to parse environmentConfigs schema"))
+		})
+	})
+
+	Context("Creates Template Structure Validation", func() {
+		It("should admit valid creates with proper template structure", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "${metadata.name}-pvc"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should reject missing apiVersion in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"kind": "PersistentVolumeClaim", "metadata": {"name": "test-pvc"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("apiVersion is required"))
+		})
+
+		It("should reject missing kind in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "v1", "metadata": {"name": "test-pvc"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("kind is required"))
+		})
+
+		It("should reject missing metadata.name in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("metadata.name is required"))
+		})
+
+		It("should reject empty template in creates", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(``),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("template is required"))
+		})
+
+		It("should allow CEL expression in creates metadata.name", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "${metadata.name}-sidecar-config"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should validate creates templates on update", func() {
+			// Valid old object
+			oldObj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "test"}}`),
+					},
+				},
+			}
+
+			// New object with missing apiVersion
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"kind": "ConfigMap", "metadata": {"name": "test"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateUpdate(ctx, oldObj, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("apiVersion is required"))
+		})
+
+		It("should reject Deployment kind in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "extra-deploy"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("traits must not create workload resources"))
+			Expect(err.Error()).To(ContainSubstring("Deployment"))
+		})
+
+		It("should reject StatefulSet kind in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "apps/v1", "kind": "StatefulSet", "metadata": {"name": "extra-sts"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("traits must not create workload resources"))
+			Expect(err.Error()).To(ContainSubstring("StatefulSet"))
+		})
+
+		It("should reject CronJob kind in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "batch/v1", "kind": "CronJob", "metadata": {"name": "extra-cron"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("traits must not create workload resources"))
+			Expect(err.Error()).To(ContainSubstring("CronJob"))
+		})
+
+		It("should reject Job kind in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "extra-job"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("traits must not create workload resources"))
+			Expect(err.Error()).To(ContainSubstring("Job"))
+		})
+
+		It("should reject workload resource kind case-insensitively", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "apps/v1", "kind": "deployment", "metadata": {"name": "extra"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("traits must not create workload resources"))
+		})
+
+		It("should reject workload resource in creates on update", func() {
+			oldObj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "test"}}`),
+					},
+				},
+			}
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "extra"}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateUpdate(ctx, oldObj, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("traits must not create workload resources"))
+		})
+	})
+
+	Context("Validation Rules CEL Validation", func() {
+		It("should reject malformed CEL expression in validation rule", func() {
+			obj.Spec.Validations = []openchoreodevv1alpha1.ValidationRule{
+				{Rule: "${parameters.x +}", Message: "bad rule"},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("rule must return boolean"))
+		})
+
+		It("should reject non-boolean CEL expression in validation rule", func() {
+			obj.Spec.Parameters = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":{"name":{"type":"string","default":"app"}}}`),
+				},
+			}
+			obj.Spec.Validations = []openchoreodevv1alpha1.ValidationRule{
+				{Rule: "${parameters.name}", Message: "returns string not bool"},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("rule must return boolean"))
+		})
+
+		It("should admit valid boolean validation rules", func() {
+			obj.Spec.Parameters = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":{"mountPath":{"type":"string"}},"required":["mountPath"]}`),
+				},
+			}
+
+			obj.Spec.EnvironmentConfigs = &openchoreodevv1alpha1.SchemaSection{
+				OpenAPIV3Schema: &runtime.RawExtension{
+					Raw: []byte(`{"type":"object","properties":{"size":{"type":"string","default":"10Gi"}}}`),
+				},
+			}
+			obj.Spec.Validations = []openchoreodevv1alpha1.ValidationRule{
+				{Rule: "${parameters.mountPath != ''}", Message: "mountPath must not be empty"},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
+	Context("Creates CEL Validation", func() {
+		It("should reject malformed CEL expression in creates template", func() {
+			obj.Spec.Creates = []openchoreodevv1alpha1.TraitCreate{
+				{
+					Template: &runtime.RawExtension{
+						Raw: []byte(`{"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "test"}, "spec": {"resources": {"requests": {"storage": "${parameters.size +}"}}}}`),
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid CEL expression"))
+		})
+	})
+
+	Context("Patches Validation", func() {
+		It("should admit valid patches with proper structure", func() {
+			obj.Spec.Patches = []openchoreodevv1alpha1.TraitPatch{
+				{
+					Target: openchoreodevv1alpha1.PatchTarget{
+						Group:   "apps",
+						Version: "v1",
+						Kind:    "Deployment",
+					},
+					Operations: []openchoreodevv1alpha1.JSONPatchOperation{
+						{
+							Op:    "add",
+							Path:  "/spec/template/spec/volumes/-",
+							Value: &runtime.RawExtension{Raw: []byte(`{"name": "data", "persistentVolumeClaim": {"claimName": "${metadata.name}-pvc"}}`)},
+						},
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should reject malformed CEL expression in patches", func() {
+			obj.Spec.Patches = []openchoreodevv1alpha1.TraitPatch{
+				{
+					Target: openchoreodevv1alpha1.PatchTarget{
+						Group:   "apps",
+						Version: "v1",
+						Kind:    "Deployment",
+					},
+					Operations: []openchoreodevv1alpha1.JSONPatchOperation{
+						{
+							Op:    "add",
+							Path:  "/spec/template/spec/volumes/-",
+							Value: &runtime.RawExtension{Raw: []byte(`{"name": "${parameters.name +}"}`)},
+						},
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid CEL expression"))
+		})
+
+		It("should admit patches with CEL expression as entire value", func() {
+			obj.Spec.Patches = []openchoreodevv1alpha1.TraitPatch{
+				{
+					Target: openchoreodevv1alpha1.PatchTarget{
+						Group:   "apps",
+						Version: "v1",
+						Kind:    "Deployment",
+					},
+					Operations: []openchoreodevv1alpha1.JSONPatchOperation{
+						{
+							Op:    "add",
+							Path:  "/metadata/labels",
+							Value: &runtime.RawExtension{Raw: []byte(`"${metadata.labels}"`)},
+						},
+					},
+				},
+			}
+
+			_, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
+	Context("CRD-level validation via apiserver (XOR guard)", func() {
+		It("rejects a ClusterTrait that sets both validations and preRenderValidations", func() {
+			if k8sClient == nil {
+				Skip("envtest apiserver not available")
+			}
+			ct := &openchoreodevv1alpha1.ClusterTrait{
+				ObjectMeta: metav1.ObjectMeta{GenerateName: "xor-"},
+				Spec: openchoreodevv1alpha1.ClusterTraitSpec{
+					Validations:          []openchoreodevv1alpha1.ValidationRule{{Rule: "${1 == 1}", Message: "legacy"}},
+					PreRenderValidations: []openchoreodevv1alpha1.ValidationRule{{Rule: "${2 == 2}", Message: "fresh"}},
+				},
+			}
+			err := k8sClient.Create(ctx, ct)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("only one of"))
+		})
+	})
+})

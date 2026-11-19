@@ -1,0 +1,63 @@
+# Helm values for OpenChoreo Control Plane in k3d multi-cluster setup
+
+openchoreoApi:
+  http:
+    hostnames:
+    - api.openchoreo.localhost
+  config:
+    server:
+      publicUrl: "http://api.openchoreo.localhost:8080"
+    remoteConnect:
+      # `occ remote` tunnels. Router NodePort 30443 is mapped to the host in config-dp.yaml.
+      enabled: true
+      entrypointAddress: "127.0.0.1:30443"
+      agentImage:
+        tag: latest-dev
+      # The remote-agent calls this from the data-plane cluster, where the chart default
+      # (in-cluster CP service DNS) does not resolve. coredns-custom rewrites
+      # *.openchoreo.localhost to host.k3d.internal.
+      authorizeUrl: "http://api.openchoreo.localhost:8080/api/v1/remote-connect:authorize"
+
+backstage:
+  features:
+    costInsights:
+      enabled: true
+  secretName: backstage-secrets
+  baseUrl: "http://openchoreo.localhost:8080"
+  http:
+    hostnames:
+    - openchoreo.localhost
+
+portalAssistant:
+  config:
+    observerApiUrl: "http://observer.openchoreo.localhost:11080"
+
+security:
+  oidc:
+    issuer: "http://thunder.openchoreo.localhost:8080"
+    jwksUrl: "http://thunder.openchoreo.localhost:8080/oauth2/jwks"
+    authorizationUrl: "http://thunder.openchoreo.localhost:8080/oauth2/authorize"
+    tokenUrl: "http://thunder.openchoreo.localhost:8080/oauth2/token"
+
+# Cluster Gateway TLS route for agent connections from remote planes
+clusterGateway:
+  tlsRoute:
+    enabled: true
+    hosts:
+      - host: cluster-gateway.openchoreo.localhost
+        paths:
+          - path: /
+            pathType: Prefix
+  tls:
+    issuerRef:
+      name: cluster-gateway-server-issuer
+    dnsNames:
+      - cluster-gateway.openchoreo-control-plane.svc
+      - cluster-gateway.openchoreo-control-plane.svc.cluster.local
+      - cluster-gateway.openchoreo.localhost
+
+gateway:
+  httpPort: 8080
+  httpsPort: 8443
+  tls:
+    enabled: false

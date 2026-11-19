@@ -1,0 +1,414 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+
+	"github.com/openchoreo/openchoreo/internal/config"
+)
+
+// TestSecurityConfig_KnownActorTypes_Deterministic guards against Subjects'
+// map iteration order leaking into the returned slice — the "must be one
+// of: ..." validation message audit.go builds from it (and any test
+// asserting that message) must not flake between runs.
+func TestSecurityConfig_KnownActorTypes_Deterministic(t *testing.T) {
+	cfg := &SecurityConfig{
+		Subjects: map[string]SubjectConfig{
+			"service_account": {},
+			"agent":           {},
+			"machine":         {},
+		},
+	}
+
+	want := []string{"anonymous", "user", "agent", "machine", "service_account"}
+	for i := range 20 {
+		got := cfg.KnownActorTypes()
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("KnownActorTypes() mismatch on iteration %d (-want +got):\n%s", i, diff)
+		}
+	}
+}
+
+// TestSecurityConfig_DecodesReadableIDClaim pins the koanf tag against the
+// shape cmd/openchoreo-api/config.yaml actually ships. The loader runs with
+// ErrorUnused: true, so a wrong or missing tag makes readable_id_claim an
+// unknown key and the shipped config refuses to start — a failure no
+// struct-literal test would surface.
+func TestSecurityConfig_DecodesReadableIDClaim(t *testing.T) {
+	cfg := loadAuditTestConfig(t, `
+security:
+  subjects:
+    user:
+      display_name: "User"
+      priority: 1
+      mechanisms:
+        jwt:
+          readable_id_claim: "username"
+          entitlement:
+            claim: "groups"
+            display_name: "User Group"
+    service_account:
+      display_name: "Service Account"
+      priority: 2
+      mechanisms:
+        jwt:
+          entitlement:
+            claim: "client_id"
+            display_name: "Client ID"
+`)
+
+	if got := cfg.Security.Subjects["user"].Mechanisms["jwt"].ReadableIDClaim; got != "username" {
+		t.Errorf("user ReadableIDClaim = %q, want %q", got, "username")
+	}
+	// A mechanism naming no claim stays empty rather than inheriting one; the
+	// audit fallback is what fills the gap.
+	if got := cfg.Security.Subjects["service_account"].Mechanisms["jwt"].ReadableIDClaim; got != "" {
+		t.Errorf("service_account ReadableIDClaim = %q, want empty", got)
+	}
+}
+
+// TestSecurityConfig_ToSubjectUserTypeConfigs_CarriesReadableIDClaim guards
+// the map-to-slice conversion, which is the only path from the subjects
+// config into the resolver. A field added to MechanismConfig but not copied
+// here is silently dropped: config validates, startup succeeds, and the claim
+// is simply never resolved.
+func TestSecurityConfig_ToSubjectUserTypeConfigs_CarriesReadableIDClaim(t *testing.T) {
+	cfg := &SecurityConfig{
+		Subjects: map[string]SubjectConfig{
+			"user": {
+				DisplayName: "User",
+				Priority:    1,
+				Mechanisms: map[string]MechanismConfig{
+					"jwt": {
+						ReadableIDClaim: "username",
+						Entitlement:     EntitlementConfig{Claim: "groups", DisplayName: "User Group"},
+					},
+				},
+			},
+			"service_account": {
+				DisplayName: "Service Account",
+				Priority:    2,
+				Mechanisms: map[string]MechanismConfig{
+					"jwt": {
+						ReadableIDClaim: "client_id",
+						Entitlement:     EntitlementConfig{Claim: "client_id", DisplayName: "Client ID"},
+					},
+				},
+			},
+		},
+	}
+
+	got := cfg.ToSubjectUserTypeConfigs()
+
+	want := map[string]string{"user": "username", "service_account": "client_id"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d user types, want %d", len(got), len(want))
+	}
+	for _, ut := range got {
+		if len(ut.AuthMechanisms) != 1 {
+			t.Fatalf("%s: got %d mechanisms, want 1", ut.Type, len(ut.AuthMechanisms))
+		}
+		if gotClaim := ut.AuthMechanisms[0].ReadableIDClaim; gotClaim != want[ut.Type] {
+			t.Errorf("%s: ReadableIDClaim = %q, want %q", ut.Type, gotClaim, want[ut.Type])
+		}
+	}
+}
+
+// TestSecurityConfig_ToSubjectUserTypeConfigs_OmittedReadableIDClaim covers a
+// mechanism naming no claim: it must stay empty rather than inherit one, so
+// the audit fallback is what fills the gap.
+func TestSecurityConfig_ToSubjectUserTypeConfigs_OmittedReadableIDClaim(t *testing.T) {
+	cfg := &SecurityConfig{
+		Subjects: map[string]SubjectConfig{
+			"user": {
+				DisplayName: "User",
+				Priority:    1,
+				Mechanisms: map[string]MechanismConfig{
+					"jwt": {Entitlement: EntitlementConfig{Claim: "groups", DisplayName: "User Group"}},
+				},
+			},
+		},
+	}
+
+	got := cfg.ToSubjectUserTypeConfigs()
+	if len(got) != 1 || len(got[0].AuthMechanisms) != 1 {
+		t.Fatalf("unexpected conversion result: %+v", got)
+	}
+	if claim := got[0].AuthMechanisms[0].ReadableIDClaim; claim != "" {
+		t.Errorf("ReadableIDClaim = %q, want empty", claim)
+	}
+}
+
+func TestSecurityConfig_ValidateSubjects_DuplicatePriorities(t *testing.T) {
+	tests := []struct {
+		name           string
+		subjects       map[string]SubjectConfig
+		expectedErrors config.ValidationErrors
+	}{
+		{
+			name:           "nil subjects is valid",
+			subjects:       nil,
+			expectedErrors: nil,
+		},
+		{
+			name:           "empty subjects is valid",
+			subjects:       map[string]SubjectConfig{},
+			expectedErrors: nil,
+		},
+		{
+			name: "unique priorities is valid",
+			subjects: map[string]SubjectConfig{
+				"user": {
+					DisplayName: "User",
+					Priority:    1,
+					Mechanisms: map[string]MechanismConfig{
+						"jwt": {Entitlement: EntitlementConfig{Claim: "groups", DisplayName: "Groups"}},
+					},
+				},
+				"service_account": {
+					DisplayName: "Service Account",
+					Priority:    2,
+					Mechanisms: map[string]MechanismConfig{
+						"jwt": {Entitlement: EntitlementConfig{Claim: "sub", DisplayName: "Client ID"}},
+					},
+				},
+			},
+			expectedErrors: nil,
+		},
+		{
+			name: "duplicate priorities returns error",
+			subjects: map[string]SubjectConfig{
+				"user": {
+					DisplayName: "User",
+					Priority:    1,
+					Mechanisms: map[string]MechanismConfig{
+						"jwt": {Entitlement: EntitlementConfig{Claim: "groups", DisplayName: "Groups"}},
+					},
+				},
+				"service_account": {
+					DisplayName: "Service Account",
+					Priority:    1, // duplicate priority
+					Mechanisms: map[string]MechanismConfig{
+						"jwt": {Entitlement: EntitlementConfig{Claim: "sub", DisplayName: "Client ID"}},
+					},
+				},
+			},
+			expectedErrors: nil, // We'll check for non-nil and message content instead
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := SecurityConfig{
+				Enabled:        true,
+				Authentication: AuthenticationDefaults(),
+				Subjects:       tt.subjects,
+				Authorization:  AuthorizationDefaults(),
+			}
+
+			errs := cfg.Validate(config.NewPath("security"))
+
+			if tt.name == "duplicate priorities returns error" {
+				// Special handling for duplicate priority test due to map iteration order
+				if len(errs) != 1 {
+					t.Errorf("expected 1 error, got %d: %v", len(errs), errs)
+					return
+				}
+				// Check that the error mentions "duplicate priority"
+				if errs[0].Message == "" {
+					t.Error("expected error message about duplicate priority")
+				}
+				return
+			}
+
+			if diff := cmp.Diff(tt.expectedErrors, errs); diff != "" {
+				t.Errorf("validation errors mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestJWTConfig_Validate(t *testing.T) {
+	tests := []struct {
+		name           string
+		cfg            JWTConfig
+		expectedErrors config.ValidationErrors
+	}{
+		{
+			name:           "defaults are valid",
+			cfg:            JWTConfig{},
+			expectedErrors: nil,
+		},
+		{
+			name: "negative clock_skew is invalid",
+			cfg: JWTConfig{
+				ClockSkew: -1 * time.Second,
+			},
+			expectedErrors: config.ValidationErrors{
+				{Field: "jwt.clock_skew", Message: "must be non-negative"},
+			},
+		},
+		{
+			name: "negative jwks refresh_interval is invalid",
+			cfg: JWTConfig{
+				JWKS: JWKSConfig{
+					RefreshInterval: -1 * time.Hour,
+				},
+			},
+			expectedErrors: config.ValidationErrors{
+				{Field: "jwt.jwks.refresh_interval", Message: "must be non-negative"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := tt.cfg.Validate(config.NewPath("jwt"))
+			if diff := cmp.Diff(tt.expectedErrors, errs); diff != "" {
+				t.Errorf("validation errors mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAuthorizationConfig_Validate(t *testing.T) {
+	tests := []struct {
+		name           string
+		cfg            AuthorizationConfig
+		expectedErrors config.ValidationErrors
+	}{
+		{
+			name: "disabled skips all validation",
+			cfg: AuthorizationConfig{
+				Enabled: false,
+				// Missing required fields but should pass because disabled
+			},
+			expectedErrors: nil,
+		},
+		{
+			name: "enabled is valid",
+			cfg: AuthorizationConfig{
+				Enabled: true,
+			},
+			expectedErrors: nil,
+		},
+		{
+			name: "cache enabled requires positive ttl",
+			cfg: AuthorizationConfig{
+				Enabled: true,
+				Cache: AuthzCacheConfig{
+					Enabled: true,
+					TTL:     0, // zero TTL is invalid when cache enabled
+				},
+			},
+			expectedErrors: config.ValidationErrors{
+				{Field: "authz.cache.ttl", Message: "must be greater than 0s"},
+			},
+		},
+		{
+			name: "cache enabled with valid ttl is valid",
+			cfg: AuthorizationConfig{
+				Enabled: true,
+				Cache: AuthzCacheConfig{
+					Enabled: true,
+					TTL:     5 * time.Minute,
+				},
+			},
+			expectedErrors: nil,
+		},
+		{
+			name: "cache disabled allows zero ttl",
+			cfg: AuthorizationConfig{
+				Enabled: true,
+				Cache: AuthzCacheConfig{
+					Enabled: false,
+					TTL:     0,
+				},
+			},
+			expectedErrors: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := tt.cfg.Validate(config.NewPath("authz"))
+			if diff := cmp.Diff(tt.expectedErrors, errs); diff != "" {
+				t.Errorf("validation errors mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSecurityConfig_Validate_GlobalDisable(t *testing.T) {
+	// SecurityConfig.Validate should short-circuit and return nil when Enabled=false,
+	// even if nested configs would otherwise fail validation.
+	cfg := SecurityConfig{
+		Enabled: false,
+		Authentication: AuthenticationConfig{
+			JWT: JWTConfig{
+				ClockSkew: -1 * time.Second, // would normally fail
+			},
+		},
+		Authorization: AuthorizationConfig{
+			Enabled:        true,
+			ResyncInterval: -1 * time.Second, // would normally fail
+		},
+	}
+
+	errs := cfg.Validate(config.NewPath("security"))
+	if errs != nil {
+		t.Errorf("expected nil errors when security disabled, got: %v", errs)
+	}
+}
+
+func TestJWTConfig_ToJWTMiddlewareConfig_DisabledPropagation(t *testing.T) {
+	oidc := &OIDCConfig{
+		JWKSURL: "https://example.com/.well-known/jwks.json",
+	}
+	cfg := JWTConfig{}
+
+	tests := []struct {
+		securityEnabled bool
+		wantDisabled    bool
+	}{
+		{securityEnabled: true, wantDisabled: false},
+		{securityEnabled: false, wantDisabled: true},
+	}
+
+	for _, tt := range tests {
+		result := cfg.ToJWTMiddlewareConfig(oidc, nil, nil, tt.securityEnabled)
+		if result.Disabled != tt.wantDisabled {
+			t.Errorf("securityEnabled=%v: expected Disabled=%v, got %v",
+				tt.securityEnabled, tt.wantDisabled, result.Disabled)
+		}
+	}
+}
+
+func TestAuthorizationConfig_ToAuthzConfig_EnabledPropagation(t *testing.T) {
+	tests := []struct {
+		name            string
+		securityEnabled bool
+		authzEnabled    bool
+		wantEnabled     bool
+	}{
+		{name: "both enabled", securityEnabled: true, authzEnabled: true, wantEnabled: true},
+		{name: "security disabled", securityEnabled: false, authzEnabled: true, wantEnabled: false},
+		{name: "authz disabled", securityEnabled: true, authzEnabled: false, wantEnabled: false},
+		{name: "both disabled", securityEnabled: false, authzEnabled: false, wantEnabled: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := AuthorizationConfig{Enabled: tt.authzEnabled}
+			result := cfg.ToAuthzConfig(tt.securityEnabled)
+			if result.Enabled != tt.wantEnabled {
+				t.Errorf("expected Enabled=%v, got %v", tt.wantEnabled, result.Enabled)
+			}
+		})
+	}
+}

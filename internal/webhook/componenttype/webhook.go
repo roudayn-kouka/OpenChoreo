@@ -1,0 +1,241 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package componenttype
+
+import (
+	"context"
+	"fmt"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	openchoreodevv1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/validation/component"
+	"github.com/openchoreo/openchoreo/internal/validation/schemautil"
+)
+
+// nolint:unused
+// log is for logging in this package.
+var componenttypelog = logf.Log.WithName("componenttype-resource")
+
+// SetupComponentTypeWebhookWithManager registers the webhook for ComponentType in the manager.
+func SetupComponentTypeWebhookWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewWebhookManagedBy(mgr, &openchoreodevv1alpha1.ComponentType{}).
+		WithCustomValidator(&Validator{}).
+		Complete()
+}
+
+// +kubebuilder:webhook:path=/validate-openchoreo-dev-v1alpha1-componenttype,mutating=false,failurePolicy=fail,sideEffects=None,groups=openchoreo.dev,resources=componenttypes,verbs=create;update,versions=v1alpha1,name=vcomponenttype-v1alpha1.kb.io,admissionReviewVersions=v1
+
+// Validator validates ComponentType resources
+// +kubebuilder:object:generate=false
+type Validator struct{}
+
+var _ webhook.CustomValidator = &Validator{}
+
+// ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type ComponentType.
+func (v *Validator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
+	componenttype, ok := obj.(*openchoreodevv1alpha1.ComponentType)
+	if !ok {
+		return nil, fmt.Errorf("expected a ComponentType object but got %T", obj)
+	}
+	componenttypelog.Info("Validation for ComponentType upon creation", "name", componenttype.GetName())
+
+	allErrs := validateComponentType(componenttype)
+
+	if len(allErrs) > 0 {
+		return nil, apierrors.NewInvalid(componenttype.GroupVersionKind().GroupKind(), componenttype.GetName(), allErrs)
+	}
+
+	return nil, nil
+}
+
+// ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type ComponentType.
+func (v *Validator) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	_, ok := oldObj.(*openchoreodevv1alpha1.ComponentType)
+	if !ok {
+		return nil, fmt.Errorf("expected a ComponentType object for the oldObj but got %T", oldObj)
+	}
+
+	newComponentType, ok := newObj.(*openchoreodevv1alpha1.ComponentType)
+	if !ok {
+		return nil, fmt.Errorf("expected a ComponentType object for the newObj but got %T", newObj)
+	}
+	componenttypelog.Info("Validation for ComponentType upon update", "name", newComponentType.GetName())
+
+	// Note: spec.workloadType immutability is enforced by CEL rules in the CRD schema
+
+	allErrs := validateComponentType(newComponentType)
+
+	if len(allErrs) > 0 {
+		return nil, apierrors.NewInvalid(newComponentType.GroupVersionKind().GroupKind(), newComponentType.GetName(), allErrs)
+	}
+
+	return nil, nil
+}
+
+// ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type ComponentType.
+func (v *Validator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	componenttype, ok := obj.(*openchoreodevv1alpha1.ComponentType)
+	if !ok {
+		return nil, fmt.Errorf("expected a ComponentType object but got %T", obj)
+	}
+	componenttypelog.Info("Validation for ComponentType upon deletion", "name", componenttype.GetName())
+
+	// No special validation needed for deletion
+	return nil, nil
+}
+
+// validateComponentType performs all validation for a ComponentType.
+func validateComponentType(ct *openchoreodevv1alpha1.ComponentType) field.ErrorList {
+	allErrs := field.ErrorList{}
+
+	// Extract and validate schemas, getting structural schemas for CEL validation
+	parametersSchema, envConfigsSchema, schemaErrs := schemautil.ExtractAndValidateSchemas(
+		ct.Spec.Parameters, ct.Spec.EnvironmentConfigs, field.NewPath("spec"),
+	)
+	allErrs = append(allErrs, schemaErrs...)
+
+	// Validate CEL expressions with schema-aware type checking
+	allErrs = append(allErrs, component.ValidateComponentTypeResourcesWithSchema(
+		ct, parametersSchema, envConfigsSchema,
+	)...)
+
+	// Validate resource IDs and workloadType
+	resourceErrs := validateResourceStructure(ct)
+	allErrs = append(allErrs, resourceErrs...)
+
+	// Validate embedded traits
+	embeddedTraitErrs := validateEmbeddedTraits(ct)
+	allErrs = append(allErrs, embeddedTraitErrs...)
+
+	// Validate allowedTraits
+	allowedTraitErrs := validateAllowedTraits(ct)
+	allErrs = append(allErrs, allowedTraitErrs...)
+
+	// Validate allowedWorkflows
+	allowedWorkflowErrs := validateAllowedWorkflows(ct)
+	allErrs = append(allErrs, allowedWorkflowErrs...)
+
+	return allErrs
+}
+
+// validateResourceStructure validates resource templates and ensures workloadType matches a resource kind
+func validateResourceStructure(ct *openchoreodevv1alpha1.ComponentType) field.ErrorList {
+	return component.ValidateWorkloadResources(
+		ct.Spec.WorkloadType,
+		ct.Spec.Resources,
+		field.NewPath("spec", "resources"))
+}
+
+// validateEmbeddedTraits validates the embedded traits in a ComponentType.
+func validateEmbeddedTraits(ct *openchoreodevv1alpha1.ComponentType) field.ErrorList {
+	allErrs := field.ErrorList{}
+	traitsPath := field.NewPath("spec", "traits")
+
+	instanceNames := make(map[string]int)
+	for i, trait := range ct.Spec.Traits {
+		traitPath := traitsPath.Index(i)
+
+		// Validate non-empty name
+		if trait.Name == "" {
+			allErrs = append(allErrs, field.Required(traitPath.Child("name"), "trait name is required"))
+		}
+
+		// Validate non-empty instanceName
+		if trait.InstanceName == "" {
+			allErrs = append(allErrs, field.Required(traitPath.Child("instanceName"), "trait instanceName is required"))
+		}
+
+		// Check for duplicate instanceNames
+		if prevIdx, exists := instanceNames[trait.InstanceName]; exists {
+			allErrs = append(allErrs, field.Duplicate(
+				traitPath.Child("instanceName"),
+				fmt.Sprintf("instanceName %q is already used by trait at index %d", trait.InstanceName, prevIdx),
+			))
+		}
+		instanceNames[trait.InstanceName] = i
+	}
+
+	return allErrs
+}
+
+// validateAllowedTraits validates the allowedTraits list in a ComponentType.
+// AllowedTraits uses []TraitRef with kind+name.
+func validateAllowedTraits(ct *openchoreodevv1alpha1.ComponentType) field.ErrorList {
+	allErrs := field.ErrorList{}
+	allowedPath := field.NewPath("spec", "allowedTraits")
+
+	// Build set of embedded trait kind:name keys for overlap check
+	embeddedTraitKeys := make(map[string]bool)
+	for _, trait := range ct.Spec.Traits {
+		key := string(trait.Kind) + ":" + trait.Name
+		embeddedTraitKeys[key] = true
+	}
+
+	seen := make(map[string]bool)
+	for i, ref := range ct.Spec.AllowedTraits {
+		entryPath := allowedPath.Index(i)
+
+		// Validate non-empty name
+		if ref.Name == "" {
+			allErrs = append(allErrs, field.Required(entryPath.Child("name"), "allowed trait name must not be empty"))
+			continue
+		}
+
+		// Check for duplicates using kind:name composite key
+		key := string(ref.Kind) + ":" + ref.Name
+		if seen[key] {
+			allErrs = append(allErrs, field.Duplicate(entryPath, key))
+		}
+		seen[key] = true
+
+		// Check for overlap with embedded traits matching both kind and name
+		if embeddedTraitKeys[key] {
+			allErrs = append(allErrs, field.Invalid(
+				entryPath,
+				key,
+				"trait is already embedded in spec.traits and cannot also be in allowedTraits",
+			))
+		}
+	}
+
+	return allErrs
+}
+
+// validateAllowedWorkflows validates the allowedWorkflows list in a ComponentType.
+// ComponentType can reference both Workflow and ClusterWorkflow.
+func validateAllowedWorkflows(ct *openchoreodevv1alpha1.ComponentType) field.ErrorList {
+	allErrs := field.ErrorList{}
+	allowedPath := field.NewPath("spec", "allowedWorkflows")
+
+	seen := make(map[string]bool)
+	for i, ref := range ct.Spec.AllowedWorkflows {
+		entryPath := allowedPath.Index(i)
+
+		// Validate non-empty name
+		if ref.Name == "" {
+			allErrs = append(allErrs, field.Required(entryPath.Child("name"), "allowed workflow name must not be empty"))
+			continue
+		}
+
+		// Check for duplicates by kind:name composite key
+		refKind := ref.Kind
+		if refKind == "" {
+			refKind = openchoreodevv1alpha1.WorkflowRefKindWorkflow
+		}
+		compositeKey := string(refKind) + ":" + ref.Name
+		if seen[compositeKey] {
+			allErrs = append(allErrs, field.Duplicate(entryPath, compositeKey))
+		}
+		seen[compositeKey] = true
+	}
+
+	return allErrs
+}

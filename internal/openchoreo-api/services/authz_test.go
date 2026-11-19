@@ -1,0 +1,303 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package services
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"testing"
+
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	disabledAuthz "github.com/openchoreo/openchoreo/internal/authz"
+	authz "github.com/openchoreo/openchoreo/internal/authz/core"
+	authzmocks "github.com/openchoreo/openchoreo/internal/authz/core/mocks"
+	"github.com/openchoreo/openchoreo/internal/server/middleware/audit"
+	"github.com/openchoreo/openchoreo/internal/server/middleware/auth"
+)
+
+// ctxWithSubject returns a context with the given SubjectContext set.
+func ctxWithSubject(subjectCtx *auth.SubjectContext) context.Context {
+	return auth.SetSubjectContext(context.Background(), subjectCtx)
+}
+
+// testSubjectContext returns a valid SubjectContext for testing.
+func testSubjectContext() *auth.SubjectContext {
+	return &auth.SubjectContext{
+		ID:                "user-1",
+		Type:              "user",
+		EntitlementClaim:  "groups",
+		EntitlementValues: []string{"org-admins"},
+	}
+}
+
+// testCheckRequest returns a sample CheckRequest for testing.
+func testCheckRequest() CheckRequest {
+	return CheckRequest{
+		Action:       "project:view",
+		ResourceType: "project",
+		ResourceID:   "my-project",
+		Hierarchy:    authz.ResourceHierarchy{Namespace: "ns-1", Project: "my-project"},
+	}
+}
+
+func newTestChecker(pdp authz.PDP) *AuthzChecker {
+	return NewAuthzChecker(pdp, slog.Default())
+}
+
+// ---------------------------------------------------------------------------
+// Check tests
+// ---------------------------------------------------------------------------
+
+func TestCheck(t *testing.T) {
+	evalErr := errors.New("pdp unavailable")
+
+	tests := []struct {
+		name     string
+		decision *authz.Decision
+		evalErr  error
+		checkErr func(t *testing.T, err error)
+	}{
+		{
+			name: "allow",
+			decision: &authz.Decision{
+				Decision: true,
+				Context:  &authz.DecisionContext{Reason: "allowed"},
+			},
+			checkErr: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "deny",
+			decision: &authz.Decision{
+				Decision: false,
+				Context:  &authz.DecisionContext{Reason: "denied"},
+			},
+			checkErr: func(t *testing.T, err error) {
+				require.ErrorIs(t, err, ErrForbidden)
+			},
+		},
+		{
+			name:    "evaluate error",
+			evalErr: evalErr,
+			checkErr: func(t *testing.T, err error) {
+				require.ErrorIs(t, err, evalErr)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pdp := authzmocks.NewMockPDP(t)
+			pdp.EXPECT().Evaluate(mock.Anything, mock.Anything).
+				Return(tt.decision, tt.evalErr)
+			checker := newTestChecker(pdp)
+
+			err := checker.Check(ctxWithSubject(testSubjectContext()), testCheckRequest())
+			tt.checkErr(t, err)
+		})
+	}
+}
+
+func TestCheck_NilSubject_DisabledAuthz(t *testing.T) {
+	checker := NewAuthzChecker(disabledAuthz.NewDisabledAuthorizer(slog.Default()), slog.Default())
+
+	// context.Background() has no SubjectContext — disabled authorizer should still allow.
+	err := checker.Check(context.Background(), testCheckRequest())
+	require.NoError(t, err, "expected nil error with disabled authz")
+}
+
+// TestCheck_RecordsHierarchyRegardlessOfDecision guards that the hierarchy a
+// check was made on reaches the audit record even on a denial or a PDP
+// error — recorded before pdp.Evaluate runs, not after — so an investigator
+// can tell which project/component a refused request named.
+func TestCheck_RecordsHierarchyRegardlessOfDecision(t *testing.T) {
+	evalErr := errors.New("pdp unavailable")
+	tests := []struct {
+		name     string
+		decision *authz.Decision
+		evalErr  error
+	}{
+		{name: "allow", decision: &authz.Decision{Decision: true, Context: &authz.DecisionContext{}}},
+		{name: "deny", decision: &authz.Decision{Decision: false, Context: &authz.DecisionContext{}}},
+		{name: "pdp error", evalErr: evalErr},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pdp := authzmocks.NewMockPDP(t)
+			pdp.EXPECT().Evaluate(mock.Anything, mock.Anything).Return(tt.decision, tt.evalErr)
+			checker := newTestChecker(pdp)
+
+			ctx, auditData := audit.NewAuditContext(ctxWithSubject(testSubjectContext()), &audit.Resource{}, audit.RequestInfo{})
+			_ = checker.Check(ctx, testCheckRequest())
+
+			want := audit.Hierarchy{Namespace: "ns-1", Project: "my-project"}
+			require.Equal(t, want, auditData.Hierarchy)
+		})
+	}
+}
+
+// TestCheck_RecordsEnvironmentRegardlessOfDecision is why the environment is
+// recorded here rather than by a handler's SetResource call: a denial never
+// reaches the handler, and a refused attempt on a production environment is
+// exactly the record that needs to name it. It also pins the value to the
+// dual-scoped identifier the decision used, not a re-derived variant.
+func TestCheck_RecordsEnvironmentRegardlessOfDecision(t *testing.T) {
+	evalErr := errors.New("pdp unavailable")
+	tests := []struct {
+		name     string
+		decision *authz.Decision
+		evalErr  error
+	}{
+		{name: "allow", decision: &authz.Decision{Decision: true, Context: &authz.DecisionContext{}}},
+		{name: "deny", decision: &authz.Decision{Decision: false, Context: &authz.DecisionContext{}}},
+		{name: "pdp error", evalErr: evalErr},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pdp := authzmocks.NewMockPDP(t)
+			pdp.EXPECT().Evaluate(mock.Anything, mock.Anything).Return(tt.decision, tt.evalErr)
+			checker := newTestChecker(pdp)
+
+			req := testCheckRequest()
+			req.Context = authz.Context{
+				Resource: authz.ResourceAttribute{
+					Environment: FormatDualScopedResourceName("ns-1", "production", false),
+				},
+			}
+
+			ctx, auditData := audit.NewAuditContext(ctxWithSubject(testSubjectContext()), &audit.Resource{}, audit.RequestInfo{})
+			_ = checker.Check(ctx, req)
+
+			want := audit.Hierarchy{Namespace: "ns-1", Environment: "ns-1/production", Project: "my-project"}
+			require.Equal(t, want, auditData.Hierarchy)
+		})
+	}
+}
+
+// TestCheck_NoEnvironmentAttributeRecordsNone covers the environment-agnostic
+// majority of operations: no ABAC environment means an empty one, not
+// something derived from the namespace.
+func TestCheck_NoEnvironmentAttributeRecordsNone(t *testing.T) {
+	pdp := authzmocks.NewMockPDP(t)
+	pdp.EXPECT().Evaluate(mock.Anything, mock.Anything).
+		Return(&authz.Decision{Decision: true, Context: &authz.DecisionContext{}}, nil)
+	checker := newTestChecker(pdp)
+
+	ctx, auditData := audit.NewAuditContext(ctxWithSubject(testSubjectContext()), &audit.Resource{}, audit.RequestInfo{})
+	_ = checker.Check(ctx, testCheckRequest())
+
+	require.Empty(t, auditData.Hierarchy.Environment)
+}
+
+// TestBatchCheck_DoesNotRecordHierarchy guards that FilteredList's per-item
+// checks — routed through BatchCheck, not Check — stay out of the audit
+// record. BatchCheck is used for read-side filtering, not an audited
+// mutating operation, so it must never populate AuditData.Hierarchy.
+func TestBatchCheck_DoesNotRecordHierarchy(t *testing.T) {
+	pdp := authzmocks.NewMockPDP(t)
+	pdp.EXPECT().BatchEvaluate(mock.Anything, mock.Anything).
+		Return(&authz.BatchEvaluateResponse{Decisions: []authz.Decision{{Decision: true}}}, nil)
+	checker := newTestChecker(pdp)
+
+	ctx, auditData := audit.NewAuditContext(ctxWithSubject(testSubjectContext()), &audit.Resource{}, audit.RequestInfo{})
+	_, err := checker.BatchCheck(ctx, []CheckRequest{testCheckRequest()})
+	require.NoError(t, err)
+
+	require.Equal(t, audit.Hierarchy{}, auditData.Hierarchy)
+}
+
+// ---------------------------------------------------------------------------
+// BatchCheck tests
+// ---------------------------------------------------------------------------
+
+func TestBatchCheck_EmptyRequests(t *testing.T) {
+	// No expectations set — mockery panics if BatchEvaluate is called,
+	// which enforces that empty-request short-circuit skips the PDP.
+	pdp := authzmocks.NewMockPDP(t)
+	checker := newTestChecker(pdp)
+
+	results, err := checker.BatchCheck(ctxWithSubject(testSubjectContext()), []CheckRequest{})
+	require.NoError(t, err)
+	require.Nil(t, results)
+}
+
+func TestBatchCheck_AllAllowed(t *testing.T) {
+	pdp := authzmocks.NewMockPDP(t)
+	pdp.EXPECT().BatchEvaluate(mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, req *authz.BatchEvaluateRequest) (*authz.BatchEvaluateResponse, error) {
+			decisions := make([]authz.Decision, len(req.Requests))
+			for i := range decisions {
+				decisions[i] = authz.Decision{Decision: true}
+			}
+			return &authz.BatchEvaluateResponse{Decisions: decisions}, nil
+		})
+	checker := newTestChecker(pdp)
+
+	requests := []CheckRequest{testCheckRequest(), testCheckRequest()}
+	results, err := checker.BatchCheck(ctxWithSubject(testSubjectContext()), requests)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	for i, r := range results {
+		require.Truef(t, r, "expected results[%d] to be true", i)
+	}
+}
+
+func TestBatchCheck_MixedDecisions(t *testing.T) {
+	pdp := authzmocks.NewMockPDP(t)
+	pdp.EXPECT().BatchEvaluate(mock.Anything, mock.Anything).
+		Return(&authz.BatchEvaluateResponse{
+			Decisions: []authz.Decision{
+				{Decision: true},
+				{Decision: false},
+				{Decision: true},
+			},
+		}, nil)
+	checker := newTestChecker(pdp)
+
+	requests := []CheckRequest{testCheckRequest(), testCheckRequest(), testCheckRequest()}
+	results, err := checker.BatchCheck(ctxWithSubject(testSubjectContext()), requests)
+	require.NoError(t, err)
+	expected := []bool{true, false, true}
+	require.Equal(t, expected, results)
+}
+
+func TestBatchCheck_EvaluateError(t *testing.T) {
+	batchErr := errors.New("batch pdp error")
+	pdp := authzmocks.NewMockPDP(t)
+	pdp.EXPECT().BatchEvaluate(mock.Anything, mock.Anything).Return(nil, batchErr)
+	checker := newTestChecker(pdp)
+
+	_, err := checker.BatchCheck(ctxWithSubject(testSubjectContext()), []CheckRequest{testCheckRequest()})
+	require.Error(t, err)
+	require.ErrorIs(t, err, batchErr)
+}
+
+func TestBatchCheck_NilSubject_DisabledAuthz(t *testing.T) {
+	checker := NewAuthzChecker(disabledAuthz.NewDisabledAuthorizer(slog.Default()), slog.Default())
+
+	// context.Background() has no SubjectContext — disabled authorizer should still allow.
+	results, err := checker.BatchCheck(context.Background(), []CheckRequest{testCheckRequest()})
+	require.NoError(t, err, "expected nil error with disabled authz")
+	require.Equal(t, []bool{true}, results)
+}
+
+func TestBatchCheck_SingleRequest(t *testing.T) {
+	pdp := authzmocks.NewMockPDP(t)
+	pdp.EXPECT().BatchEvaluate(mock.Anything, mock.Anything).
+		Return(&authz.BatchEvaluateResponse{
+			Decisions: []authz.Decision{{Decision: false}},
+		}, nil)
+	checker := newTestChecker(pdp)
+
+	results, err := checker.BatchCheck(ctxWithSubject(testSubjectContext()), []CheckRequest{testCheckRequest()})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.False(t, results[0], "expected results[0] to be false")
+}

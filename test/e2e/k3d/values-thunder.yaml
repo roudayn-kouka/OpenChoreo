@@ -1,0 +1,146 @@
+# ThunderID IdP overrides for e2e testing
+# Applied on top of install/k3d/common/values-thunder.yaml:
+#   helm install thunder ... -f install/k3d/common/values-thunder.yaml -f test/e2e/k3d/values-thunder.yaml
+
+httproute:
+  hostnames:
+    - thunder.e2e-cp.local
+
+configuration:
+  server:
+    publicUrl: "http://thunder.e2e-cp.local:28080"
+
+  gateClient:
+    hostname: "thunder.e2e-cp.local"
+    port: 28080
+
+  passkey:
+    allowedOrigins:
+      - "http://openchoreo.e2e-cp.local:28080"
+
+  # Playwright's globalSetup mints each role's session once into a storageState
+  # file, and every test builds a fresh browser context from that file. Token
+  # rotation inside one context is never written back, so with the chart default
+  # (revokePreviousOnRenew: true) the first refresh revokes the token still held
+  # in the file and every later context starts with a dead credential — the suite
+  # then fails every test that needs a signed-in session. Reuse is harmless in a
+  # disposable e2e cluster; production keeps the chart default.
+  oauth:
+    refreshToken:
+      revokePreviousOnRenew: false
+
+bootstrap:
+  scripts:
+    49-cors.yaml: |
+      resource_type: server_config
+      name: cors
+      value:
+        allowedOrigins:
+          - "http://openchoreo.e2e-cp.local:28080"
+
+    # Retarget the identifiers at this cluster's endpoints. Replaces the base
+    # document of the same key.
+    62-openchoreo-resource-servers.yaml: |
+      resource_type: resource_server
+      id: 01900000-0000-7000-8001-000000000070
+      name: OpenChoreo Control Plane
+      description: OpenChoreo control plane MCP server
+      identifier: "http://api.e2e-cp.local:28080/mcp"
+      type: MCP
+      ouHandle: default
+      ---
+      resource_type: resource_server
+      id: 01900000-0000-7000-8001-000000000071
+      name: OpenChoreo Observability Plane
+      description: OpenChoreo observability plane MCP server
+      identifier: "http://observer.e2e-op.local:11080/mcp"
+      type: MCP
+      ouHandle: default
+
+    # Add the openchoreo.e2e-cp.local:28080 redirect URI alongside the
+    # single-cluster default so ThunderID accepts the OIDC redirect-back from
+    # Backstage on this cluster. Replaces the base document of the same key.
+    51-backstage-app.yaml: |
+      resource_type: application
+      id: 01900000-0000-7000-8001-000000000060
+      ouId: 01900000-0000-7000-8000-000000000001
+      name: Backstage
+      type: fullstack
+      authFlowId: 01900000-0000-7000-8000-000000000061
+      description: OpenChoreo Backstage Portal
+      logoUrl: "https://cdn.statically.io/gh/openchoreo/openchoreo.github.io@main/static/img/openchoreo-logo.png"
+      allowedUserTypes:
+        - openchoreo-user
+      assertion:
+        validityPeriod: 3600
+      inboundAuthConfig:
+        - type: oauth2
+          config:
+            clientId: openchoreo-backstage-client
+            clientSecret: backstage-portal-secret
+            redirectUris:
+              - "http://openchoreo.localhost:8080/api/auth/openchoreo-auth/handler/frame"
+              - "http://openchoreo.e2e-cp.local:28080/api/auth/openchoreo-auth/handler/frame"
+            grantTypes:
+              - authorization_code
+              - client_credentials
+              - refresh_token
+            responseTypes:
+              - code
+            tokenEndpointAuthMethod: client_secret_post
+            pkceRequired: false
+            publicClient: false
+            token:
+              accessToken:
+                userConfig:
+                  validityPeriod: 86400
+                  attributes:
+                    - given_name
+                    - family_name
+                    - username
+                    - groups
+                clientConfig:
+                  validityPeriod: 86400
+              idToken:
+                validityPeriod: 86400
+                userAttributes:
+                  - given_name
+                  - family_name
+                  - username
+                  - groups
+            scopeClaims:
+              email:
+                - email
+              groups:
+                - groups
+              profile:
+                - username
+                - given_name
+                - family_name
+                - picture
+
+    # Provision the ABAC-restricted identity the abac-ui Playwright suite
+    # signs in as. Users and groups are seeded only through the setup Job's
+    # bootstrap; the user type comes from 50-user-schema-and-users.yaml in the
+    # base values.
+    52-abac-user.yaml: |
+      resource_type: user
+      id: 01900000-0000-7000-8001-000000000034
+      type: openchoreo-user
+      ouHandle: default
+      attributes:
+        username: abac-dev@openchoreo.dev
+        email: abac-dev@openchoreo.dev
+        given_name: ABAC
+        family_name: Developer
+      credentials:
+        password: "Abac@123"
+      ---
+      resource_type: group
+      id: 01900000-0000-7000-8001-000000000044
+      name: abac-developers
+      description: ABAC-restricted developers (environment-scoped access, used by the abac-ui Playwright suite)
+      ouHandle: default
+      members:
+        - id: 01900000-0000-7000-8001-000000000034
+          type: user

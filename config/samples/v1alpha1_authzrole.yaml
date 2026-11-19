@@ -1,0 +1,14 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: AuthzRole
+metadata:
+  labels:
+    app.kubernetes.io/name: openchoreo
+  name: developer
+  namespace: acme-org
+spec:
+  description: "Developer role with read/write access to components and projects"
+  actions:
+    - component:*
+    - project:view
+    - project:update
+    - workflow:*

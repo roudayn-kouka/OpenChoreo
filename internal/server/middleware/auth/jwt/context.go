@@ -1,0 +1,77 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package jwt
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// contextKey is a custom type for context keys to avoid collisions
+type contextKey string
+
+const (
+	// claimsContextKey is the key used to store claims in the request context
+	claimsContextKey contextKey = "jwt_claims"
+	// tokenContextKey is the key used to store the raw token in the request context
+	tokenContextKey contextKey = "jwt_token"
+)
+
+// GetClaims retrieves the JWT claims from the request context
+func GetClaims(r *http.Request) (jwt.MapClaims, bool) {
+	claims, ok := r.Context().Value(claimsContextKey).(jwt.MapClaims)
+	return claims, ok
+}
+
+// GetToken retrieves the raw JWT token string from the request context
+func GetToken(r *http.Request) (string, bool) {
+	token, ok := r.Context().Value(tokenContextKey).(string)
+	return token, ok
+}
+
+// GetClaimValue retrieves a specific claim value from the request context
+func GetClaimValue(r *http.Request, key string) (interface{}, bool) {
+	claims, ok := GetClaims(r)
+	if !ok {
+		return nil, false
+	}
+	value, exists := claims[key]
+	return value, exists
+}
+
+// GetSubject retrieves the subject (sub) claim from the request context
+func GetSubject(r *http.Request) (string, bool) {
+	value, ok := GetClaimValue(r, "sub")
+	if !ok {
+		return "", false
+	}
+	sub, ok := value.(string)
+	return sub, ok
+}
+
+// GetClaimsFromContext retrieves the validated JWT claims from a context.Context
+func GetClaimsFromContext(ctx context.Context) (jwt.MapClaims, bool) {
+	claims, ok := ctx.Value(claimsContextKey).(jwt.MapClaims)
+	return claims, ok
+}
+
+// ContextWithClaims returns a copy of ctx carrying claims.
+func ContextWithClaims(ctx context.Context, claims jwt.MapClaims) context.Context {
+	return context.WithValue(ctx, claimsContextKey, claims)
+}
+
+// GetTokenFromContext retrieves the raw JWT token string from a context.Context
+func GetTokenFromContext(ctx context.Context) string {
+	token, _ := ctx.Value(tokenContextKey).(string)
+	return token
+}
+
+// ContextWithToken returns a copy of ctx carrying the raw JWT token string.
+// The middleware sets this automatically; it is exported mainly so downstream
+// code (and tests) can populate the token the same way.
+func ContextWithToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, tokenContextKey, token)
+}

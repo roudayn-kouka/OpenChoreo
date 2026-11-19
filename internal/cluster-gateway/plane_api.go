@@ -1,0 +1,285 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package clustergateway
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+
+	"github.com/openchoreo/openchoreo/internal/cluster-gateway/fabric"
+)
+
+type PlaneAPI struct {
+	connMgr *ConnectionManager
+	server  *Server // For accessing k8sClient to fetch CR CAs
+	logger  *slog.Logger
+}
+
+type PlaneNotification struct {
+	PlaneType string `json:"planeType"` // "dataplane", "workflowplane", "observabilityplane"
+	PlaneID   string `json:"planeID"`
+	Event     string `json:"event"` // "created", "updated", "deleted"
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+// PlaneNotificationResponse represents the response to a plane notification
+type PlaneNotificationResponse struct {
+	Success               bool   `json:"success"`
+	Action                string `json:"action"` // "disconnect", "disconnect_fallback", "revalidate"
+	DisconnectedAgents    *int   `json:"disconnectedAgents,omitempty"`
+	AuthorizationsGranted *int   `json:"authorizationsGranted,omitempty"`
+	AuthorizationsRevoked *int   `json:"authorizationsRevoked,omitempty"`
+	Error                 string `json:"error,omitempty"`
+}
+
+// PlaneReconnectResponse represents the response to a manual reconnect request
+type PlaneReconnectResponse struct {
+	Success            bool `json:"success"`
+	DisconnectedAgents int  `json:"disconnectedAgents"`
+}
+
+// AllPlaneStatusResponse represents the response for all plane statuses
+type AllPlaneStatusResponse struct {
+	Planes []PlaneConnectionStatus `json:"planes"`
+	Total  int                     `json:"total"`
+}
+
+func NewPlaneAPI(connMgr *ConnectionManager, server *Server, logger *slog.Logger) *PlaneAPI {
+	return &PlaneAPI{
+		connMgr: connMgr,
+		server:  server,
+		logger:  logger.With("component", "plane-api"),
+	}
+}
+
+func (api *PlaneAPI) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/v1/planes/notify", api.handlePlaneNotification)
+	mux.HandleFunc("POST /api/v1/planes/{type}/{id}/reconnect", api.handleReconnect)
+	mux.HandleFunc("GET /api/v1/planes/{type}/{id}/status", api.handleGetPlaneStatus)
+	mux.HandleFunc("GET /api/v1/planes/status", api.handleGetAllPlaneStatus)
+}
+
+func (api *PlaneAPI) handlePlaneNotification(w http.ResponseWriter, r *http.Request) {
+	var notification PlaneNotification
+	if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
+		api.logger.Error("invalid notification payload", "error", err)
+		http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if notification.PlaneType == "" || notification.PlaneID == "" || notification.Event == "" {
+		api.logger.Error("missing required fields in notification",
+			"planeType", notification.PlaneType,
+			"planeID", notification.PlaneID,
+			"event", notification.Event,
+		)
+		http.Error(w, "missing required fields: planeType, planeID, event", http.StatusBadRequest)
+		return
+	}
+
+	api.logger.Info("received plane notification",
+		"planeType", notification.PlaneType,
+		"planeID", notification.PlaneID,
+		"event", notification.Event,
+		"cr", fmt.Sprintf("%s/%s", notification.Namespace, notification.Name),
+	)
+
+	var result PlaneNotificationResponse
+	result.Success = true
+
+	switch notification.Event {
+	case "created", "updated":
+		// For both "created" and "updated" events, attempt to revalidate agent certificates
+		// using the CR's CA. This avoids disconnecting all HA agent replicas unnecessarily.
+		caData, err := api.fetchCRClientCA(notification)
+		if err != nil {
+			api.logger.Error("failed to fetch CR CA for re-validation", "error", err,
+				"planeType", notification.PlaneType,
+				"planeID", notification.PlaneID,
+				"event", notification.Event,
+			)
+			// Return 503 so the controller treats this as a transient error and retries.
+			// Do NOT disconnect agents — existing connections are still valid.
+			http.Error(w, fmt.Sprintf("failed to fetch CR CA for re-validation: %v", err), http.StatusServiceUnavailable)
+			return
+		} else {
+			updated, removed, err := api.connMgr.RevalidateCR(
+				notification.PlaneType,
+				notification.PlaneID,
+				notification.Namespace,
+				notification.Name,
+				caData,
+			)
+			if err != nil {
+				api.logger.Error("CR re-validation failed", "error", err)
+				http.Error(w, fmt.Sprintf("re-validation failed: %v", err), http.StatusInternalServerError)
+				return
+			}
+			api.logger.Info("CR re-validation completed",
+				"planeType", notification.PlaneType,
+				"planeID", notification.PlaneID,
+				"event", notification.Event,
+				"cr", fmt.Sprintf("%s/%s", notification.Namespace, notification.Name),
+				"authorizationsGranted", updated,
+				"authorizationsRevoked", removed,
+			)
+			result.Action = "revalidate"
+			result.AuthorizationsGranted = &updated
+			result.AuthorizationsRevoked = &removed
+		}
+
+	case "deleted":
+		disconnectedCount := api.connMgr.DisconnectAllForPlane(notification.PlaneType, notification.PlaneID)
+		api.logger.Info("disconnected agents for CR deletion",
+			"planeType", notification.PlaneType,
+			"planeID", notification.PlaneID,
+			"disconnectedAgents", disconnectedCount,
+		)
+		result.Action = "disconnect"
+		result.DisconnectedAgents = &disconnectedCount
+
+	default:
+		api.logger.Warn("unknown event type", "event", notification.Event)
+		http.Error(w, fmt.Sprintf("unknown event type: %s", notification.Event), http.StatusBadRequest)
+		return
+	}
+
+	// This notification landed on one replica behind the load balancer;
+	// propagate it so replicas owning other connections for the plane apply
+	// it too. Counts in the response cover only this replica's connections.
+	api.server.propagatePlaneEvent(fabric.PlaneEvent{
+		PlaneType: notification.PlaneType,
+		PlaneID:   notification.PlaneID,
+		Event:     notification.Event,
+		Namespace: notification.Namespace,
+		Name:      notification.Name,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		api.logger.Error("failed to encode response", "error", err)
+	}
+}
+
+func (api *PlaneAPI) handleReconnect(w http.ResponseWriter, r *http.Request) {
+	planeType := r.PathValue("type")
+	planeID := r.PathValue("id")
+
+	if planeType == "" || planeID == "" {
+		http.Error(w, "missing planeType or planeID in path", http.StatusBadRequest)
+		return
+	}
+
+	api.logger.Info("manual reconnection requested",
+		"planeType", planeType,
+		"planeID", planeID,
+	)
+
+	disconnectedCount := api.connMgr.DisconnectAllForPlane(planeType, planeID)
+
+	// Propagate so replicas owning other connections for this plane
+	// disconnect them too. The count covers only this replica.
+	api.server.propagatePlaneEvent(fabric.PlaneEvent{
+		PlaneType: planeType,
+		PlaneID:   planeID,
+		Event:     "reconnect",
+	})
+
+	api.logger.Info("manual reconnection processed",
+		"planeType", planeType,
+		"planeID", planeID,
+		"disconnectedAgents", disconnectedCount,
+	)
+
+	response := PlaneReconnectResponse{
+		Success:            true,
+		DisconnectedAgents: disconnectedCount,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		api.logger.Error("failed to encode response", "error", err)
+	}
+}
+
+// handleGetPlaneStatus returns connection status for a specific plane
+// This endpoint is called by the controller to update DataPlane CR status
+// If name query parameter is provided, it returns CR-specific authorization status
+// GET /api/v1/planes/{type}/{id}/status -> plane-level status (all agents connected to plane)
+// GET /api/v1/planes/{type}/{id}/status?namespace=X&name=Y -> CR-specific authorization status (namespace-scoped CR)
+// GET /api/v1/planes/{type}/{id}/status?name=Y -> CR-specific authorization status (cluster-scoped CR, empty namespace)
+func (api *PlaneAPI) handleGetPlaneStatus(w http.ResponseWriter, r *http.Request) {
+	planeType := r.PathValue("type")
+	planeID := r.PathValue("id")
+
+	if planeType == "" || planeID == "" {
+		http.Error(w, "missing planeType or planeID in path", http.StatusBadRequest)
+		return
+	}
+
+	// Check for CR-specific query parameters
+	// For cluster-scoped CRs, namespace will be empty but name will be provided
+	// For namespace-scoped CRs, both namespace and name will be provided
+	namespace := r.URL.Query().Get("namespace")
+	name := r.URL.Query().Get("name")
+
+	var status *PlaneConnectionStatus
+	if name != "" {
+		// CR-specific status (works for both namespace-scoped and cluster-scoped CRs)
+		// For cluster-scoped CRs, namespace is empty and CR key becomes "/name"
+		status = api.server.CRAuthorizationStatus(planeType, planeID, namespace, name)
+	} else {
+		// Plane-level status (all agents connected to the plane)
+		status = api.server.PlaneStatus(planeType, planeID)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		api.logger.Error("failed to encode response", "error", err)
+	}
+}
+
+// handleGetAllPlaneStatus returns connection status for all planes
+// This endpoint is called by the controller to get status of all planes at once
+func (api *PlaneAPI) handleGetAllPlaneStatus(w http.ResponseWriter, r *http.Request) {
+	statuses := api.server.AllPlaneStatuses()
+
+	response := AllPlaneStatusResponse{
+		Planes: statuses,
+		Total:  len(statuses),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		api.logger.Error("failed to encode response", "error", err)
+	}
+}
+
+// fetchCRClientCA fetches the client CA certificate for a specific CR
+// Uses the server's getAllPlaneClientCAs() method to query Kubernetes API
+func (api *PlaneAPI) fetchCRClientCA(notification PlaneNotification) ([]byte, error) {
+	caData, err := api.server.fetchCRClientCA(
+		notification.PlaneType,
+		notification.PlaneID,
+		notification.Namespace,
+		notification.Name,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	api.logger.Debug("fetched CA for CR",
+		"cr", fmt.Sprintf("%s/%s", notification.Namespace, notification.Name),
+		"caSize", len(caData),
+	)
+
+	return caData, nil
+}

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# Get the absolute path of the script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source helper functions
+source "${SCRIPT_DIR}/.helpers.sh"
+
+# Catch unexpected exits so users don't think the install succeeded
+trap 'exit_code=$?; if [[ $exit_code -ne 0 ]]; then echo ""; log_error "Installation failed unexpectedly (exit code $exit_code)"; log_error "Re-run with --debug for more details"; fi' EXIT
+
+# Parse command line arguments
+ENABLE_WORKFLOW_PLANE=false
+ENABLE_OBSERVABILITY=false
+SKIP_PRELOAD=false
+SKIP_RESOURCE_CHECK=false
+DEBUG=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --with-build)
+            ENABLE_WORKFLOW_PLANE=true
+            shift
+            ;;
+        --with-observability)
+            ENABLE_OBSERVABILITY=true
+            shift
+            ;;
+        --skip-preload)
+            SKIP_PRELOAD=true
+            shift
+            ;;
+        --skip-resource-check)
+            SKIP_RESOURCE_CHECK=true
+            shift
+            ;;
+        --debug)
+            DEBUG=true
+            export DEBUG
+            shift
+            ;;
+        --version)
+            OPENCHOREO_VERSION="$2"
+            export OPENCHOREO_VERSION
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --version VER             Specify version to install (default: latest)"
+            echo "  --with-build              Install with Workflow Plane (Argo Workflows + Registry)"
+            echo "  --with-observability      Install with Observability Plane (enables audit logs)"
+            echo "  --skip-preload            Skip image preloading from host Docker"
+            echo "  --skip-resource-check     Skip system resource validation"
+            echo "  --debug                   Enable debug mode"
+            echo "  --help, -h                Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0                                     # Install with defaults"
+            echo "  $0 --version v1.2.3                    # Install specific version"
+            echo "  $0 --with-build                        # Install with build capabilities"
+            echo "  $0 --with-observability                # Install with observability"
+            echo "  $0 --with-build --with-observability   # Full platform"
+            echo "  $0 --skip-preload                      # Skip image preloading"
+            echo "  $0 --debug --version latest-dev        # Debug with dev version"
+            exit 0
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Export flags for use in helper functions
+export SKIP_RESOURCE_CHECK
+export ENABLE_WORKFLOW_PLANE
+export ENABLE_OBSERVABILITY
+
+# Derive chart version from the (possibly user-provided) OPENCHOREO_VERSION
+derive_chart_version
+
+log_info "Starting OpenChoreo installation..."
+print_installation_config
+
+# Step 1: Verify prerequisites and create cluster
+verify_prerequisites
+create_k3d_cluster
+
+# Step 2: Preload Docker images (unless skipped)
+if [[ "$SKIP_PRELOAD" != "true" ]]; then
+    preload_images
+fi
+
+# Step 3: Install prerequisites
+install_cert_manager
+install_eso
+install_gateway_crds
+
+# Step 3b: Install OpenBao secret backend (seeds platform secrets + ClusterSecretStore).
+# Must run before the control plane so its ExternalSecrets can sync from the store.
+install_openbao
+
+# Step 4: Install kgateway and Thunder
+install_kgateway
+install_thunder
+
+# Step 5: Apply CoreDNS config
+apply_coredns_config
+
+# Step 6: Create backstage ExternalSecret and install Control Plane
+create_backstage_external_secret "$CONTROL_PLANE_NS"
+install_control_plane
+
+# Step 6b: Extract cluster-gateway CA into ConfigMap
+extract_cluster_gateway_ca
+
+# Step 7: Set up Data Plane CA
+setup_data_plane_ca
+
+# Step 8: Install Data Plane
+install_data_plane
+
+# Step 9: Create DataPlane resource and default resources
+create_dataplane_resource
+install_default_resources
+label_default_namespace
+
+# Step 10: Install Workflow Plane (optional)
+if [[ "$ENABLE_WORKFLOW_PLANE" == "true" ]]; then
+    setup_workflow_plane_ca
+    install_registry
+    install_workflow_plane
+    install_workflow_templates
+
+    create_workflowplane_resource
+fi
+
+# Step 11: Install Observability Plane (optional)
+if [[ "$ENABLE_OBSERVABILITY" == "true" ]]; then
+    setup_observability_plane_ca
+    create_observability_external_secrets "$OBSERVABILITY_NS"
+
+    install_observability_plane
+
+    create_observabilityplane_resource
+
+    configure_observabilityplane_reference
+fi
+
+# Step 12: Configure OCC CLI login (non-fatal, Thunder may need time to start)
+if [[ -f "${SCRIPT_DIR}/occ-login.sh" ]]; then
+    if ! bash "${SCRIPT_DIR}/occ-login.sh"; then
+        log_warning "OCC CLI login setup failed (Thunder may not be ready yet)"
+        log_info "You can retry later: bash occ-login.sh"
+    fi
+else
+    log_warning "occ-login.sh not found, skipping OCC CLI login"
+fi
+
+THUNDER_ADMIN_PASSWORD=$(kubectl get secret -n "$THUNDER_NS" thunder-admin-credentials \
+    -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+
+log_success "OpenChoreo installation completed successfully!"
+log_info "Access URLs:"
+log_info "  Backstage UI: http://openchoreo.localhost:8080/"
+log_info "    Login credentials:"
+log_info "      Admin:"
+log_info "        Username: admin@openchoreo.dev"
+log_info "        Password: Admin@123"
+log_info "      Developer:"
+log_info "        Username: developer@openchoreo.dev"
+log_info "        Password: Dev@123"
+log_info "      Platform Engineer:"
+log_info "        Username: platform-engineer@openchoreo.dev"
+log_info "        Password: PE@123"
+log_info "      SRE:"
+log_info "        Username: sre@openchoreo.dev"
+log_info "        Password: SRE@123"
+log_info "  OpenChoreo API: http://api.openchoreo.localhost:8080/"
+log_info "  ThunderID Identity Provider: http://thunder.openchoreo.localhost:8080/"
+log_info "  ThunderID Identity Provider UI: http://thunder.openchoreo.localhost:8080/console"
+log_info "    Logins:"
+log_info "      Username: admin"
+log_info "      Password: ${THUNDER_ADMIN_PASSWORD:-<not found; check the thunder-admin-credentials Secret in the $THUNDER_NS namespace>}"
+echo ""
+log_info "OCC CLI Login:"
+log_info "  Run the following commands to login:"
+log_info "    source .occ-credentials"
+log_info "    occ config controlplane update default --url http://api.openchoreo.localhost:8080"
+log_info "    occ login --client-credentials"
+echo ""
+log_info "Next Steps:"
+log_info "  Deploy sample applications:"
+log_info "    ./deploy-react-starter.sh      # Simple React web application"
+log_info "    ./deploy-gcp-demo.sh           # GCP Microservices Demo (11 services)"
+
+if [[ "$ENABLE_WORKFLOW_PLANE" == "true" ]]; then
+    log_info "    ./build-deploy-greeter.sh      # Build from source (Go greeter service)"
+fi

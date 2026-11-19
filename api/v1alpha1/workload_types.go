@@ -1,0 +1,391 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
+// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+
+// EnvVar represents an environment variable present in the container.
+// +kubebuilder:validation:XValidation:rule="!(has(self.value) && has(self.valueFrom))",message="value and valueFrom are mutually exclusive"
+type EnvVar struct {
+	// The environment variable key.
+	// +required
+	Key string `json:"key"`
+
+	// The literal value of the environment variable.
+	// Mutually exclusive with valueFrom.
+	// +optional
+	Value string `json:"value,omitempty"`
+
+	// Extract the environment variable value from another resource.
+	// Mutually exclusive with value.
+	// +optional
+	ValueFrom *EnvVarValueFrom `json:"valueFrom,omitempty"`
+}
+
+// EnvVarValueFrom holds references to external sources for environment variables.
+type EnvVarValueFrom struct {
+	// Reference to a secret resource.
+	// +optional
+	SecretKeyRef *SecretKeyRef `json:"secretKeyRef,omitempty"`
+}
+
+// FileVar represents a file configuration in a container.
+// +kubebuilder:validation:XValidation:rule="!(has(self.value) && has(self.valueFrom))",message="value and valueFrom are mutually exclusive"
+type FileVar struct {
+	// The file key/name.
+	// +kubebuilder:validation:Required
+	Key string `json:"key"`
+
+	// The mount path where the file will be mounted.
+	// +kubebuilder:validation:Required
+	MountPath string `json:"mountPath"`
+
+	// The literal content of the file.
+	// Mutually exclusive with valueFrom.
+	// +optional
+	Value string `json:"value,omitempty"`
+
+	// Extract the environment variable value from another resource.
+	// Mutually exclusive with value.
+	// +optional
+	ValueFrom *EnvVarValueFrom `json:"valueFrom,omitempty"`
+}
+
+// Container represents a single container in the workload.
+type Container struct {
+	// OCI image to run (digest or tag).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Image string `json:"image"`
+
+	// Container entrypoint & args.
+	// +optional
+	Command []string `json:"command,omitempty"`
+	// +optional
+	Args []string `json:"args,omitempty"`
+
+	// Explicit environment variables.
+	// +optional
+	Env []EnvVar `json:"env,omitempty"`
+
+	// File configurations.
+	// +optional
+	Files []FileVar `json:"files,omitempty"`
+}
+
+// EndpointType defines the different API technologies supported by the endpoint
+type EndpointType string
+
+const (
+	EndpointTypeHTTP      EndpointType = "HTTP"
+	EndpointTypeGraphQL   EndpointType = "GraphQL"
+	EndpointTypeWebsocket EndpointType = "Websocket"
+	EndpointTypeGRPC      EndpointType = "gRPC"
+	EndpointTypeTCP       EndpointType = "TCP"
+	EndpointTypeUDP       EndpointType = "UDP"
+)
+
+func (e EndpointType) String() string {
+	return string(e)
+}
+
+// EndpointVisibility defines the visibility scope for an endpoint.
+// It determines which components can access the endpoint and how that access is enforced at runtime.
+// +kubebuilder:validation:Enum=project;namespace;internal;external
+type EndpointVisibility string
+
+const (
+	// EndpointVisibilityProject makes the endpoint accessible only within the same project and environment.
+	EndpointVisibilityProject EndpointVisibility = "project"
+
+	// EndpointVisibilityNamespace makes the endpoint accessible across all projects in the same namespace and environment.
+	EndpointVisibilityNamespace EndpointVisibility = "namespace"
+
+	// EndpointVisibilityInternal makes the endpoint accessible across all namespaces in the deployment (intranet).
+	EndpointVisibilityInternal EndpointVisibility = "internal"
+
+	// EndpointVisibilityExternal makes the endpoint accessible from outside the deployment, including public internet.
+	EndpointVisibilityExternal EndpointVisibility = "external"
+)
+
+// WorkloadEndpoint represents a simple network endpoint for basic exposure.
+type WorkloadEndpoint struct {
+	// Visibility is an array of additional endpoint visibilities beyond the implicit project visibility.
+	// Every endpoint always gets project visibility. This array adds extra scopes.
+	// +optional
+	// +listType=set
+	Visibility []EndpointVisibility `json:"visibility,omitempty"`
+
+	// Type indicates the protocol/technology of the endpoint.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=HTTP;gRPC;GraphQL;Websocket;TCP;UDP
+	Type EndpointType `json:"type"`
+
+	// Port exposed by the endpoint. If targetPort is not set, platform defaults to port for both.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+
+	// TargetPort maps to the container listening port. Optional — defaults to port.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	TargetPort int32 `json:"targetPort,omitempty"`
+
+	// DisplayName is an optional human-readable name for the endpoint.
+	// +optional
+	DisplayName string `json:"displayName,omitempty"`
+
+	// BasePath is the base path of the API exposed via the endpoint.
+	// +optional
+	BasePath string `json:"basePath,omitempty"`
+
+	// Schema for the endpoint API definition.
+	// +optional
+	Schema *Schema `json:"schema,omitempty"`
+}
+
+// Schema defines the API definition for an endpoint.
+type Schema struct {
+	Type    string `json:"type,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+// WorkloadConnection represents a connection to another component's endpoint.
+type WorkloadConnection struct {
+	// Project is the target component's project name.
+	// If empty, defaults to the same project as the consumer.
+	// Required when namespace is specified.
+	// +optional
+	Project string `json:"project,omitempty"`
+
+	// Component is the target component name.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Component string `json:"component"`
+
+	// Name is the target endpoint name on the target component.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Visibility is the visibility level at which this connection consumes the endpoint.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=project;namespace
+	Visibility string `json:"visibility"`
+
+	// EnvBindings maps semantic URL components to environment variable names.
+	// +kubebuilder:validation:Required
+	EnvBindings ConnectionEnvBindings `json:"envBindings"`
+}
+
+// ConnectionEnvBindings defines env var names for resolved connection address components.
+type ConnectionEnvBindings struct {
+	// Address is the env var name for the protocol-appropriate connection string.
+	// For HTTP/HTTPS/WS/WSS: scheme://host:port/basePath
+	// For gRPC/TCP/UDP: host:port
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// Host is the optional env var name for just the hostname.
+	// +optional
+	Host string `json:"host,omitempty"`
+
+	// Port is the optional env var name for just the port number.
+	// +optional
+	Port string `json:"port,omitempty"`
+
+	// BasePath is the optional env var name for just the base path.
+	// +optional
+	BasePath string `json:"basePath,omitempty"`
+}
+
+// WorkloadDependencies defines the dependencies of a workload on other components' endpoints
+// and on project-bound Resources.
+type WorkloadDependencies struct {
+	// Endpoints define how this workload consumes endpoints from other components.
+	// +optional
+	// +kubebuilder:validation:MaxItems=50
+	Endpoints []WorkloadConnection `json:"endpoints,omitempty"`
+
+	// Resources define how this workload consumes outputs from project-bound Resources.
+	// Each entry references a Resource by name and binds named outputs of the resolved
+	// ResourceReleaseBinding to container env vars (envBindings) and file mounts (fileBindings).
+	// +optional
+	// +listType=map
+	// +listMapKey=ref
+	// +kubebuilder:validation:MaxItems=50
+	Resources []WorkloadResourceDependency `json:"resources,omitempty"`
+}
+
+// WorkloadResourceDependency represents a dependency on a project-bound Resource. Output names
+// declared on the referenced ResourceType are wired into the consuming container as env vars
+// (envBindings) and file mounts (fileBindings). Outputs not listed in either map are ignored.
+type WorkloadResourceDependency struct {
+	// Ref is the name of the Resource to consume. The Resource must live in the same project as
+	// the consuming Component (cross-project consumption is deferred to a later release).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Ref string `json:"ref"`
+
+	// EnvBindings maps a ResourceType output name to a container environment variable name.
+	// The output's source kind (value, secretKeyRef, configMapKeyRef) determines whether the
+	// resulting env var is a literal or a valueFrom reference.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=50
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() > 0 && self[k].size() > 0)",message="envBindings keys (output names) and values (env var names) cannot be empty"
+	EnvBindings map[string]string `json:"envBindings,omitempty"`
+
+	// FileBindings maps a ResourceType output name to a container mount path. The referenced
+	// output's source kind must be secretKeyRef or configMapKeyRef; value-kind outputs cannot
+	// be mounted as files because there is no DP-side object to mount.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=50
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.size() > 0 && self[k].size() > 0)",message="fileBindings keys (output names) and values (mount paths) cannot be empty"
+	FileBindings map[string]string `json:"fileBindings,omitempty"`
+}
+
+// WorkloadSource records the VCS commit provenance of the image running in this
+// workload. Populated by the producer alongside the image (native CI's push-workload
+// step, or an external CI calling the API/occ directly) and threaded through to the
+// rendered data-plane resource so Delivery Insights can compute Lead Time for Changes
+// from real deployments. Optional: DF/CFR/MTTR compute without it; Lead Time reports
+// unavailable when absent.
+type WorkloadSource struct {
+	// Commit is the VCS commit SHA the running image was built from. Constrained to
+	// hex so that a tag or branch name passed here is rejected rather than recorded
+	// as a commit -- an easy mistake to make when --source-branch sits next to it,
+	// and one that produces provenance pointing at nothing. A prefix is accepted
+	// because external CI often has only a short SHA; native CI canonicalizes to the
+	// full 40.
+	// +optional
+	// +kubebuilder:validation:MinLength=7
+	// +kubebuilder:validation:MaxLength=40
+	// +kubebuilder:validation:Pattern=`^[0-9a-fA-F]+$`
+	Commit string `json:"commit,omitempty"`
+
+	// Branch is the VCS branch the commit was built from. Absent for a build pinned
+	// to a commit, which is not made from any particular branch. Not pattern-checked:
+	// git ref names permit a wide character set, and rejecting a valid one would
+	// block a deployment for a metadata field.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	Branch string `json:"branch,omitempty"`
+
+	// Repository is the VCS repository URL the commit belongs to. Bounded but not
+	// format-checked, since both https and scp-style SSH forms
+	// (git@host:org/repo.git) are legitimate here.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Repository string `json:"repository,omitempty"`
+
+	// AuthoredAt is when the commit was authored, not when it was committed or
+	// built. This is the timestamp Lead Time for Changes measures from.
+	// +optional
+	AuthoredAt *metav1.Time `json:"authoredAt,omitempty"`
+}
+
+// WorkloadTemplateSpec defines the desired state of Workload.
+type WorkloadTemplateSpec struct {
+	// Container defines the container specification for this workload.
+	// +kubebuilder:validation:Required
+	Container Container `json:"container"`
+
+	// Endpoints define simple network endpoints for basic port exposure.
+	// The key is the endpoint name, and the value is the endpoint specification.
+	// +optional
+	Endpoints map[string]WorkloadEndpoint `json:"endpoints,omitempty"`
+
+	// Dependencies define the dependencies of this workload on other components.
+	// +optional
+	Dependencies *WorkloadDependencies `json:"dependencies,omitempty"`
+
+	// Source records the commit provenance of the image in Container, for Delivery
+	// Insights' Lead Time for Changes metric.
+	// +optional
+	Source *WorkloadSource `json:"source,omitempty"`
+}
+
+// GetDependencyEndpoints returns the endpoint connections from dependencies, or nil if none.
+func (w *WorkloadTemplateSpec) GetDependencyEndpoints() []WorkloadConnection {
+	if w.Dependencies == nil {
+		return nil
+	}
+	return w.Dependencies.Endpoints
+}
+
+// GetDependencyResources returns the resource dependencies, or nil if none.
+func (w *WorkloadTemplateSpec) GetDependencyResources() []WorkloadResourceDependency {
+	if w.Dependencies == nil {
+		return nil
+	}
+	return w.Dependencies.Resources
+}
+
+type WorkloadOwner struct {
+	// +kubebuilder:validation:MinLength=1
+	ProjectName string `json:"projectName"`
+	// +kubebuilder:validation:MinLength=1
+	ComponentName string `json:"componentName"`
+}
+
+type WorkloadSpec struct {
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.owner is immutable"
+	Owner WorkloadOwner `json:"owner"`
+
+	// Inline *all* the template fields so they appear at top level.
+	WorkloadTemplateSpec `json:",inline"`
+}
+
+// WorkloadType defines how the workload is deployed.
+type WorkloadType string
+
+const (
+	WorkloadTypeService        WorkloadType = "Service"
+	WorkloadTypeManualTask     WorkloadType = "ManualTask"
+	WorkloadTypeScheduledTask  WorkloadType = "ScheduledTask"
+	WorkloadTypeWebApplication WorkloadType = "WebApplication"
+)
+
+// WorkloadStatus defines the observed state of Workload.
+type WorkloadStatus struct {
+	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
+	// Important: Run "make" to regenerate code after modifying this file
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Project",type=string,JSONPath=`.spec.owner.projectName`
+// +kubebuilder:printcolumn:name="Component",type=string,JSONPath=`.spec.owner.componentName`
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+
+// Workload is the Schema for the workloads API.
+type Workload struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   WorkloadSpec   `json:"spec,omitempty"`
+	Status WorkloadStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// WorkloadList contains a list of Workload.
+type WorkloadList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []Workload `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&Workload{}, &WorkloadList{})
+}

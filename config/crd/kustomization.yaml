@@ -1,0 +1,60 @@
+# This kustomization.yaml is not intended to be run by itself,
+# since it depends on service name and namespace that are out of this kustomize package.
+# It should be run by config/default
+resources:
+  - bases/openchoreo.dev_projects.yaml
+  - bases/openchoreo.dev_environments.yaml
+  - bases/openchoreo.dev_dataplanes.yaml
+  - bases/openchoreo.dev_deploymentpipelines.yaml
+  - bases/openchoreo.dev_components.yaml
+  - bases/openchoreo.dev_componenttypes.yaml
+  - bases/openchoreo.dev_resources.yaml
+  - bases/openchoreo.dev_resourcetypes.yaml
+  - bases/openchoreo.dev_traits.yaml
+
+
+  - bases/openchoreo.dev_workloads.yaml
+
+  - bases/openchoreo.dev_renderedreleases.yaml
+
+  - bases/openchoreo.dev_workflowplanes.yaml
+  - bases/openchoreo.dev_workflows.yaml
+  - bases/openchoreo.dev_workflowruns.yaml
+  - bases/openchoreo.dev_secretreferences.yaml
+  - bases/openchoreo.dev_componentreleases.yaml
+  - bases/openchoreo.dev_resourcereleases.yaml
+  - bases/openchoreo.dev_releasebindings.yaml
+  - bases/openchoreo.dev_resourcereleasebindings.yaml
+  - bases/openchoreo.dev_observabilityplanes.yaml
+  - bases/openchoreo.dev_observabilityalertsnotificationchannels.yaml
+  - bases/openchoreo.dev_observabilityalertrules.yaml
+  - bases/openchoreo.dev_authzroles.yaml
+  - bases/openchoreo.dev_authzrolebindings.yaml
+  - bases/openchoreo.dev_clusterauthzroles.yaml
+  - bases/openchoreo.dev_clusterauthzrolebindings.yaml
+  - bases/openchoreo.dev_clusterworkflowplanes.yaml
+  - bases/openchoreo.dev_clusterdataplanes.yaml
+  - bases/openchoreo.dev_clusterobservabilityplanes.yaml
+  - bases/openchoreo.dev_clustercomponenttypes.yaml
+  - bases/openchoreo.dev_clusterresourcetypes.yaml
+  - bases/openchoreo.dev_clustertraits.yaml
+  - bases/openchoreo.dev_clusterworkflows.yaml
+  - bases/openchoreo.dev_projecttypes.yaml
+  - bases/openchoreo.dev_clusterprojecttypes.yaml
+  - bases/openchoreo.dev_projectreleases.yaml
+  - bases/openchoreo.dev_projectreleasebindings.yaml
+# +kubebuilder:scaffold:crdkustomizeresource
+
+# patches:
+# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix.
+# patches here are for enabling the conversion webhook for each CRD
+# +kubebuilder:scaffold:crdkustomizewebhookpatch
+
+# [CERTMANAGER] To enable cert-manager, uncomment all the sections with [CERTMANAGER] prefix.
+# patches here are for enabling the CA injection for each CRD
+# +kubebuilder:scaffold:crdkustomizecainjectionpatch
+
+# [WEBHOOK] To enable webhook, uncomment the following section
+# the following config is for teaching kustomize how to do kustomization for CRDs.
+#configurations:
+#- kustomizeconfig.yaml

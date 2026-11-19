@@ -1,0 +1,902 @@
+# yaml-language-server: $schema=values.schema.json
+
+# @schema.root
+# title: OpenChoreo Data Plane
+# description: Helm values for the OpenChoreo data plane chart. Deploys runtime infrastructure including API gateway, observability, and control plane connectivity.
+# @schema.root
+
+# @schema
+# type: object
+# description: Global values shared across all components in the data plane
+# additionalProperties: false
+# @schema
+global:
+  # @schema
+  # type: object
+  # description: Common labels applied to all resources deployed by this chart
+  # additionalProperties:
+  #   type: string
+  # default: {}
+  # @schema
+  commonLabels: {}
+
+  # @schema
+  # type: string
+  # description: Registry override for all first-party container images. When set, it replaces the registry host of each image repository. May include a path (e.g. registry.example.com/ghcr.io) for path-preserving mirrors. Empty uses each image's default registry.
+  # default: ""
+  # @schema
+  imageRegistry: ""
+
+  # @schema
+  # type: array
+  # description: Image pull secrets applied to all first-party pods, for pulling images from authenticated private registries. Entries are LocalObjectReferences (name only).
+  # items:
+  #   type: object
+  # default: []
+  # @schema
+  imagePullSecrets: []
+
+# @schema
+# type: string
+# description: Kubernetes cluster DNS domain used for service discovery and certificate generation
+# default: cluster.local
+# @schema
+kubernetesClusterDomain: cluster.local
+
+# @schema
+# type: object
+# additionalProperties: true
+# description: KGateway API gateway configuration. Provides HTTP/HTTPS traffic routing using Kubernetes Gateway API and Envoy proxy.
+# @schema
+gateway:
+  # @schema
+  # type: boolean
+  # description: Enable Gateway CR creation
+  # default: true
+  # @schema
+  enabled: true
+
+  # @schema
+  # type: string
+  # description: GatewayClass name to reference in the Gateway CR
+  # default: "kgateway"
+  # @schema
+  gatewayClassName: "kgateway"
+
+  # @schema
+  # type: object
+  # additionalProperties: true
+  # description: |
+  #   Gateway infrastructure configuration passed to the generated Service.
+  #   Used to configure cloud provider load balancer settings via annotations.
+  #   Example for AWS with Elastic IP:
+  #     infrastructure:
+  #       annotations:
+  #         service.beta.kubernetes.io/aws-load-balancer-type: "external"
+  #         service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+  #         service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+  #         service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "eipalloc-xxx"
+  #
+  #   The chart always renders spec.infrastructure so platform identity labels
+  #   reach the kgateway proxy pods. That field needs Gateway API >= v1.2 - on
+  #   older CRDs it is pruned and the proxy pods lose plane attribution.
+  #   labels is capped at 8 entries by Gateway API, platform identity included.
+  # @schema
+  infrastructure:
+    # @schema
+    # type: object
+    # properties: {}
+    # additionalProperties:
+    #   type: string
+    # default: {"openchoreo.dev/system-component": "gateway"}
+    # @schema
+    labels:
+      openchoreo.dev/system-component: gateway
+
+  # @schema
+  # type: object
+  # description: Annotations added to the Gateway resource. Use this to configure cert-manager, external-dns, or other integrations.
+  # additionalProperties:
+  #   type: string
+  # default: {}
+  # @schema
+  annotations: {}
+
+  # @schema
+  # type: integer
+  # description: Port for the HTTP listener on the gateway
+  # default: 80
+  # minimum: 1
+  # maximum: 65535
+  # @schema
+  httpPort: 80
+
+  # @schema
+  # type: integer
+  # description: Port for the HTTPS listener on the gateway
+  # default: 443
+  # minimum: 1
+  # maximum: 65535
+  # @schema
+  httpsPort: 443
+
+  # @schema
+  # type: object
+  # description: TLS configuration for the HTTPS listener
+  # @schema
+  tls:
+    # @schema
+    # type: boolean
+    # description: Enable HTTPS listener on the gateway. When false, only the HTTP listener is created.
+    # default: true
+    # @schema
+    enabled: true
+
+    # @schema
+    # type: string
+    # description: Hostname pattern for the HTTPS listener (SNI matching)
+    # default: "*.openchoreoapis.invalid"
+    # @schema
+    hostname: "*.openchoreoapis.invalid"
+
+    # @schema
+    # type: array
+    # description: TLS certificate references for the HTTPS listener. Each entry references a Secret containing the TLS cert/key pair.
+    # items:
+    #   type: object
+    #   properties:
+    #     name:
+    #       type: string
+    #       description: Secret name containing the TLS certificate
+    # @schema
+    certificateRefs: []
+
+  # @schema
+  # type: object
+  # description: |
+  #   TLS passthrough (SNI) configuration. Adds a Gateway listener (protocol TLS, mode Passthrough)
+  #   that routes encrypted traffic by SNI without terminating TLS; the workload terminates TLS itself.
+  #   Required by TLSRoute-based ComponentTypes such as the component-tls-service sample.
+  # @schema
+  tlsPassthrough:
+    # @schema
+    # type: boolean
+    # description: Enable the TLS passthrough listener. When false, no passthrough listener is created.
+    # default: false
+    # @schema
+    enabled: false
+
+    # @schema
+    # type: string
+    # description: |
+    #   Hostname pattern for the TLS passthrough listener (SNI matching). When empty, the listener
+    #   matches all SNIs. Must encompass the TLSRoute hostnames (e.g. "*.openchoreoapis.invalid").
+    # default: "*.openchoreoapis.invalid"
+    # @schema
+    hostname: "*.openchoreoapis.invalid"
+
+    # @schema
+    # type: integer
+    # description: Port for the TLS passthrough listener. Must differ from httpsPort when the HTTPS (Terminate) listener is also enabled.
+    # default: 8443
+    # minimum: 1
+    # maximum: 65535
+    # @schema
+    port: 8443
+
+  # @schema
+  # type: object
+  # additionalProperties: true
+  # description: KGateway controller configuration for managing Gateway API resources
+  # @schema
+  controller:
+    # @schema
+    # type: integer
+    # description: Number of gateway controller replicas
+    # default: 1
+    # minimum: 1
+    # @schema
+    replicaCount: 1
+
+    # @schema
+    # description: Log level for the gateway controller
+    # enum: [trace, debug, info, warn, error]
+    # default: info
+    # @schema
+    logLevel: info
+
+    # @schema
+    # type: object
+    # additionalProperties: true
+    # description: Container image configuration for the gateway controller
+    # @schema
+    image:
+      # @schema
+      # type: string
+      # description: Container registry for the controller image. Empty uses default registry.
+      # default: ""
+      # @schema
+      registry: ""
+
+      # @schema
+      # type: string
+      # description: Image repository name for the gateway controller
+      # default: kgateway
+      # @schema
+      repository: kgateway
+
+      # @schema
+      # description: Image pull policy for the controller container
+      # enum: [Always, IfNotPresent, Never]
+      # default: IfNotPresent
+      # @schema
+      pullPolicy: IfNotPresent
+
+      # @schema
+      # type: string
+      # description: Image tag. Empty uses Chart.AppVersion.
+      # default: ""
+      # @schema
+      tag: ""
+
+    # @schema
+    # type: object
+    # additionalProperties: true
+    # description: Kubernetes service configuration for the gateway controller
+    # @schema
+    service:
+      # @schema
+      # description: Service type for the gateway controller
+      # enum: [ClusterIP, NodePort, LoadBalancer]
+      # default: ClusterIP
+      # @schema
+      type: ClusterIP
+
+      # @schema
+      # type: object
+      # additionalProperties: true
+      # description: Service port mappings for the gateway controller
+      # @schema
+      ports:
+        # @schema
+        # type: integer
+        # description: gRPC port for xDS communication
+        # default: 9977
+        # @schema
+        grpc: 9977
+
+        # @schema
+        # type: integer
+        # description: Agent gateway gRPC port
+        # default: 9978
+        # @schema
+        agwGrpc: 9978
+
+        # @schema
+        # type: integer
+        # description: Health check endpoint port
+        # default: 9093
+        # @schema
+        health: 9093
+
+        # @schema
+        # type: integer
+        # description: Metrics endpoint port
+        # default: 9092
+        # @schema
+        metrics: 9092
+
+    # @schema
+    # type: object
+    # additionalProperties: true
+    # description: Resource limits and requests for the gateway controller
+    # @schema
+    resources:
+      # @schema
+      # type: object
+      # additionalProperties: true
+      # description: Maximum resources the controller can consume
+      # @schema
+      limits:
+        # @schema
+        # type: string
+        # description: CPU limit for the controller
+        # default: 200m
+        # @schema
+        cpu: 200m
+        # @schema
+        # type: string
+        # description: Memory limit for the controller
+        # default: 256Mi
+        # @schema
+        memory: 256Mi
+      # @schema
+      # type: object
+      # additionalProperties: true
+      # description: Minimum resources guaranteed for the controller
+      # @schema
+      requests:
+        # @schema
+        # type: string
+        # description: CPU request for the controller
+        # default: 100m
+        # @schema
+        cpu: 100m
+        # @schema
+        # type: string
+        # description: Memory request for the controller
+        # default: 128Mi
+        # @schema
+        memory: 128Mi
+
+  # @schema
+  # type: object
+  # additionalProperties: true
+  # description: Agent Gateway configuration for MCP server and REST API connectivity
+  # @schema
+  agentgateway:
+    # @schema
+    # type: boolean
+    # description: Enable Agent Gateway for AI agent connectivity
+    # default: false
+    # @schema
+    enabled: false
+
+# @schema
+# type: object
+# description: Network configuration for the data plane
+# @schema
+networking:
+  # @schema
+  # type: boolean
+  # description: Enable networking features (network policies, service mesh integration)
+  # default: true
+  # @schema
+  enabled: true
+
+# @schema
+# type: object
+# description: Security configuration for the data plane
+# @schema
+security:
+  # @schema
+  # type: boolean
+  # description: Enable security features (certificate issuers, TLS configuration)
+  # default: true
+  # @schema
+  enabled: true
+
+# @schema
+# type: object
+# additionalProperties: true
+# description: Cluster Agent configuration for WebSocket connection to control plane cluster gateway
+# @schema
+clusterAgent:
+  # @schema
+  # type: string
+  # description: Name of the cluster agent deployment
+  # default: cluster-agent-dataplane
+  # @schema
+  name: cluster-agent-dataplane
+
+  # @schema
+  # type: integer
+  # description: Number of cluster agent replicas (typically 1 per data plane)
+  # default: 1
+  # minimum: 0
+  # @schema
+  replicas: 1
+
+  # @schema
+  # type: object
+  # description: Container image configuration for cluster agent
+  # @schema
+  image:
+    # @schema
+    # type: string
+    # description: Cluster agent image repository
+    # default: cr.openchoreo.dev/openchoreo/cluster-agent
+    # @schema
+    repository: cr.openchoreo.dev/openchoreo/cluster-agent
+
+    # @schema
+    # type: string
+    # description: Image tag. Empty uses Chart.AppVersion.
+    # default: ""
+    # @schema
+    tag: ""
+
+    # @schema
+    # description: Image pull policy
+    # enum: [Always, IfNotPresent, Never]
+    # default: IfNotPresent
+    # @schema
+    pullPolicy: IfNotPresent
+
+  # @schema
+  # type: string
+  # description: WebSocket URL of the cluster gateway in control plane
+  # default: wss://cluster-gateway.openchoreo-control-plane.svc.cluster.local:8443/ws
+  # @schema
+  serverUrl: wss://cluster-gateway.openchoreo-control-plane.svc.cluster.local:8443/ws
+
+  # @schema
+  # type: string
+  # description: |
+  #   Logical plane identifier shared across multiple CRs connecting to the same physical plane.
+  #   Ships as the literal "default"; falls back to Helm release name if set as "". Rendered as
+  #   the openchoreo.dev/plane-id pod label, so it must be a valid Kubernetes label value.
+  # default: default
+  # pattern: "^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$"
+  # maxLength: 63
+  # @schema
+  planeID: default
+
+  # @schema
+  # description: Type of plane this agent manages
+  # enum: [dataplane, workflowplane, observabilityplane]
+  # default: dataplane
+  # @schema
+  planeType: dataplane
+
+  # @schema
+  # type: string
+  # description: Interval between heartbeat messages to control plane
+  # default: 30s
+  # @schema
+  heartbeatInterval: 30s
+
+  # @schema
+  # type: string
+  # description: Delay before attempting reconnection after disconnect
+  # default: 5s
+  # @schema
+  reconnectDelay: 5s
+
+  # @schema
+  # description: Log level for cluster agent
+  # enum: [trace, debug, info, warn, error]
+  # default: info
+  # @schema
+  logLevel: info
+
+  # @schema
+  # type: array
+  # description: Additional environment variables to set in the cluster agent container. Each entry must specify exactly one of 'value' (literal) or 'valueFrom.secretKeyRef' (reference to an existing Kubernetes Secret).
+  # items:
+  #   type: object
+  #   additionalProperties: false
+  #   required:
+  #     - name
+  #   oneOf:
+  #     - required: [name, value]
+  #     - required: [name, valueFrom]
+  #   properties:
+  #     name:
+  #       type: string
+  #       description: Name of the environment variable
+  #     value:
+  #       type: string
+  #       description: Literal value of the environment variable. Avoid for secret material; use valueFrom.secretKeyRef instead.
+  #     valueFrom:
+  #       type: object
+  #       additionalProperties: false
+  #       description: Source the value from an existing Kubernetes resource. Currently only secretKeyRef is supported.
+  #       required: [secretKeyRef]
+  #       properties:
+  #         secretKeyRef:
+  #           type: object
+  #           additionalProperties: false
+  #           description: Reference to a key in an existing Kubernetes Secret.
+  #           required: [name, key]
+  #           properties:
+  #             name:
+  #               type: string
+  #               description: Name of the Secret (must exist in the cluster-agent's namespace).
+  #             key:
+  #               type: string
+  #               description: Key within the Secret whose value to inject.
+  # default: []
+  # @schema
+  extraEnvs: []
+
+  # @schema
+  # type: object
+  # description: Resource limits and requests for cluster agent
+  # @schema
+  resources:
+    # @schema
+    # type: object
+    # description: Minimum resources guaranteed for the agent
+    # @schema
+    requests:
+      # @schema
+      # type: string
+      # description: CPU request for the agent
+      # default: "50m"
+      # @schema
+      cpu: "50m"
+      # @schema
+      # type: string
+      # description: Memory request for the agent
+      # default: "128Mi"
+      # @schema
+      memory: "128Mi"
+    # @schema
+    # type: object
+    # description: Maximum resources the agent can consume
+    # @schema
+    limits:
+      # @schema
+      # type: string
+      # description: CPU limit for the agent
+      # default: "100m"
+      # @schema
+      cpu: "100m"
+      # @schema
+      # type: string
+      # description: Memory limit for the agent
+      # default: "256Mi"
+      # @schema
+      memory: "256Mi"
+
+  # @schema
+  # type: object
+  # description: Pod Disruption Budget configuration for cluster agent
+  # @schema
+  podDisruptionBudget:
+    # @schema
+    # type: boolean
+    # description: Enable PodDisruptionBudget for cluster agent
+    # default: false
+    # @schema
+    enabled: false
+    # @schema
+    # type: integer
+    # description: Minimum number of pods that must be available
+    # minimum: 0
+    # default: 1
+    # @schema
+    minAvailable: 1
+    # @schema
+    # type: [integer, "null"]
+    # description: Maximum number of pods that can be unavailable
+    # minimum: 0
+    # @schema
+    maxUnavailable: null
+
+  # @schema
+  # type: object
+  # description: Service account configuration for cluster agent
+  # @schema
+  serviceAccount:
+    # @schema
+    # type: boolean
+    # description: Create a service account for the cluster agent
+    # default: true
+    # @schema
+    create: true
+
+    # @schema
+    # type: string
+    # description: Service account name
+    # default: cluster-agent-dataplane
+    # @schema
+    name: cluster-agent-dataplane
+
+    # @schema
+    # type: object
+    # description: Annotations to add to the service account
+    # additionalProperties:
+    #   type: string
+    # default: {}
+    # @schema
+    annotations: {}
+
+  # @schema
+  # type: object
+  # description: RBAC configuration for cluster agent
+  # @schema
+  rbac:
+    # @schema
+    # type: boolean
+    # description: Create RBAC resources (ClusterRole, ClusterRoleBinding)
+    # default: true
+    # @schema
+    create: true
+
+  # @schema
+  # type: object
+  # description: Priority class configuration for cluster agent pods
+  # @schema
+  priorityClass:
+    # @schema
+    # type: boolean
+    # description: Create a PriorityClass for cluster agent
+    # default: false
+    # @schema
+    create: false
+
+    # @schema
+    # type: string
+    # description: PriorityClass name
+    # default: cluster-agent-dataplane
+    # @schema
+    name: cluster-agent-dataplane
+
+    # @schema
+    # type: integer
+    # description: Priority value (higher = more important)
+    # default: 900000
+    # @schema
+    value: 900000
+
+  # @schema
+  # type: object
+  # description: TLS configuration for secure agent-gateway communication
+  # @schema
+  tls:
+    # @schema
+    # type: boolean
+    # description: Enable TLS for agent-gateway communication
+    # default: true
+    # @schema
+    enabled: true
+
+    # @schema
+    # type: boolean
+    # description: Generate client certificates locally using cert-manager with a self-signed CA
+    # default: true
+    # @schema
+    generateCerts: true
+
+    # @schema
+    # type: string
+    # description: Secret name for client certificate and key
+    # default: cluster-agent-tls
+    # @schema
+    secretName: cluster-agent-tls
+
+    # @schema
+    # type: string
+    # description: Secret name for client certificate (typically same as secretName)
+    # default: cluster-agent-tls
+    # @schema
+    clientSecretName: cluster-agent-tls
+
+    # @schema
+    # type: string
+    # description: ConfigMap name containing server CA certificate for verifying gateway
+    # default: cluster-gateway-ca
+    # @schema
+    serverCAConfigMap: cluster-gateway-ca
+
+    # @schema
+    # type: string
+    # description: CA secret name for signing agent client certificates. If empty, self-signed certs will be generated (required for multi-cluster setup).
+    # default: cluster-gateway-ca
+    # @schema
+    caSecretName: cluster-gateway-ca
+
+    # @schema
+    # type: string
+    # description: Certificate validity duration
+    # default: 2160h
+    # @schema
+    duration: 2160h
+
+    # @schema
+    # type: string
+    # description: Time before expiry to renew certificate
+    # default: 360h
+    # @schema
+    renewBefore: 360h
+
+  # @schema
+  # type: object
+  # description: Pod-level security context
+  # @schema
+  podSecurityContext:
+    # @schema
+    # type: boolean
+    # description: Run container as non-root user
+    # default: true
+    # @schema
+    runAsNonRoot: true
+
+    # @schema
+    # type: integer
+    # description: User ID to run container as
+    # default: 1000
+    # @schema
+    runAsUser: 1000
+
+    # @schema
+    # type: integer
+    # description: Group ID for volume mounts
+    # default: 1000
+    # @schema
+    fsGroup: 1000
+
+  # @schema
+  # type: object
+  # description: Container-level security context
+  # @schema
+  securityContext:
+    # @schema
+    # type: boolean
+    # description: Prevent privilege escalation
+    # default: false
+    # @schema
+    allowPrivilegeEscalation: false
+
+    # @schema
+    # type: object
+    # description: Linux capabilities configuration
+    # @schema
+    capabilities:
+      # @schema
+      # type: array
+      # description: Capabilities to drop from container
+      # items:
+      #   type: string
+      # default: [ALL]
+      # @schema
+      drop:
+        - ALL
+
+    # @schema
+    # type: boolean
+    # description: Mount root filesystem as read-only
+    # default: true
+    # @schema
+    readOnlyRootFilesystem: true
+
+  # @schema
+  # type: object
+  # description: Annotations to add to cluster agent pods
+  # additionalProperties:
+  #   type: string
+  # default: {}
+  # @schema
+  podAnnotations: {}
+
+  # @schema
+  # type: object
+  # description: Node selector for pod scheduling
+  # additionalProperties:
+  #   type: string
+  # default: {}
+  # @schema
+  nodeSelector: {}
+
+  # @schema
+  # type: array
+  # description: Tolerations for pod scheduling
+  # items:
+  #   type: object
+  #   properties:
+  #     key:
+  #       type: string
+  #     operator:
+  #       enum: [Exists, Equal]
+  #     value:
+  #       type: string
+  #     effect:
+  #       enum: [NoSchedule, PreferNoSchedule, NoExecute]
+  # default: []
+  # @schema
+  tolerations: []
+
+  # @schema
+  # type: object
+  # additionalProperties: true
+  # description: Affinity rules for pod scheduling
+  # default: {}
+  # @schema
+  affinity: {}
+
+  # @schema
+  # type: array
+  # description: Topology spread constraints for pod distribution across failure domains
+  # items:
+  #   type: object
+  # default: []
+  # @schema
+  topologySpreadConstraints: []
+
+# @schema
+# type: object
+# description: |
+#   remote-connect SNI router: a single per-data-plane L4 entrypoint for `occ remote`.
+#   It SNI-routes each occ tunnel to the matching per-project+env remote-agent
+#   (TLS terminates at the agent, not here). One exposed port for all agents.
+# @schema
+remoteAgentRouter:
+  # @schema
+  # type: boolean
+  # description: Enable the shared remote-connect SNI router.
+  # default: false
+  # @schema
+  enabled: false
+  # @schema
+  # description: Container image configuration for the remote-connect SNI router
+  # @schema
+  image:
+    # @schema
+    # type: string
+    # description: Remote-connect SNI router image repository
+    # default: cr.openchoreo.dev/openchoreo/remote-agent-router
+    # @schema
+    repository: cr.openchoreo.dev/openchoreo/remote-agent-router
+
+    # @schema
+    # type: string
+    # description: Image tag. Empty uses Chart.AppVersion.
+    # default: ""
+    # @schema
+    tag: ""
+
+    # @schema
+    # type: string
+    # description: Image pull policy for the router container.
+    # default: IfNotPresent
+    # @schema
+    pullPolicy: IfNotPresent
+  # @schema
+  # type: string
+  # description: "Router log level: debug, info, warn, error."
+  # default: info
+  # @schema
+  logLevel: info
+  # @schema
+  # description: Resource requests and limits for the router container
+  # @schema
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  # @schema
+  # description: Container security context for the router
+  # @schema
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+  # @schema
+  # description: Pod security context for the router
+  # @schema
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  # @schema
+  # type: integer
+  # description: L4 port the router listens on (occ dials this via the Service below).
+  # default: 8443
+  # @schema
+  listenPort: 8443
+  # @schema
+  # type: object
+  # description: Service exposing the router as the single per-data-plane entrypoint.
+  # @schema
+  service:
+    # @schema
+    # type: string
+    # description: LoadBalancer for cloud (one internal LB), NodePort for k3d/bare-metal.
+    # default: LoadBalancer
+    # @schema
+    type: LoadBalancer
+    # @schema
+    # type: integer
+    # description: |
+    #   Fixed nodePort when type is NodePort (must match the k3d host port mapping and
+    #   openchoreoApi.config.remoteConnect.entrypointAddress). Ignored for LoadBalancer.
+    # default: 30443
+    # @schema
+    nodePort: 30443

@@ -1,0 +1,586 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	authzcore "github.com/openchoreo/openchoreo/internal/authz/core"
+	coremocks "github.com/openchoreo/openchoreo/internal/authz/core/mocks"
+	"github.com/openchoreo/openchoreo/internal/observer/api/gen"
+	observerAuthz "github.com/openchoreo/openchoreo/internal/observer/authz"
+	"github.com/openchoreo/openchoreo/internal/observer/labels"
+	"github.com/openchoreo/openchoreo/internal/observer/service/mocks"
+	"github.com/openchoreo/openchoreo/internal/observer/store/incidententry"
+	"github.com/openchoreo/openchoreo/internal/observer/types"
+	"github.com/openchoreo/openchoreo/internal/server/middleware/auth"
+)
+
+// authedCtx returns a context with a valid SubjectContext set.
+func authedCtx() context.Context {
+	return auth.SetSubjectContext(context.Background(), &auth.SubjectContext{
+		ID:   "test-user",
+		Type: "user",
+	})
+}
+
+// mockPDPAllow creates a PDP mock that allows the request exactly once.
+func mockPDPAllow(t *testing.T) *coremocks.MockPDP {
+	pdp := coremocks.NewMockPDP(t)
+	pdp.EXPECT().Evaluate(mock.Anything, mock.Anything).Return(&authzcore.Decision{Decision: true}, nil).Once()
+	return pdp
+}
+
+// mockPDPDeny creates a PDP mock that denies the request exactly once.
+func mockPDPDeny(t *testing.T) *coremocks.MockPDP {
+	pdp := coremocks.NewMockPDP(t)
+	pdp.EXPECT().Evaluate(mock.Anything, mock.Anything).Return(&authzcore.Decision{Decision: false}, nil).Once()
+	return pdp
+}
+
+// --- AlertIncidentService Authz Tests ---
+
+func TestAlertIncidentAuthz_QueryAlerts_NilPDP(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+	expected := &gen.AlertsQueryResponse{}
+	inner.EXPECT().QueryAlerts(mock.Anything, mock.Anything).Return(expected, nil)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, nil, testLogger())
+	req := gen.AlertsQueryRequest{SearchScope: gen.ComponentSearchScope{Namespace: "ns"}}
+
+	resp, err := svc.QueryAlerts(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestAlertIncidentAuthz_QueryAlerts_Allowed(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+	expected := &gen.AlertsQueryResponse{}
+	inner.EXPECT().QueryAlerts(mock.Anything, mock.Anything).Return(expected, nil)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, mockPDPAllow(t), testLogger())
+	req := gen.AlertsQueryRequest{SearchScope: gen.ComponentSearchScope{Namespace: "ns"}}
+
+	resp, err := svc.QueryAlerts(authedCtx(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestAlertIncidentAuthz_QueryAlerts_Denied(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := gen.AlertsQueryRequest{SearchScope: gen.ComponentSearchScope{Namespace: "ns"}}
+
+	_, err := svc.QueryAlerts(authedCtx(), req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+func TestAlertIncidentAuthz_QueryIncidents_NilPDP(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+	expected := &gen.IncidentsQueryResponse{}
+	inner.EXPECT().QueryIncidents(mock.Anything, mock.Anything).Return(expected, nil)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, nil, testLogger())
+	req := gen.IncidentsQueryRequest{SearchScope: gen.ComponentSearchScope{Namespace: "ns"}}
+
+	resp, err := svc.QueryIncidents(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestAlertIncidentAuthz_QueryIncidents_Denied(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := gen.IncidentsQueryRequest{SearchScope: gen.ComponentSearchScope{Namespace: "ns"}}
+
+	_, err := svc.QueryIncidents(authedCtx(), req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+func TestAlertIncidentAuthz_UpdateIncident_NilPDP(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+	expected := &gen.IncidentPutResponse{}
+	inner.EXPECT().IncidentScope(mock.Anything, "inc-1").Return("ns", "proj", "comp", nil)
+	inner.EXPECT().UpdateIncident(mock.Anything, "inc-1", mock.Anything).Return(expected, nil)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, nil, testLogger())
+
+	resp, err := svc.UpdateIncident(context.Background(), "inc-1", gen.IncidentPutRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestAlertIncidentAuthz_UpdateIncident_Denied(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+	inner.EXPECT().IncidentScope(mock.Anything, "inc-1").Return("ns", "proj", "comp", nil)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+
+	_, err := svc.UpdateIncident(authedCtx(), "inc-1", gen.IncidentPutRequest{})
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+// TestAlertIncidentAuthz_UpdateIncident_AuthorizesOnIncidentHierarchy guards
+// against authorizing UpdateIncident with an empty ResourceHierarchy{}, which
+// resourceHierarchyToPath renders as the "*" wildcard — under prefix matching
+// only a policy whose own resource is "*" matches that, silently denying
+// namespace- and project-scoped incidents:update grants.
+//
+// Asserting on the EvaluateRequest is what catches a regression to the
+// scope-free form — the call still succeeds either way, so nothing else would.
+func TestAlertIncidentAuthz_UpdateIncident_AuthorizesOnIncidentHierarchy(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+	inner.EXPECT().IncidentScope(mock.Anything, "inc-1").Return("ns-a", "proj-b", "comp-c", nil)
+	inner.EXPECT().UpdateIncident(mock.Anything, "inc-1", mock.Anything).
+		Return(&gen.IncidentPutResponse{}, nil)
+
+	pdp := coremocks.NewMockPDP(t)
+	var got *authzcore.EvaluateRequest
+	pdp.EXPECT().Evaluate(mock.Anything, mock.Anything).
+		Run(func(_ context.Context, req *authzcore.EvaluateRequest) { got = req }).
+		Return(&authzcore.Decision{Decision: true}, nil)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, pdp, testLogger())
+	_, err := svc.UpdateIncident(authedCtx(), "inc-1", gen.IncidentPutRequest{})
+	require.NoError(t, err)
+
+	require.NotNil(t, got)
+	assert.Equal(t, string(observerAuthz.ActionUpdateIncidents), got.Action)
+	assert.Equal(t, authzcore.ResourceHierarchy{
+		Namespace: "ns-a", Project: "proj-b", Component: "comp-c",
+	}, got.Resource.Hierarchy, "the check must name the incident's own hierarchy, not an empty one")
+	assert.Equal(t, "comp-c", got.Resource.ID)
+}
+
+// TestAlertIncidentAuthz_UpdateIncident_ScopeLookupFails covers the pre-authz
+// read failing. The PDP mock carries no expectations, so mockery fails the
+// test if it is consulted at all — the update must not be authorized against
+// a hierarchy that could not be established, nor run.
+func TestAlertIncidentAuthz_UpdateIncident_ScopeLookupFails(t *testing.T) {
+	inner := mocks.NewMockAlertIncidentService(t)
+	inner.EXPECT().IncidentScope(mock.Anything, "inc-1").
+		Return("", "", "", incidententry.ErrIncidentNotFound)
+
+	svc := NewAlertIncidentServiceWithAuthz(inner, coremocks.NewMockPDP(t), testLogger())
+
+	_, err := svc.UpdateIncident(authedCtx(), "inc-1", gen.IncidentPutRequest{})
+	assert.ErrorIs(t, err, incidententry.ErrIncidentNotFound)
+}
+
+// --- LogsQuerier Authz Tests ---
+
+func TestLogsAuthz_QueryLogs_NilPDP(t *testing.T) {
+	inner := mocks.NewMockLogsQuerier(t)
+	expected := &types.LogsQueryResponse{}
+	inner.EXPECT().QueryLogs(mock.Anything, mock.Anything).Return(expected, nil)
+
+	svc := NewLogsServiceWithAuthz(inner, nil, testLogger())
+	req := &types.LogsQueryRequest{
+		SearchScope: &types.SearchScope{
+			Component: &types.ComponentSearchScope{
+				Namespace: "ns",
+				Project:   "proj",
+				Component: "comp",
+			},
+		},
+	}
+
+	resp, err := svc.QueryLogs(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestLogsAuthz_QueryLogs_Denied(t *testing.T) {
+	inner := mocks.NewMockLogsQuerier(t)
+
+	svc := NewLogsServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := &types.LogsQueryRequest{
+		SearchScope: &types.SearchScope{
+			Component: &types.ComponentSearchScope{
+				Namespace: "ns",
+				Project:   "proj",
+				Component: "comp",
+			},
+		},
+	}
+
+	_, err := svc.QueryLogs(authedCtx(), req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+func TestLogsAuthz_QueryLogs_NilRequest(t *testing.T) {
+	inner := mocks.NewMockLogsQuerier(t)
+
+	// PDP with no expectation — nil request fails before auth check
+	pdp := coremocks.NewMockPDP(t)
+	svc := NewLogsServiceWithAuthz(inner, pdp, testLogger())
+
+	_, err := svc.QueryLogs(authedCtx(), nil)
+	assert.Error(t, err)
+}
+
+// --- MetricsQuerier Authz Tests ---
+
+func TestMetricsAuthz_QueryMetrics_NilPDP(t *testing.T) {
+	inner := mocks.NewMockMetricsQuerier(t)
+	inner.EXPECT().QueryMetrics(mock.Anything, mock.Anything).Return("result", nil)
+
+	svc := NewMetricsServiceWithAuthz(inner, nil, testLogger())
+	req := &types.MetricsQueryRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace: "ns",
+			Project:   "proj",
+			Component: "comp",
+		},
+	}
+
+	resp, err := svc.QueryMetrics(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, "result", resp)
+}
+
+func TestMetricsAuthz_QueryMetrics_Denied(t *testing.T) {
+	inner := mocks.NewMockMetricsQuerier(t)
+
+	svc := NewMetricsServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := &types.MetricsQueryRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace: "ns",
+			Project:   "proj",
+			Component: "comp",
+		},
+	}
+
+	_, err := svc.QueryMetrics(authedCtx(), req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+func TestMetricsAuthz_QueryMetrics_NilRequest(t *testing.T) {
+	inner := mocks.NewMockMetricsQuerier(t)
+
+	svc := NewMetricsServiceWithAuthz(inner, nil, testLogger())
+
+	_, err := svc.QueryMetrics(context.Background(), nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "metrics query request is required")
+}
+
+// --- TracesQuerier Authz Tests ---
+
+func TestTracesAuthz_QueryTraces_NilPDP(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+	expected := &types.TracesQueryResponse{}
+	inner.EXPECT().QueryTraces(mock.Anything, mock.Anything).Return(expected, nil)
+
+	svc := NewTracesServiceWithAuthz(inner, nil, testLogger())
+	req := &types.TracesQueryRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace: "ns",
+			Project:   "proj",
+			Component: "comp",
+		},
+	}
+
+	resp, err := svc.QueryTraces(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestTracesAuthz_QueryTraces_Denied(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+
+	svc := NewTracesServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := &types.TracesQueryRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace: "ns",
+			Project:   "proj",
+			Component: "comp",
+		},
+	}
+
+	_, err := svc.QueryTraces(authedCtx(), req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+func TestTracesAuthz_QuerySpans_NilPDP(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+	expected := &types.SpansQueryResponse{}
+	inner.EXPECT().QuerySpans(mock.Anything, "trace-1", mock.Anything).Return(expected, nil)
+
+	svc := NewTracesServiceWithAuthz(inner, nil, testLogger())
+	req := &types.TracesQueryRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace: "ns",
+			Project:   "proj",
+			Component: "comp",
+		},
+	}
+
+	resp, err := svc.QuerySpans(context.Background(), "trace-1", req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestTracesAuthz_QuerySpans_Denied(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+
+	svc := NewTracesServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := &types.TracesQueryRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace: "ns",
+			Project:   "proj",
+			Component: "comp",
+		},
+	}
+
+	_, err := svc.QuerySpans(authedCtx(), "trace-1", req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+func spanWithScope() *types.SpanInfo {
+	return &types.SpanInfo{
+		SpanID: "span-1",
+		ResourceAttributes: map[string]interface{}{
+			labels.NamespaceName:   "ns",
+			labels.ProjectName:     "proj",
+			labels.ComponentName:   "comp",
+			labels.EnvironmentName: "dev",
+		},
+	}
+}
+
+func TestTracesAuthz_GetSpanDetails_NilPDP(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+	expected := spanWithScope()
+	inner.EXPECT().GetSpanDetails(mock.Anything, "trace-1", "span-1").Return(expected, nil)
+
+	svc := NewTracesServiceWithAuthz(inner, nil, testLogger())
+
+	resp, err := svc.GetSpanDetails(context.Background(), "trace-1", "span-1")
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+// spanScopeEvaluateReq matches the EvaluateRequest that GetSpanDetails derives
+// from spanWithScope's resource attributes: a component-scoped traces:view check.
+func spanScopeEvaluateReq(req *authzcore.EvaluateRequest) bool {
+	return req.Action == string(observerAuthz.ActionViewTraces) &&
+		req.Resource.Type == string(observerAuthz.ResourceTypeComponent) &&
+		req.Resource.ID == "comp" &&
+		req.Resource.Hierarchy == authzcore.ResourceHierarchy{Namespace: "ns", Project: "proj", Component: "comp"} &&
+		req.Context.Resource.Environment == "ns/dev"
+}
+
+func TestTracesAuthz_GetSpanDetails_Allowed(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+	expected := spanWithScope()
+	inner.EXPECT().GetSpanDetails(mock.Anything, "trace-1", "span-1").Return(expected, nil)
+
+	pdp := coremocks.NewMockPDP(t)
+	pdp.EXPECT().Evaluate(mock.Anything, mock.MatchedBy(spanScopeEvaluateReq)).
+		Return(&authzcore.Decision{Decision: true}, nil).Once()
+	svc := NewTracesServiceWithAuthz(inner, pdp, testLogger())
+
+	resp, err := svc.GetSpanDetails(authedCtx(), "trace-1", "span-1")
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestTracesAuthz_GetSpanDetails_Denied(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+	inner.EXPECT().GetSpanDetails(mock.Anything, "trace-1", "span-1").Return(spanWithScope(), nil)
+
+	pdp := coremocks.NewMockPDP(t)
+	pdp.EXPECT().Evaluate(mock.Anything, mock.MatchedBy(spanScopeEvaluateReq)).
+		Return(&authzcore.Decision{Decision: false}, nil).Once()
+	svc := NewTracesServiceWithAuthz(inner, pdp, testLogger())
+
+	resp, err := svc.GetSpanDetails(authedCtx(), "trace-1", "span-1")
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+	assert.Nil(t, resp)
+}
+
+// The span fetch failing short-circuits before any authorization is attempted.
+func TestTracesAuthz_GetSpanDetails_FetchError(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+	wantErr := errors.New("adapter unavailable")
+	inner.EXPECT().GetSpanDetails(mock.Anything, "trace-1", "span-1").Return(nil, wantErr)
+
+	// A non-nil PDP with no Evaluate expectation: the mock fails if authz is consulted.
+	pdp := coremocks.NewMockPDP(t)
+	svc := NewTracesServiceWithAuthz(inner, pdp, testLogger())
+
+	resp, err := svc.GetSpanDetails(authedCtx(), "trace-1", "span-1")
+	assert.ErrorIs(t, err, wantErr)
+	assert.Nil(t, resp)
+}
+
+// A span lacking openchoreo.dev/* attributes yields an empty (unknown) scope; the
+// PDP is still consulted and its decision is honored.
+func TestTracesAuthz_GetSpanDetails_MissingScopeAttributes(t *testing.T) {
+	inner := mocks.NewMockTracesQuerier(t)
+	span := &types.SpanInfo{
+		SpanID:             "span-1",
+		ResourceAttributes: map[string]interface{}{"service.name": "frontend"},
+	}
+	inner.EXPECT().GetSpanDetails(mock.Anything, "trace-1", "span-1").Return(span, nil)
+
+	pdp := coremocks.NewMockPDP(t)
+	pdp.EXPECT().Evaluate(mock.Anything, mock.MatchedBy(func(req *authzcore.EvaluateRequest) bool {
+		return req.Resource.Type == string(observerAuthz.ResourceTypeUnknown) &&
+			req.Resource.ID == "" &&
+			req.Resource.Hierarchy == authzcore.ResourceHierarchy{} &&
+			req.Context.Resource.Environment == ""
+	})).Return(&authzcore.Decision{Decision: true}, nil).Once()
+	svc := NewTracesServiceWithAuthz(inner, pdp, testLogger())
+
+	resp, err := svc.GetSpanDetails(authedCtx(), "trace-1", "span-1")
+	require.NoError(t, err)
+	assert.Equal(t, span, resp)
+}
+
+// --- MetricsQuerier QueryRuntimeTopology Authz Tests ---
+
+func TestMetricsAuthz_QueryRuntimeTopology_NilRequest(t *testing.T) {
+	inner := mocks.NewMockMetricsQuerier(t)
+
+	svc := NewMetricsServiceWithAuthz(inner, nil, testLogger())
+
+	_, err := svc.QueryRuntimeTopology(context.Background(), nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "runtime topology request is required")
+}
+
+func TestMetricsAuthz_QueryRuntimeTopology_NilPDP(t *testing.T) {
+	expected := &types.RuntimeTopologyResponse{}
+	inner := mocks.NewMockMetricsQuerier(t)
+	inner.EXPECT().QueryRuntimeTopology(mock.Anything, mock.Anything).Return(expected, nil)
+
+	svc := NewMetricsServiceWithAuthz(inner, nil, testLogger())
+	req := &types.RuntimeTopologyRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace:   "ns",
+			Project:     "proj",
+			Environment: "env",
+		},
+	}
+
+	resp, err := svc.QueryRuntimeTopology(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestMetricsAuthz_QueryRuntimeTopology_Allowed(t *testing.T) {
+	expected := &types.RuntimeTopologyResponse{}
+	inner := mocks.NewMockMetricsQuerier(t)
+	inner.EXPECT().QueryRuntimeTopology(mock.Anything, mock.Anything).Return(expected, nil)
+
+	svc := NewMetricsServiceWithAuthz(inner, mockPDPAllow(t), testLogger())
+	req := &types.RuntimeTopologyRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace:   "ns",
+			Project:     "proj",
+			Environment: "env",
+		},
+	}
+
+	resp, err := svc.QueryRuntimeTopology(authedCtx(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expected, resp)
+}
+
+func TestMetricsAuthz_QueryRuntimeTopology_Denied(t *testing.T) {
+	inner := mocks.NewMockMetricsQuerier(t)
+
+	svc := NewMetricsServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := &types.RuntimeTopologyRequest{
+		SearchScope: types.ComponentSearchScope{
+			Namespace:   "ns",
+			Project:     "proj",
+			Environment: "env",
+		},
+	}
+
+	_, err := svc.QueryRuntimeTopology(authedCtx(), req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+// --- FinOpsQuerier Authz Tests ---
+
+func finopsCostReq() *types.CostQueryRequest {
+	return &types.CostQueryRequest{
+		Namespace:   "ns",
+		Environment: "env",
+		Project:     "proj",
+		Component:   "comp",
+		StartTime:   "2026-05-23T10:00:01Z",
+		EndTime:     "2026-05-24T10:00:01Z",
+	}
+}
+
+func TestFinOpsAuthz_GetComponentCosts_NilPDP(t *testing.T) {
+	inner := mocks.NewMockFinOpsQuerier(t)
+	inner.EXPECT().GetComponentCosts(mock.Anything, mock.Anything).Return("result", nil)
+
+	svc := NewFinOpsServiceWithAuthz(inner, nil, testLogger())
+
+	resp, err := svc.GetComponentCosts(context.Background(), finopsCostReq())
+	require.NoError(t, err)
+	assert.Equal(t, "result", resp)
+}
+
+func TestFinOpsAuthz_GetComponentCosts_Allowed(t *testing.T) {
+	inner := mocks.NewMockFinOpsQuerier(t)
+	inner.EXPECT().GetComponentCosts(mock.Anything, mock.Anything).Return("result", nil)
+
+	svc := NewFinOpsServiceWithAuthz(inner, mockPDPAllow(t), testLogger())
+
+	resp, err := svc.GetComponentCosts(authedCtx(), finopsCostReq())
+	require.NoError(t, err)
+	assert.Equal(t, "result", resp)
+}
+
+func TestFinOpsAuthz_GetComponentCosts_Denied(t *testing.T) {
+	inner := mocks.NewMockFinOpsQuerier(t)
+
+	svc := NewFinOpsServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+
+	_, err := svc.GetComponentCosts(authedCtx(), finopsCostReq())
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}
+
+func TestFinOpsAuthz_GetComponentCosts_NilRequest(t *testing.T) {
+	inner := mocks.NewMockFinOpsQuerier(t)
+
+	svc := NewFinOpsServiceWithAuthz(inner, nil, testLogger())
+
+	_, err := svc.GetComponentCosts(context.Background(), nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "FinOps cost query request is required")
+}
+
+func TestFinOpsAuthz_GetRecommendations_Denied(t *testing.T) {
+	inner := mocks.NewMockFinOpsQuerier(t)
+
+	svc := NewFinOpsServiceWithAuthz(inner, mockPDPDeny(t), testLogger())
+	req := &types.RecommendationQueryRequest{
+		Namespace:   "ns",
+		Environment: "env",
+		Project:     "proj",
+		Component:   "comp",
+		StartTime:   "2026-05-23T10:00:01Z",
+		EndTime:     "2026-05-24T10:00:01Z",
+	}
+
+	_, err := svc.GetRecommendations(authedCtx(), req)
+	assert.ErrorIs(t, err, observerAuthz.ErrAuthzForbidden)
+}

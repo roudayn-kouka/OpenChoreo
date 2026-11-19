@@ -1,0 +1,151 @@
+# Helm values for OpenChoreo Control Plane in quick-start container
+
+openchoreoApi:
+  http:
+    hostnames:
+    - api.openchoreo.localhost
+  config:
+    server:
+      publicUrl: "http://api.openchoreo.localhost:8080"
+    security:
+      authorization:
+        bootstrap:
+          # Includes admin, developer, platform-engineer bindings from base values,
+          # all system bindings, and the quick-start CLI admin binding.
+          mappings:
+            - name: admin-binding
+              kind: ClusterAuthzRoleBinding
+              roleMappings:
+                - roleRef:
+                    name: admin
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: groups
+                value: admins
+              effect: allow
+            - name: developer-binding
+              kind: ClusterAuthzRoleBinding
+              roleMappings:
+                - roleRef:
+                    name: developer
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: groups
+                value: developers
+              effect: allow
+            - name: platform-engineer-binding
+              kind: ClusterAuthzRoleBinding
+              roleMappings:
+                - roleRef:
+                    name: platform-engineer
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: groups
+                value: platform-engineers
+              effect: allow
+            - name: backstage-catalog-reader-binding
+              kind: ClusterAuthzRoleBinding
+              system: true
+              roleMappings:
+                - roleRef:
+                    name: backstage-catalog-reader
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: client_id
+                value: openchoreo-backstage-client
+              effect: allow
+            - name: finops-agent-binding
+              kind: ClusterAuthzRoleBinding
+              system: true
+              roleMappings:
+                - roleRef:
+                    name: finops-agent
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: client_id
+                value: openchoreo-finops-agent
+              effect: allow
+            - name: rca-agent-binding
+              kind: ClusterAuthzRoleBinding
+              system: true
+              roleMappings:
+                - roleRef:
+                    name: rca-agent
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: client_id
+                value: openchoreo-rca-agent
+              effect: allow
+            - name: workload-publisher-binding
+              kind: ClusterAuthzRoleBinding
+              system: true
+              roleMappings:
+                - roleRef:
+                    name: workload-publisher
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: client_id
+                value: openchoreo-workload-publisher-client
+              effect: allow
+            - name: observer-resource-reader-binding
+              kind: ClusterAuthzRoleBinding
+              system: true
+              roleMappings:
+                - roleRef:
+                    name: observer-resource-reader
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: client_id
+                value: openchoreo-observer-resource-reader-client
+              effect: allow
+            - name: mcp-tryout-client-binding
+              kind: ClusterAuthzRoleBinding
+              roleMappings:
+                - roleRef:
+                    name: admin
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: client_id
+                value: service_mcp_client
+              effect: allow
+            - name: quickstart-cli-admin-binding
+              kind: ClusterAuthzRoleBinding
+              roleMappings:
+                - roleRef:
+                    name: admin
+                    kind: ClusterAuthzRole
+              entitlement:
+                claim: client_id
+                value: openchoreo-cli-quickstart
+              effect: allow
+
+backstage:
+  features:
+    costInsights:
+      enabled: true
+  secretName: backstage-secrets
+  baseUrl: "http://openchoreo.localhost:8080"
+  http:
+    hostnames:
+    - openchoreo.localhost
+
+portalAssistant:
+  config:
+    observerApiUrl: "http://observer.openchoreo.localhost:11080"
+
+features:
+  secretManagement:
+    enabled: true
+
+security:
+  oidc:
+    issuer: "http://thunder.openchoreo.localhost:8080"
+    jwksUrl: "http://thunder.openchoreo.localhost:8080/oauth2/jwks"
+    authorizationUrl: "http://thunder.openchoreo.localhost:8080/oauth2/authorize"
+    tokenUrl: "http://thunder.openchoreo.localhost:8080/oauth2/token"
+
+gateway:
+  httpPort: 8080
+  httpsPort: 8443
+  tls:
+    enabled: false

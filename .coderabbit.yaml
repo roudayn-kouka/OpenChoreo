@@ -1,0 +1,234 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+
+reviews:
+  profile: chill
+  poem: false
+  in_progress_fortune: false
+
+  # Keep CodeRabbit from blocking merges via request-changes workflow. Default is false. Will make this true once most of the code base is covered.
+  request_changes_workflow: false
+
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  high_level_summary_instructions: |
+    Keep the summary evidence-based and quant-heavy:
+    1) Show a mini breakdown: changed files count by top-level folder (api/, config/, internal/, pkg/, install/, docs/, openapi/, agents/, make/, cmd/, samples/).
+    2) Call out API/CRD surface changes explicitly (what changed, compatibility risk: low/med/high).
+    3) List tests added/updated (and what critical paths still lack tests).
+    4) Highlight risk hotspots with short reasons (authn/authz, RBAC, secrets, reconciliation loops, install/upgrade paths).
+
+  # Reduce noise / wasted tokens
+  path_filters:
+    - "!hack/**"
+    - "!logo/**"
+    - "!tools/**"
+    - "!**/zz_generated.*"
+    - "!internal/openchoreo-api/api/gen/**"
+    - "!config/crd/bases/**"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.gif"
+    - "!**/*.svg"
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_title_keywords: ["wip", "do not merge", "draft"]
+    labels: ["!wip", "!do-not-review"]
+
+  tools:
+    # CI hygiene
+    actionlint:
+      enabled: true
+
+    # Secrets
+    gitleaks:
+      enabled: true
+
+    # Go: use repo's existing config
+    golangci-lint:
+      enabled: true
+      config_file: ".golangci.yml"
+
+    # Shell + YAML + Docker + Markdown
+    shellcheck:
+      enabled: true
+    yamllint:
+      enabled: true
+    hadolint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    checkmake:
+      enabled: true
+
+  path_instructions:
+    # =================
+    # LEVEL: BASELINE
+    # =================
+
+    - path: "**/*.go"
+      instructions: |
+        LEVEL: BASELINE (Go)
+        - Require gofmt/goimports formatting and gci import grouping (local prefix: github.com/openchoreo/openchoreo).
+        - New Go files must include the OpenChoreo license header.
+
+    # =====================
+    # LEVEL: VERY STRICT
+    # =====================
+
+    - path: "api/**"
+      instructions: |
+        LEVEL: VERY STRICT (OpenChoreo API / CRDs)
+        - Treat changes as potentially breaking; flag compatibility risk.
+        - Ensure kubebuilder validation tags are consistent and safe (enums, patterns, min/max, required/optional).
+        - Verify JSON tags, omitempty usage, and defaulting behavior.
+        - If schema changes: call out upgrade/migration impact and required controller/CRD/OpenAPI updates.
+        - Add or update tests to cover new/changed fields or behaviors.
+
+    - path: "api/v1alpha1/**"
+      instructions: |
+        LEVEL: VERY STRICT (CRD types - cross-surface propagation)
+        Codegen is already enforced by CI (`make code.gen-check` covers CRD manifests and
+        openapi.yaml<->generated-code consistency), so do NOT comment about regenerating code
+        or CRDs. Focus only on the hand-maintained hops that have no generator and silently
+        drift when a CRD field is added.
+
+        Trigger ONLY when this PR adds or renames a developer/user-facing spec field (a field
+        on a *Spec type). Then inspect THIS PR's diff and comment ONLY for a surface that
+        plausibly needs the field but has no corresponding change in the PR - as a short
+        checklist the author can confirm or consciously skip:
+        - OpenAPI source: does openapi/openchoreo-api.yaml (hand-authored, NOT generated from
+          the CRD types) need the field to keep the REST contract in sync?
+        - MCP: do the handlers in internal/openchoreo-api/mcphandlers/** surface it?
+        - CLI (occ fsmode): do the field-by-field mappers in internal/occ/fsmode/typed/** and
+          the generator in internal/occ/fsmode/generator/** emit it? These reconstruct specs
+          field by field and have repeatedly dropped new fields (validations, removes,
+          dependency resources).
+        - Service converters in internal/openchoreo-api/services/** if they copy specs by field.
+
+        Stay SILENT - emit no comment - when the field is status-only, internal or
+        controller-only, or clearly not part of these surfaces, or when the PR already updates
+        them. Do not speculate or produce a checklist "just in case"; flag only a concrete,
+        visible gap. The author decides whether each surface truly needs the change.
+
+    - path: "openapi/**"
+      instructions: |
+        LEVEL: VERY STRICT (OpenAPI)
+        - Ensure spec matches server behavior and CRD contracts.
+        - Call out breaking changes (removed fields, tightened constraints, renamed endpoints).
+        - Prefer additive changes; if breaking, require versioning/migration guidance.
+
+    # ==============
+    # LEVEL: STRICT
+    # ==============
+
+    - path: "install/helm/**"
+      instructions: |
+        LEVEL: STRICT (Helm charts)
+        - Keep values, templates, and schema in sync; call out breaking value changes.
+        - Avoid embedding secrets in values; prefer existing Secret refs.
+        - Ensure upgrades are safe: hooks, CRDs, RBAC, PSP/PSA alignment.
+        - Validate naming, labels, and selector consistency across charts.
+
+    - path: "internal/controller/**"
+      instructions: |
+        LEVEL: STRICT (Controllers / reconcilers)
+        - Reconciliation must be idempotent and requeue-safe.
+        - Look for infinite loops, missing error context, and race conditions.
+        - Ensure status updates handle conflicts and avoid API spam.
+        - External calls must use context, timeouts, and reasonable retry/backoff.
+        - Prefer explicit ownership/garbage-collection references.
+
+    - path: "internal/**"
+      instructions: |
+        LEVEL: STRICT (Core implementation)
+        - Keep functions small and packages cohesive; flag high complexity.
+        - Ensure errors are wrapped with context; logs are structured and non-noisy.
+        - Use context propagation consistently; avoid goroutine leaks.
+        - Add tests for critical logic or regressions.
+
+    - path: "pkg/**"
+      instructions: |
+        LEVEL: STRICT (Exported packages / public surface)
+        - Treat as public API; highlight breaking changes or new exported symbols.
+        - Keep error contracts stable and document behavior changes.
+        - Encourage tests for exported behavior.
+
+    # =================
+    # LEVEL: STANDARD
+    # =================
+
+    - path: "cmd/**"
+      instructions: |
+        LEVEL: STANDARD (Entrypoints / CLIs)
+        - Ensure flags/env vars are documented and consistent.
+        - Check signal handling, context cancellation, and graceful shutdown.
+        - Avoid global mutable state; validate config early.
+        - Flag breaking changes to commands, flags, or output formats.
+
+    - path: "agents/**"
+      instructions: |
+        LEVEL: STANDARD (Agent)
+        - Reliability-sensitive: prioritize timeouts, retries, and telemetry.
+        - Suggest tests for parsing/analysis logic and failure modes.
+
+    - path: "install/**/*.sh"
+      instructions: |
+        LEVEL: STANDARD (Install scripts)
+        - Prefer bash safety: set -euo pipefail, quote variables, and check dependencies.
+        - Call out portability issues and required privileges.
+
+    - path: "**/Dockerfile"
+      instructions: |
+        LEVEL: STANDARD (Container)
+        - Prefer minimal, pinned base images and non-root runtime.
+        - Flag large layers, missing .dockerignore usage, or supply-chain risks.
+
+    - path: "go.mod"
+      instructions: |
+        LEVEL: STANDARD (Dependencies)
+        - Call out risky bumps (major versions) and require rationale.
+        - Ensure go mod tidy consistency and no unused deps.
+
+    # =============
+    # LEVEL: LIGHT
+    # =============
+
+    - path: ".github/**"
+      instructions: |
+        LEVEL: LIGHT (CI)
+        - Check for secret exposure risk, overly broad permissions, and missing pinning for third-party actions.
+        - Prefer reproducibility: pinned versions and correctness-safe caching.
+
+    - path: "docs/**"
+      instructions: |
+        LEVEL: LIGHT (Docs)
+        - Focus on correctness, clarity, and step ordering.
+        - Prefer short, copy-paste-safe commands.
+        - Flag broken links, missing prerequisites, and ambiguous wording.
+
+    - path: "README.md"
+      instructions: |
+        LEVEL: LIGHT (Docs)
+        - Keep quick-start and prerequisites accurate; highlight command changes.
+
+    - path: "samples/**"
+      instructions: |
+        LEVEL: LIGHT (Samples)
+        - Prioritize "it runs" + clarity; avoid nitpicks unless correctness.
+
+    - path: "test/**"
+      instructions: |
+        LEVEL: LIGHT (Tests)
+        - Focus on determinism, flake risks, and meaningful assertions.
+        - Suggest table-driven tests for broad coverage when appropriate.
+
+    - path: "make/**"
+      instructions: |
+        LEVEL: LIGHT (Build helpers)
+        - Ensure targets are discoverable, consistent, and documented where needed.

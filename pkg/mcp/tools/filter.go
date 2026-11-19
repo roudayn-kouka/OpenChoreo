@@ -1,0 +1,361 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	authzcore "github.com/openchoreo/openchoreo/internal/authz/core"
+	"github.com/openchoreo/openchoreo/internal/server/middleware/auth"
+)
+
+const (
+	// methodCallTool is the MCP method name for tool invocation.
+	methodCallTool = "tools/call"
+	// methodListTools is the MCP method name for listing tools.
+	methodListTools = "tools/list"
+)
+
+// Sentinel errors wrapped into filterCallTool's denial errors so a caller
+// (the audit middleware) can classify why a call was rejected via errors.Is,
+// rather than string-matching an error message. ErrPDPFailure is deliberately
+// distinct from the other two: it means the PDP could not be reached or
+// evaluated — an infrastructure failure, not a policy decision — and must not
+// be recorded as if the user had been denied by policy.
+var (
+	// ErrNoSubject means the request carried no authenticated subject.
+	ErrNoSubject = errors.New("no authenticated user")
+	// ErrForbidden means the PDP evaluated the request and denied it.
+	ErrForbidden = errors.New("missing required permission")
+	// ErrPDPFailure means the PDP could not be reached or evaluated.
+	ErrPDPFailure = errors.New("could not evaluate permissions")
+)
+
+// NewToolFilterMiddleware returns an MCP receiving middleware that filters
+// tools/list and tools/call results along two independent axes:
+//
+//  1. Toolset narrowing — when the client requested a specific subset of
+//     toolsets via ?toolsets= on the current request, tools/list returns
+//     only tools whose registered toolsets intersect the requested set. This
+//     filter is purely a tools/list visibility helper; tools/call is not
+//     gated by it (clients that bypass tools/list can still call any
+//     registered tool).
+//
+//  2. Authz filtering — when filterByAuthz is true (the default) and a PDP
+//     is configured, tools/list hides tools the user lacks permission for and
+//     tools/call rejects unauthorized calls. When filterByAuthz is false, or
+//     pdp is nil, the MCP server is permissive at the protocol layer; the
+//     service layer still enforces authz independently.
+//
+// The perms map is produced by Register(); it maps tool name to ToolPermission
+// (carrying the required authz action). The toolToToolsets map is also
+// produced by Register(); it maps each tool name to the set of toolsets it
+// belongs to.
+//
+// logger is used only for server-side detail on a PDP failure that must not
+// reach the MCP client (see filterCallTool). Required — a nil logger fails
+// construction rather than silently falling back to slog.Default(), which
+// could route this detail somewhere nobody is watching.
+func NewToolFilterMiddleware(
+	logger *slog.Logger,
+	pdp authzcore.PDP,
+	perms map[string]ToolPermission,
+	toolToToolsets map[string]map[ToolsetType]bool,
+) (mcp.Middleware, error) {
+	if logger == nil {
+		return nil, errors.New("audit: NewToolFilterMiddleware requires a non-nil logger")
+	}
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			switch method {
+			case methodListTools:
+				return filterListTools(ctx, next, req, pdp, perms, toolToToolsets)
+			case methodCallTool:
+				return filterCallTool(ctx, next, method, req, pdp, perms, logger)
+			default:
+				return next(ctx, method, req)
+			}
+		}
+	}, nil
+}
+
+// filterListTools calls the next handler, then narrows the returned tool list
+// by the per-request toolset request and (when enabled) the user's authz
+// capabilities.
+func filterListTools(
+	ctx context.Context,
+	next mcp.MethodHandler,
+	req mcp.Request,
+	pdp authzcore.PDP,
+	perms map[string]ToolPermission,
+	toolToToolsets map[string]map[ToolsetType]bool,
+) (mcp.Result, error) {
+	result, err := next(ctx, methodListTools, req)
+	if err != nil {
+		return result, err
+	}
+
+	listResult, ok := result.(*mcp.ListToolsResult)
+	if !ok || listResult == nil {
+		// Unexpected type: pass through unchanged.
+		return result, nil
+	}
+
+	requested, hasRequested := RequestedToolsetsFromContext(ctx)
+	authzActive := authzFilteringActive(ctx, pdp)
+
+	if !hasRequested && !authzActive {
+		// Nothing to filter on — return the result as-is.
+		return listResult, nil
+	}
+
+	var profile *authzcore.UserCapabilitiesResponse
+	if authzActive {
+		subjectCtx, _ := auth.GetSubjectContextFromContext(ctx)
+		if subjectCtx == nil {
+			// No authenticated user in context — return no tools.
+			listResult.Tools = []*mcp.Tool{}
+			return listResult, nil
+		}
+		profile, err = pdp.GetSubjectProfile(ctx, &authzcore.ProfileRequest{
+			SubjectContext: authzcore.GetAuthzSubjectContext(subjectCtx),
+		})
+		if err != nil {
+			// On PDP error, be safe: return no tools. The service layer will
+			// independently deny any calls the user makes.
+			listResult.Tools = []*mcp.Tool{}
+			return listResult, nil
+		}
+	}
+
+	filtered := listResult.Tools[:0:0]
+	for _, tool := range listResult.Tools {
+		if hasRequested && !toolInRequestedToolsets(tool.Name, toolToToolsets, requested) {
+			continue
+		}
+		if authzActive && !isAllowed(tool.Name, perms, profile) {
+			continue
+		}
+		filtered = append(filtered, tool)
+	}
+	listResult.Tools = filtered
+	return listResult, nil
+}
+
+// filterCallTool checks whether the user is permitted to call the requested tool
+// before forwarding to the next handler. Authz checks are skipped when the
+// per-request filterByAuthz flag is false or no PDP is configured; the service
+// layer enforces authz independently in those cases.
+func filterCallTool(
+	ctx context.Context,
+	next mcp.MethodHandler,
+	method string,
+	req mcp.Request,
+	pdp authzcore.PDP,
+	perms map[string]ToolPermission,
+	logger *slog.Logger,
+) (mcp.Result, error) {
+	if !authzFilteringActive(ctx, pdp) {
+		return next(ctx, method, req)
+	}
+	if logger == nil {
+		return nil, errors.New("audit: filterCallTool requires a non-nil logger")
+	}
+
+	toolName := callToolName(req)
+	perm, hasPerm := perms[toolName]
+	if !hasPerm {
+		// No permission entry — allow through (unknown tools pass, service layer will check).
+		return next(ctx, method, req)
+	}
+
+	subjectCtx, _ := auth.GetSubjectContextFromContext(ctx)
+	if subjectCtx == nil {
+		return nil, fmt.Errorf("not authorized to call tool %q: %w", toolName, ErrNoSubject)
+	}
+
+	requiredAction := perm.ActionForScope(callToolScopeArg(req))
+	if requiredAction == "" {
+		// Either the tool declares no fixed action, or the scope argument was not
+		// recognized. Let the tool handler / service layer enforce authorization.
+		return next(ctx, method, req)
+	}
+
+	profile, err := pdp.GetSubjectProfile(ctx, &authzcore.ProfileRequest{
+		SubjectContext: authzcore.GetAuthzSubjectContext(subjectCtx),
+		Scope:          callToolScope(req),
+	})
+	if err != nil {
+		// The raw PDP error (network/connection detail, internal endpoint,
+		// etc.) must not reach the MCP client — go-sdk relays a returned
+		// error's text back as tool-call result content. Log it server-side
+		// and return only the sentinel-wrapped, sanitized message.
+		//
+		// Worded as a server-side evaluation failure, not "not authorized":
+		// the PDP never reached a decision here, so this isn't a denial.
+		logger.Error("audit: PDP failure while authorizing MCP tool call", "tool", toolName, "error", err)
+		return nil, fmt.Errorf("error evaluating authorization for tool %q: %w", toolName, ErrPDPFailure)
+	}
+
+	if !hasActionCapability(requiredAction, profile) {
+		return nil, fmt.Errorf("not authorized to call tool %q: missing permission %q: %w",
+			toolName, requiredAction, ErrForbidden)
+	}
+
+	return next(ctx, method, req)
+}
+
+// authzFilteringActive reports whether MCP-layer authz filtering should be
+// applied for this request. It is active only when a PDP is configured and the
+// per-request filterByAuthz flag has not been explicitly set to false.
+func authzFilteringActive(ctx context.Context, pdp authzcore.PDP) bool {
+	if pdp == nil {
+		return false
+	}
+	if filter, set := FilterByAuthzFromContext(ctx); set && !filter {
+		return false
+	}
+	return true
+}
+
+// toolInRequestedToolsets returns true if the named tool belongs to at least
+// one of the toolsets the client requested. Tools without a toolset entry
+// (an unexpected condition since Register always indexes registered tools)
+// are returned by default to avoid hiding tools after a rollout.
+func toolInRequestedToolsets(
+	toolName string,
+	toolToToolsets map[string]map[ToolsetType]bool,
+	requested map[ToolsetType]bool,
+) bool {
+	owned, ok := toolToToolsets[toolName]
+	if !ok || len(owned) == 0 {
+		return true
+	}
+	for ts := range owned {
+		if requested[ts] {
+			return true
+		}
+	}
+	return false
+}
+
+// isAllowed returns true if the user's profile grants at least one resource for at
+// least one of the tool's possible actions. A scope-collapsed tool declares one
+// action per scope; the user only needs one of them to see the tool in tools/list
+// (the tools/call path checks the action that matches the requested scope). If the
+// tool has no permission entry in perms, it is shown by default (safe-default:
+// don't hide tools added after a deploy).
+func isAllowed(toolName string, perms map[string]ToolPermission, profile *authzcore.UserCapabilitiesResponse) bool {
+	perm, ok := perms[toolName]
+	if !ok {
+		return true
+	}
+	actions := perm.Actions()
+	if len(actions) == 0 {
+		return true
+	}
+	for _, action := range actions {
+		if hasActionCapability(action, profile) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasActionCapability returns true if the profile has at least one allowed resource
+// for the given action.
+func hasActionCapability(action string, profile *authzcore.UserCapabilitiesResponse) bool {
+	if profile == nil {
+		return false
+	}
+	cap, ok := profile.Capabilities[action]
+	if !ok || cap == nil {
+		return false
+	}
+	return len(cap.Allowed) > 0
+}
+
+// callToolName extracts the tool name from a tools/call Request.
+// The Params field is of type *mcp.CallToolParamsRaw (server-side) which embeds Name.
+func callToolName(req mcp.Request) string {
+	if req == nil {
+		return ""
+	}
+	params := req.GetParams()
+	if params == nil {
+		return ""
+	}
+	if p, ok := params.(*mcp.CallToolParamsRaw); ok && p != nil {
+		return p.Name
+	}
+	// Fallback: try CallToolParams (client-side, shouldn't happen on server).
+	if p, ok := params.(*mcp.CallToolParams); ok && p != nil {
+		return p.Name
+	}
+	return ""
+}
+
+// callToolScopeArg extracts the `scope` argument from a tools/call request. It is
+// used to resolve the required authz action of a scope-collapsed tool (which
+// declares one action per scope value). Returns "" when the argument is absent or
+// unparsable; callers should treat "" as the default (namespace) scope.
+func callToolScopeArg(req mcp.Request) string {
+	if req == nil {
+		return ""
+	}
+	params := req.GetParams()
+	if params == nil {
+		return ""
+	}
+	p, ok := params.(*mcp.CallToolParamsRaw)
+	if !ok || p == nil || len(p.Arguments) == 0 {
+		return ""
+	}
+	var args struct {
+		Scope string `json:"scope"`
+	}
+	if err := json.Unmarshal(p.Arguments, &args); err != nil {
+		return ""
+	}
+	return args.Scope
+}
+
+// callToolScope derives the resource hierarchy scope from the tools/call arguments.
+// It looks for the conventional namespace_name, project_name, component_name and
+// resource_name fields used by MCP tools in this package. Missing fields remain
+// empty, which the PDP interprets as a broader scope.
+func callToolScope(req mcp.Request) authzcore.ResourceHierarchy {
+	if req == nil {
+		return authzcore.ResourceHierarchy{}
+	}
+	params := req.GetParams()
+	if params == nil {
+		return authzcore.ResourceHierarchy{}
+	}
+	p, ok := params.(*mcp.CallToolParamsRaw)
+	if !ok || p == nil || len(p.Arguments) == 0 {
+		return authzcore.ResourceHierarchy{}
+	}
+	var args struct {
+		NamespaceName string `json:"namespace_name"`
+		ProjectName   string `json:"project_name"`
+		ComponentName string `json:"component_name"`
+		ResourceName  string `json:"resource_name"`
+	}
+	if err := json.Unmarshal(p.Arguments, &args); err != nil {
+		return authzcore.ResourceHierarchy{}
+	}
+	return authzcore.ResourceHierarchy{
+		Namespace: args.NamespaceName,
+		Project:   args.ProjectName,
+		Component: args.ComponentName,
+		Resource:  args.ResourceName,
+	}
+}

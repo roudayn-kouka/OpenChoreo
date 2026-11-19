@@ -1,0 +1,77 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/openchoreo/openchoreo/internal/config"
+	"github.com/openchoreo/openchoreo/pkg/mcp/tools"
+)
+
+// MCPConfig defines Model Context Protocol server settings.
+type MCPConfig struct {
+	// Enabled enables the MCP server endpoint.
+	Enabled bool `koanf:"enabled"`
+	// Toolsets is the list of enabled MCP toolsets.
+	Toolsets []string `koanf:"toolsets"`
+}
+
+// MCPDefaults returns the default MCP configuration.
+func MCPDefaults() MCPConfig {
+	return MCPConfig{
+		Enabled: true,
+		Toolsets: []string{
+			string(tools.ToolsetNamespace),
+			string(tools.ToolsetProject),
+			string(tools.ToolsetComponent),
+			string(tools.ToolsetDeployment),
+			string(tools.ToolsetBuild),
+			string(tools.ToolsetResource),
+		},
+	}
+}
+
+// validToolsets is the set of valid MCP toolset names.
+var validToolsets = map[string]bool{
+	string(tools.ToolsetNamespace):  true,
+	string(tools.ToolsetProject):    true,
+	string(tools.ToolsetComponent):  true,
+	string(tools.ToolsetDeployment): true,
+	string(tools.ToolsetBuild):      true,
+	string(tools.ToolsetPE):         true,
+	string(tools.ToolsetResource):   true,
+}
+
+// ValidateMCPConfig validates the MCP configuration.
+func (c *MCPConfig) ValidateMCPConfig(path *config.Path) config.ValidationErrors {
+	var errs config.ValidationErrors
+
+	valid := make([]string, 0, len(validToolsets))
+	for ts := range validToolsets {
+		valid = append(valid, ts)
+	}
+	sort.Strings(valid)
+	validList := strings.Join(valid, ", ")
+
+	for i, ts := range c.Toolsets {
+		if !validToolsets[ts] {
+			errs = append(errs, config.Invalid(path.Child("toolsets").Index(i),
+				fmt.Sprintf("unknown toolset %q; valid toolsets: %s", ts, validList)))
+		}
+	}
+
+	return errs
+}
+
+// ParseToolsets converts the toolset strings to a map of ToolsetType for lookup.
+func (c *MCPConfig) ParseToolsets() map[tools.ToolsetType]bool {
+	result := make(map[tools.ToolsetType]bool, len(c.Toolsets))
+	for _, ts := range c.Toolsets {
+		result[tools.ToolsetType(ts)] = true
+	}
+	return result
+}

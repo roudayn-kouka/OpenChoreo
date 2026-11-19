@@ -1,0 +1,7 @@
+# Helm values for OpenChoreo Data Plane in quick-start container
+
+gateway:
+  httpPort: 19080
+  httpsPort: 19443
+  tls:
+    enabled: false

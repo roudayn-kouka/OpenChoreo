@@ -1,0 +1,132 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package project
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"text/tabwriter"
+
+	"sigs.k8s.io/yaml"
+
+	"github.com/openchoreo/openchoreo/internal/occ/cmd/pagination"
+	"github.com/openchoreo/openchoreo/internal/occ/cmd/utils"
+	"github.com/openchoreo/openchoreo/internal/occ/cmdutil"
+	"github.com/openchoreo/openchoreo/internal/occ/resources/client"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/api/gen"
+)
+
+// Project implements project operations
+type Project struct {
+	client client.Interface
+}
+
+// New creates a new project implementation
+func New(c client.Interface) *Project {
+	return &Project{client: c}
+}
+
+// List lists all projects in a namespace
+func (p *Project) List(params ListParams) error {
+	if err := cmdutil.RequireFields("list", "project", map[string]string{"namespace": params.Namespace}); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	items, err := pagination.FetchAll(func(limit int, cursor string) ([]gen.Project, string, error) {
+		lp := &gen.ListProjectsParams{}
+		lp.Limit = &limit
+		if cursor != "" {
+			lp.Cursor = &cursor
+		}
+		result, err := p.client.ListProjects(ctx, params.Namespace, lp)
+		if err != nil {
+			return nil, "", err
+		}
+		next := ""
+		if result.Pagination.NextCursor != nil {
+			next = *result.Pagination.NextCursor
+		}
+		return result.Items, next, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return printList(items)
+}
+
+// Get retrieves a single project and outputs it as YAML
+func (p *Project) Get(params GetParams) error {
+	if err := cmdutil.RequireFields("get", "project", map[string]string{"namespace": params.Namespace}); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	result, err := p.client.GetProject(ctx, params.Namespace, params.ProjectName)
+	if err != nil {
+		return err
+	}
+
+	data, err := yaml.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("failed to marshal project to YAML: %w", err)
+	}
+
+	fmt.Print(string(data))
+	return nil
+}
+
+// Delete deletes a single project
+func (p *Project) Delete(params DeleteParams) error {
+	if err := cmdutil.RequireFields("delete", "project", map[string]string{"namespace": params.Namespace, "name": params.ProjectName}); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	if err := p.client.DeleteProject(ctx, params.Namespace, params.ProjectName); err != nil {
+		return err
+	}
+
+	fmt.Printf("Project '%s' deleted\n", params.ProjectName)
+	return nil
+}
+
+func printList(items []gen.Project) error {
+	if len(items) == 0 {
+		fmt.Println("No projects found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "NAME\tTYPE\tAGE")
+
+	for _, proj := range items {
+		name := proj.Metadata.Name
+		age := "n/a"
+		if proj.Metadata.CreationTimestamp != nil {
+			age = utils.FormatAge(*proj.Metadata.CreationTimestamp)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", name, projectType(proj), age)
+	}
+
+	return w.Flush()
+}
+
+// projectType renders spec.type as "<Kind>/<Name>", defaulting the kind to
+// ProjectType when unset (matching the API default).
+func projectType(proj gen.Project) string {
+	if proj.Spec == nil || proj.Spec.Type == nil {
+		return ""
+	}
+	kind := string(gen.ProjectTypeRefKindProjectType)
+	if proj.Spec.Type.Kind != nil {
+		kind = string(*proj.Spec.Type.Kind)
+	}
+	return kind + "/" + proj.Spec.Type.Name
+}

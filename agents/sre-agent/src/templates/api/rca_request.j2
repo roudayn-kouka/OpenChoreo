@@ -1,0 +1,54 @@
+## Root Cause Analysis Request
+
+An alert has been triggered in OpenChoreo. Systematically investigate and identify the root cause(s) of this incident.
+
+- **Current Namespace:** {{ scope.namespace }}
+- **Current Environment:** {{ scope.environment }}
+- **Current Project:** {{ scope.project }}
+
+
+All your analysis should be scoped to the current namespace and environment and project. Everything else is considered external to your investigation
+
+### Alert Details
+
+- **Rule Name:** {{ alert.rule.name }}
+- **Alert ID:** {{ alert.id }}
+- **Triggered Value:** {{ alert.value }}
+- **Timestamp:** {{ alert.timestamp }}
+{% if alert.rule.severity -%}
+- **Severity:** {{ alert.rule.severity }}
+{% endif -%}
+{% if alert.rule.description -%}
+- **Description:** {{ alert.rule.description }}
+{% endif -%}
+
+### Alert Origin
+
+- **Component:** {{ scope.component }}
+
+{% if alert.rule.source -%}
+### Alert Rule Source
+
+- **Type:** {{ alert.rule.source.type }}
+{% if alert.rule.source.query -%}
+- **Query:** `{{ alert.rule.source.query }}`
+{% endif -%}
+{% if alert.rule.source.metric -%}
+- **Metric:** `{{ alert.rule.source.metric }}`
+{% endif -%}
+
+{% endif -%}
+{% if alert.rule.condition -%}
+### Alert Rule Condition
+
+- **Window:** {{ alert.rule.condition.window }}
+- **Interval:** {{ alert.rule.condition.interval }}
+- **Operator:** {{ alert.rule.condition.operator }}
+- **Threshold:** {{ alert.rule.condition.threshold }}
+
+{% endif -%}
+{% if meta -%}
+### Additional Context
+
+{{ meta | tojson(indent=2) }}
+{% endif -%}

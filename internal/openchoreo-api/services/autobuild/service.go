@@ -1,0 +1,106 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package autobuild
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services/git"
+)
+
+const (
+	// webhookSecretName is the name of the Kubernetes Secret containing webhook secrets.
+	webhookSecretName = "git-webhook-secrets" // #nosec G101 -- This is a secret name, not a hardcoded credential
+	// webhookSecretNamespace is the namespace where the webhook secret is stored.
+	webhookSecretNamespace = "openchoreo-control-plane" // #nosec G101 -- This is a namespace name, not a credential
+)
+
+// WebhookProcessor handles the core webhook processing: finding affected components and
+// triggering builds. webhookProcessor (in this package) satisfies this interface.
+type WebhookProcessor interface {
+	ProcessWebhook(ctx context.Context, provider git.Provider, payload []byte) ([]string, error)
+}
+
+type autobuildService struct {
+	k8sClient client.Client
+	processor WebhookProcessor
+	logger    *slog.Logger
+}
+
+var _ Service = (*autobuildService)(nil)
+
+// NewService creates a new autobuild service.
+func NewService(k8sClient client.Client, processor WebhookProcessor, logger *slog.Logger) Service {
+	return &autobuildService{
+		k8sClient: k8sClient,
+		processor: processor,
+		logger:    logger,
+	}
+}
+
+// ProcessWebhook retrieves the appropriate git provider, validates the payload signature
+// against the stored Kubernetes secret, and delegates processing to the WebhookProcessor.
+func (s *autobuildService) ProcessWebhook(ctx context.Context, params *ProcessWebhookParams) (*WebhookResult, error) {
+	provider, err := git.GetProvider(params.ProviderType)
+	if err != nil {
+		s.logger.Error("Failed to get git provider", "error", err, "provider", params.ProviderType)
+		return nil, fmt.Errorf("failed to get git provider: %w", err)
+	}
+
+	// getWebhookSecret logs the specific failure reason internally and returns a sentinel;
+	// the raw error is not logged here to avoid any secret-derived value reaching the log.
+	webhookSecret, err := s.getWebhookSecret(ctx, params.SecretKey)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := provider.ValidateWebhookPayload(params.Payload, params.Signature, webhookSecret); err != nil {
+		s.logger.Error("Invalid webhook signature", "error", err, "provider", params.ProviderType)
+		return nil, ErrInvalidSignature
+	}
+
+	affectedComponents, err := s.processor.ProcessWebhook(ctx, provider, params.Payload)
+	if err != nil {
+		s.logger.Error("Failed to process webhook", "error", err, "provider", params.ProviderType)
+		return nil, fmt.Errorf("failed to process webhook: %w", err)
+	}
+
+	s.logger.Info("Webhook processed successfully",
+		"provider", params.ProviderType,
+		"affectedComponents", len(affectedComponents),
+	)
+	return &WebhookResult{AffectedComponents: affectedComponents}, nil
+}
+
+// getWebhookSecret retrieves the webhook secret value for the given key from the Kubernetes Secret.
+// A missing key or empty value is treated as an error so that signature validation always fails
+// closed when no secret is configured for the provider. Failures are logged here (using only
+// non-sensitive metadata) and reported to callers as ErrSecretNotConfigured.
+func (s *autobuildService) getWebhookSecret(ctx context.Context, secretKey string) (string, error) {
+	secret := &corev1.Secret{}
+	if err := s.k8sClient.Get(ctx, client.ObjectKey{
+		Name:      webhookSecretName,
+		Namespace: webhookSecretNamespace,
+	}, secret); err != nil {
+		s.logger.Error("Failed to fetch webhook secret from Kubernetes",
+			"namespace", webhookSecretNamespace, "name", webhookSecretName, "error", err)
+		return "", ErrSecretNotConfigured
+	}
+
+	secretData, ok := secret.Data[secretKey]
+	if !ok || len(secretData) == 0 {
+		// The provider key name is intentionally not logged; the caller logs the provider
+		// for correlation, and CodeQL treats the secret-key identifier as sensitive.
+		s.logger.Error("Webhook secret key is missing or empty",
+			"namespace", webhookSecretNamespace, "name", webhookSecretName)
+		return "", ErrSecretNotConfigured
+	}
+
+	return string(secretData), nil
+}

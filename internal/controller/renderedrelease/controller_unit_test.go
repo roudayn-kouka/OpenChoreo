@@ -1,0 +1,2018 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package renderedrelease
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/labels"
+)
+
+// helpers
+
+func int32Ptr(v int32) *int32 { return &v }
+func boolPtr(v bool) *bool    { return &v }
+
+// toUnstructured converts a typed object to *unstructured.Unstructured using the default converter.
+func toUnstructured(t *testing.T, obj interface{}) *unstructured.Unstructured {
+	t.Helper()
+	raw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		t.Fatalf("ToUnstructured: %v", err)
+	}
+	return &unstructured.Unstructured{Object: raw}
+}
+
+// ─────────────────────────────────────────────────────────────
+// addJitter
+// ─────────────────────────────────────────────────────────────
+
+func TestAddJitter(t *testing.T) {
+	base := 10 * time.Second
+
+	t.Run("zero maxJitter returns base", func(t *testing.T) {
+		result := addJitter(base, 0)
+		if result != base {
+			t.Errorf("expected %v, got %v", base, result)
+		}
+	})
+
+	t.Run("negative maxJitter returns base", func(t *testing.T) {
+		result := addJitter(base, -5*time.Second)
+		if result != base {
+			t.Errorf("expected %v, got %v", base, result)
+		}
+	})
+
+	t.Run("positive maxJitter returns value in [base, base+maxJitter)", func(t *testing.T) {
+		maxJitter := 2 * time.Second
+		for i := 0; i < 100; i++ {
+			result := addJitter(base, maxJitter)
+			if result < base || result >= base+maxJitter {
+				t.Errorf("result %v outside expected range [%v, %v)", result, base, base+maxJitter)
+			}
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// getStableRequeueInterval
+// ─────────────────────────────────────────────────────────────
+
+func TestGetStableRequeueInterval(t *testing.T) {
+	t.Run("nil interval defaults to 5m with jitter", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{}
+		result := getStableRequeueInterval(release)
+		if result < 5*time.Minute || result >= 6*time.Minute {
+			t.Errorf("expected result in [5m, 6m), got %v", result)
+		}
+	})
+
+	t.Run("interval set to 0 returns zero", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				Interval: &metav1.Duration{Duration: 0},
+			},
+		}
+		result := getStableRequeueInterval(release)
+		if result != 0 {
+			t.Errorf("expected 0, got %v", result)
+		}
+	})
+
+	t.Run("custom interval uses it as base with 20pct jitter", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				Interval: &metav1.Duration{Duration: 10 * time.Minute},
+			},
+		}
+		result := getStableRequeueInterval(release)
+		// 20% jitter: [10m, 12m)
+		if result < 10*time.Minute || result >= 12*time.Minute {
+			t.Errorf("expected result in [10m, 12m), got %v", result)
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// getProgressingRequeueInterval
+// ─────────────────────────────────────────────────────────────
+
+func TestGetProgressingRequeueInterval(t *testing.T) {
+	t.Run("nil interval defaults to 10s with jitter", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{}
+		result := getProgressingRequeueInterval(release)
+		if result < 10*time.Second || result >= 12*time.Second {
+			t.Errorf("expected result in [10s, 12s), got %v", result)
+		}
+	})
+
+	t.Run("interval set to 0 returns zero", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				ProgressingInterval: &metav1.Duration{Duration: 0},
+			},
+		}
+		result := getProgressingRequeueInterval(release)
+		if result != 0 {
+			t.Errorf("expected 0, got %v", result)
+		}
+	})
+
+	t.Run("custom interval uses it as base with 20pct jitter", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				ProgressingInterval: &metav1.Duration{Duration: 30 * time.Second},
+			},
+		}
+		result := getProgressingRequeueInterval(release)
+		// 20% jitter: [30s, 36s)
+		if result < 30*time.Second || result >= 36*time.Second {
+			t.Errorf("expected result in [30s, 36s), got %v", result)
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// findStaleResources
+// ─────────────────────────────────────────────────────────────
+
+func TestFindStaleResources(t *testing.T) {
+	r := &Reconciler{}
+
+	makeObj := func(resourceID string) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{}
+		obj.SetLabels(map[string]string{labels.LabelKeyRenderedReleaseResourceID: resourceID})
+		return obj
+	}
+
+	t.Run("empty live resources returns empty", func(t *testing.T) {
+		result := r.findStaleResources(nil, nil)
+		if len(result) != 0 {
+			t.Errorf("expected 0, got %d", len(result))
+		}
+	})
+
+	t.Run("live resource not in desired is stale", func(t *testing.T) {
+		live := []*unstructured.Unstructured{makeObj("res-1")}
+		desired := []*unstructured.Unstructured{makeObj("res-2")}
+		stale := r.findStaleResources(live, desired)
+		if len(stale) != 1 {
+			t.Fatalf("expected 1 stale, got %d", len(stale))
+		}
+		if stale[0].GetLabels()[labels.LabelKeyRenderedReleaseResourceID] != "res-1" {
+			t.Error("wrong stale resource returned")
+		}
+	})
+
+	t.Run("live resource in desired is not stale", func(t *testing.T) {
+		live := []*unstructured.Unstructured{makeObj("res-1")}
+		desired := []*unstructured.Unstructured{makeObj("res-1")}
+		stale := r.findStaleResources(live, desired)
+		if len(stale) != 0 {
+			t.Errorf("expected 0 stale, got %d", len(stale))
+		}
+	})
+
+	t.Run("live resource with no ID label is not stale", func(t *testing.T) {
+		noIDObj := &unstructured.Unstructured{}
+		noIDObj.SetLabels(map[string]string{"other": "label"})
+		stale := r.findStaleResources([]*unstructured.Unstructured{noIDObj}, nil)
+		if len(stale) != 0 {
+			t.Errorf("expected 0 (no ID label skipped), got %d", len(stale))
+		}
+	})
+
+	t.Run("mixed: some stale, some current", func(t *testing.T) {
+		live := []*unstructured.Unstructured{makeObj("keep"), makeObj("remove")}
+		desired := []*unstructured.Unstructured{makeObj("keep")}
+		stale := r.findStaleResources(live, desired)
+		if len(stale) != 1 {
+			t.Fatalf("expected 1 stale, got %d", len(stale))
+		}
+		if stale[0].GetLabels()[labels.LabelKeyRenderedReleaseResourceID] != "remove" {
+			t.Error("wrong stale resource")
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// findAllKnownGVKs
+// ─────────────────────────────────────────────────────────────
+
+func TestFindAllKnownGVKs(t *testing.T) {
+	const dpWellKnownCount = 20 // number of well-known GVKs for the data plane
+	const opWellKnownCount = 1  // number of well-known GVKs for the observability plane
+
+	containsGVK := func(gvks []schema.GroupVersionKind, group, kind string) bool {
+		for _, gvk := range gvks {
+			if gvk.Group == group && gvk.Kind == kind {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("empty inputs returns all data-plane well-known types", func(t *testing.T) {
+		gvks := findAllKnownGVKs(nil, nil, targetPlaneDataPlane)
+		if len(gvks) != dpWellKnownCount {
+			t.Errorf("expected %d well-known GVKs, got %d", dpWellKnownCount, len(gvks))
+		}
+	})
+
+	t.Run("data-plane well-known types include common Kubernetes resources", func(t *testing.T) {
+		gvks := findAllKnownGVKs(nil, nil, targetPlaneDataPlane)
+		for _, check := range []struct{ group, kind string }{
+			{"apps", "Deployment"},
+			{"apps", "StatefulSet"},
+			{"", "Service"},
+			{"", "ConfigMap"},
+			{"batch", "CronJob"},
+			{"networking.k8s.io", "NetworkPolicy"},
+		} {
+			if !containsGVK(gvks, check.group, check.kind) {
+				t.Errorf("expected well-known GVK %s/%s to be present", check.group, check.kind)
+			}
+		}
+	})
+
+	t.Run("observability-plane well-known types contain only obs-plane CRDs", func(t *testing.T) {
+		gvks := findAllKnownGVKs(nil, nil, targetPlaneObservabilityPlane)
+		if len(gvks) != opWellKnownCount {
+			t.Errorf("expected %d well-known GVKs for obs plane, got %d", opWellKnownCount, len(gvks))
+		}
+		if !containsGVK(gvks, "openchoreo.dev", "ObservabilityAlertRule") {
+			t.Error("expected obs-plane well-known GVK openchoreo.dev/ObservabilityAlertRule to be present")
+		}
+		// Control-plane-only and data-plane types must NOT appear in the obs-plane list
+		if containsGVK(gvks, "openchoreo.dev", "ObservabilityAlertsNotificationChannel") {
+			t.Error("ObservabilityAlertsNotificationChannel is a control-plane CRD and must not appear in obs-plane list")
+		}
+		if containsGVK(gvks, "apps", "Deployment") || containsGVK(gvks, "", "Service") {
+			t.Error("data-plane GVKs must not appear in the observability-plane well-known list")
+		}
+	})
+
+	t.Run("custom desired resource GVK is included alongside well-known", func(t *testing.T) {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "Widget"})
+		gvks := findAllKnownGVKs([]*unstructured.Unstructured{obj}, nil, targetPlaneDataPlane)
+		if len(gvks) != dpWellKnownCount+1 {
+			t.Errorf("expected %d, got %d", dpWellKnownCount+1, len(gvks))
+		}
+		if !containsGVK(gvks, "custom.io", "Widget") {
+			t.Error("custom GVK not found in result")
+		}
+	})
+
+	t.Run("desired resource matching a well-known GVK is not duplicated", func(t *testing.T) {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
+		gvks := findAllKnownGVKs([]*unstructured.Unstructured{obj}, nil, targetPlaneDataPlane)
+		if len(gvks) != dpWellKnownCount {
+			t.Errorf("expected %d (no duplication), got %d", dpWellKnownCount, len(gvks))
+		}
+	})
+
+	t.Run("applied resource status GVK is included alongside well-known", func(t *testing.T) {
+		applied := []openchoreov1alpha1.RenderedManifestStatus{
+			{Group: "legacy.io", Version: "v1", Kind: "OldThing"},
+		}
+		gvks := findAllKnownGVKs(nil, applied, targetPlaneDataPlane)
+		if len(gvks) != dpWellKnownCount+1 {
+			t.Errorf("expected %d, got %d", dpWellKnownCount+1, len(gvks))
+		}
+		if !containsGVK(gvks, "legacy.io", "OldThing") {
+			t.Error("applied resource GVK not found in result")
+		}
+	})
+
+	t.Run("desired and applied GVKs are deduplicated against each other", func(t *testing.T) {
+		desiredObj := &unstructured.Unstructured{}
+		desiredObj.SetGroupVersionKind(schema.GroupVersionKind{Group: "a.io", Version: "v1", Kind: "A"})
+		applied := []openchoreov1alpha1.RenderedManifestStatus{
+			{Group: "a.io", Version: "v1", Kind: "A"}, // duplicate of desired
+			{Group: "b.io", Version: "v1", Kind: "B"},
+		}
+		gvks := findAllKnownGVKs([]*unstructured.Unstructured{desiredObj}, applied, targetPlaneDataPlane)
+		if len(gvks) != dpWellKnownCount+2 {
+			t.Errorf("expected %d, got %d", dpWellKnownCount+2, len(gvks))
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// hasTransitioningResources
+// ─────────────────────────────────────────────────────────────
+
+func TestHasTransitioningResources(t *testing.T) {
+	r := &Reconciler{}
+
+	tests := []struct {
+		name      string
+		resources []openchoreov1alpha1.RenderedManifestStatus
+		want      bool
+	}{
+		{
+			name:      "empty resources returns false",
+			resources: nil,
+			want:      false,
+		},
+		{
+			name:      "healthy resource returns false",
+			resources: []openchoreov1alpha1.RenderedManifestStatus{{HealthStatus: openchoreov1alpha1.HealthStatusHealthy}},
+			want:      false,
+		},
+		{
+			name:      "suspended resource returns false",
+			resources: []openchoreov1alpha1.RenderedManifestStatus{{HealthStatus: openchoreov1alpha1.HealthStatusSuspended}},
+			want:      false,
+		},
+		{
+			name:      "progressing resource returns true",
+			resources: []openchoreov1alpha1.RenderedManifestStatus{{HealthStatus: openchoreov1alpha1.HealthStatusProgressing}},
+			want:      true,
+		},
+		{
+			name:      "unknown resource returns true",
+			resources: []openchoreov1alpha1.RenderedManifestStatus{{HealthStatus: openchoreov1alpha1.HealthStatusUnknown}},
+			want:      true,
+		},
+		{
+			name:      "degraded resource returns true",
+			resources: []openchoreov1alpha1.RenderedManifestStatus{{HealthStatus: openchoreov1alpha1.HealthStatusDegraded}},
+			want:      true,
+		},
+		{
+			name: "mix of healthy and progressing returns true",
+			resources: []openchoreov1alpha1.RenderedManifestStatus{
+				{HealthStatus: openchoreov1alpha1.HealthStatusHealthy},
+				{HealthStatus: openchoreov1alpha1.HealthStatusProgressing},
+			},
+			want: true,
+		},
+		{
+			name: "all healthy returns false",
+			resources: []openchoreov1alpha1.RenderedManifestStatus{
+				{HealthStatus: openchoreov1alpha1.HealthStatusHealthy},
+				{HealthStatus: openchoreov1alpha1.HealthStatusSuspended},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := r.hasTransitioningResources(tt.resources)
+			if got != tt.want {
+				t.Errorf("expected %v, got %v", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// hasResurrectableWorkload
+// ─────────────────────────────────────────────────────────────
+
+func TestHasResurrectableWorkload(t *testing.T) {
+	// desired is a rendered manifest carrying its GVK + resource-ID label; live is the object
+	// fetched back from the plane (no GVK on list items) sharing the same resource-ID label.
+	desired := func(resID string, gvk schema.GroupVersionKind) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		u.SetLabels(map[string]string{labels.LabelKeyRenderedReleaseResourceID: resID})
+		return u
+	}
+	deploymentGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	statefulSetGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "StatefulSet"}
+	liveDeployment := func(resID string, replicas *int32, paused bool) *unstructured.Unstructured {
+		u := toUnstructured(t, &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: replicas, Paused: paused}})
+		u.SetLabels(map[string]string{labels.LabelKeyRenderedReleaseResourceID: resID})
+		return u
+	}
+	liveStatefulSet := func(resID string, replicas *int32) *unstructured.Unstructured {
+		u := toUnstructured(t, &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{Replicas: replicas}})
+		u.SetLabels(map[string]string{labels.LabelKeyRenderedReleaseResourceID: resID})
+		return u
+	}
+	serviceGVK := schema.GroupVersionKind{Version: "v1", Kind: "Service"}
+
+	tests := []struct {
+		name    string
+		desired []*unstructured.Unstructured
+		live    []*unstructured.Unstructured
+		want    bool
+	}{
+		{
+			name: "empty resources returns false",
+			want: false,
+		},
+		{
+			name:    "deployment scaled to zero returns true",
+			desired: []*unstructured.Unstructured{desired("d1", deploymentGVK)},
+			live:    []*unstructured.Unstructured{liveDeployment("d1", int32Ptr(0), false)},
+			want:    true,
+		},
+		{
+			name:    "paused deployment at zero returns false",
+			desired: []*unstructured.Unstructured{desired("d1", deploymentGVK)},
+			live:    []*unstructured.Unstructured{liveDeployment("d1", int32Ptr(0), true)},
+			want:    false,
+		},
+		{
+			name:    "deployment with replicas returns false",
+			desired: []*unstructured.Unstructured{desired("d1", deploymentGVK)},
+			live:    []*unstructured.Unstructured{liveDeployment("d1", int32Ptr(2), false)},
+			want:    false,
+		},
+		{
+			name:    "deployment without replicas field returns false",
+			desired: []*unstructured.Unstructured{desired("d1", deploymentGVK)},
+			live:    []*unstructured.Unstructured{liveDeployment("d1", nil, false)},
+			want:    false,
+		},
+		{
+			name:    "statefulset scaled to zero returns true",
+			desired: []*unstructured.Unstructured{desired("s1", statefulSetGVK)},
+			live:    []*unstructured.Unstructured{liveStatefulSet("s1", int32Ptr(0))},
+			want:    true,
+		},
+		{
+			name:    "non-workload kind at zero returns false",
+			desired: []*unstructured.Unstructured{desired("svc", serviceGVK)},
+			live:    nil,
+			want:    false,
+		},
+		{
+			name:    "no matching live resource returns false",
+			desired: []*unstructured.Unstructured{desired("d1", deploymentGVK)},
+			live:    nil,
+			want:    false,
+		},
+		{
+			name:    "mix with a scaled-to-zero deployment returns true",
+			desired: []*unstructured.Unstructured{desired("d1", deploymentGVK), desired("d2", deploymentGVK)},
+			live:    []*unstructured.Unstructured{liveDeployment("d1", int32Ptr(1), false), liveDeployment("d2", int32Ptr(0), false)},
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasResurrectableWorkload(tt.desired, tt.live)
+			if got != tt.want {
+				t.Errorf("expected %v, got %v", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// GetHealthCheckFunc
+// ─────────────────────────────────────────────────────────────
+
+func TestGetHealthCheckFunc(t *testing.T) {
+	tests := []struct {
+		name        string
+		gvk         schema.GroupVersionKind
+		wantNonNil  bool
+		wantUnknown bool // if true, the result fn should be getUnknownResourceHealth
+	}{
+		{
+			name:       "apps/Deployment",
+			gvk:        schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
+			wantNonNil: true,
+		},
+		{
+			name:       "apps/StatefulSet",
+			gvk:        schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "StatefulSet"},
+			wantNonNil: true,
+		},
+		{
+			name:       "core/Pod",
+			gvk:        schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"},
+			wantNonNil: true,
+		},
+		{
+			name:       "batch/CronJob",
+			gvk:        schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "CronJob"},
+			wantNonNil: true,
+		},
+		{
+			name:        "unknown resource returns non-nil health function",
+			gvk:         schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "Widget"},
+			wantNonNil:  true,
+			wantUnknown: true,
+		},
+		{
+			name:        "core/Service uses unknown health function",
+			gvk:         schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Service"},
+			wantNonNil:  true,
+			wantUnknown: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fn := GetHealthCheckFunc(tt.gvk)
+			if tt.wantNonNil && fn == nil {
+				t.Error("expected non-nil health check function")
+			}
+
+			if tt.wantUnknown && fn != nil {
+				// Unknown health function should return Healthy for any object
+				obj := &unstructured.Unstructured{}
+				obj.SetGroupVersionKind(tt.gvk)
+				health, err := fn(obj)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if health != openchoreov1alpha1.HealthStatusHealthy {
+					t.Errorf("unknown resource health: expected Healthy, got %s", health)
+				}
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// getDeploymentHealth
+// ─────────────────────────────────────────────────────────────
+
+func TestGetDeploymentHealth(t *testing.T) {
+	makeDeployment := func(d appsv1.Deployment) *unstructured.Unstructured {
+		return toUnstructured(t, &d)
+	}
+
+	tests := []struct {
+		name       string
+		deployment appsv1.Deployment
+		want       openchoreov1alpha1.HealthStatus
+		wantErr    bool
+	}{
+		{
+			name: "paused deployment is Suspended",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Paused: true, Replicas: int32Ptr(1)},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
+			},
+			want: openchoreov1alpha1.HealthStatusSuspended,
+		},
+		{
+			name: "zero replicas is Suspended",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(0)},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
+			},
+			want: openchoreov1alpha1.HealthStatusSuspended,
+		},
+		{
+			name: "new deployment (ObservedGeneration==0) is Progressing",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(1)},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 0},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "generation ahead of observed is Progressing",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 3},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(1)},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "ProgressDeadlineExceeded is Degraded",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(1)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentProgressing, Reason: "ProgressDeadlineExceeded"},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "ReplicaFailure is Degraded",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(1)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentReplicaFailure, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "all replicas match and none unavailable is Healthy",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(3)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration:  1,
+					UpdatedReplicas:     3,
+					ReadyReplicas:       3,
+					AvailableReplicas:   3,
+					UnavailableReplicas: 0,
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusHealthy,
+		},
+		{
+			name: "not all replicas ready is Progressing",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(3)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration:  1,
+					UpdatedReplicas:     3,
+					ReadyReplicas:       1,
+					AvailableReplicas:   1,
+					UnavailableReplicas: 2,
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "all pods on new revision but none available, progressing condition true is Progressing",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					UpdatedReplicas:    2,
+					AvailableReplicas:  0,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "rollout complete (NewReplicaSetAvailable) but no pods available is Degraded",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					UpdatedReplicas:    2,
+					AvailableReplicas:  0,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "NewReplicaSetAvailable"},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "replica set still updating (ReplicaSetUpdated) with no pods available is Progressing",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					UpdatedReplicas:    2,
+					AvailableReplicas:  0,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "ReplicaSetUpdated"},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "all pods on new revision but none available, progressing condition false is Degraded",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					UpdatedReplicas:    2,
+					AvailableReplicas:  0,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionFalse},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "all pods on new revision but none available, progressing condition unknown is Degraded",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					UpdatedReplicas:    2,
+					AvailableReplicas:  0,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionUnknown},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := makeDeployment(tt.deployment)
+			got, err := getDeploymentHealth(obj)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("expected %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// getStatefulSetHealth
+// ─────────────────────────────────────────────────────────────
+
+func TestGetStatefulSetHealth(t *testing.T) {
+	makeSTS := func(s appsv1.StatefulSet) *unstructured.Unstructured {
+		return toUnstructured(t, &s)
+	}
+
+	tests := []struct {
+		name        string
+		statefulSet appsv1.StatefulSet
+		want        openchoreov1alpha1.HealthStatus
+	}{
+		{
+			name: "new statefulset (ObservedGeneration==0) is Progressing",
+			statefulSet: appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(2)},
+				Status:     appsv1.StatefulSetStatus{ObservedGeneration: 0},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "generation ahead of observed is Progressing",
+			statefulSet: appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: 3},
+				Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(1)},
+				Status:     appsv1.StatefulSetStatus{ObservedGeneration: 2},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "update in progress (revision mismatch) is Progressing",
+			statefulSet: appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(2)},
+				Status: appsv1.StatefulSetStatus{
+					ObservedGeneration: 1,
+					CurrentRevision:    "rev-1",
+					UpdateRevision:     "rev-2",
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "all replicas ready and updated is Healthy",
+			statefulSet: appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+				Status: appsv1.StatefulSetStatus{
+					ObservedGeneration: 1,
+					CurrentRevision:    "rev-1",
+					UpdateRevision:     "rev-1",
+					ReadyReplicas:      3,
+					AvailableReplicas:  3,
+					UpdatedReplicas:    3,
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusHealthy,
+		},
+		{
+			name: "partially ready is Progressing",
+			statefulSet: appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+				Status: appsv1.StatefulSetStatus{
+					ObservedGeneration: 1,
+					CurrentRevision:    "rev-1",
+					UpdateRevision:     "rev-1",
+					ReadyReplicas:      1,
+					AvailableReplicas:  1,
+					UpdatedReplicas:    3,
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := makeSTS(tt.statefulSet)
+			got, err := getStatefulSetHealth(obj)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("expected %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// getPodHealth
+// ─────────────────────────────────────────────────────────────
+
+func TestGetPodHealth(t *testing.T) {
+	makePod := func(p corev1.Pod) *unstructured.Unstructured {
+		return toUnstructured(t, &p)
+	}
+
+	tests := []struct {
+		name string
+		pod  corev1.Pod
+		want openchoreov1alpha1.HealthStatus
+	}{
+		{
+			name: "pending pod is Progressing",
+			pod:  corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "running pod with all containers ready is Healthy",
+			pod: corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{Ready: true},
+						{Ready: true},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusHealthy,
+		},
+		{
+			name: "running pod with not-ready container is Progressing",
+			pod: corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{Ready: true},
+						{Ready: false},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "running pod with CrashLoopBackOff is Degraded",
+			pod: corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							State: corev1.ContainerState{
+								Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+							},
+						},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "running pod with ImagePullBackOff is Degraded",
+			pod: corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							State: corev1.ContainerState{
+								Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"},
+							},
+						},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "running pod with ErrImagePull is Degraded",
+			pod: corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							State: corev1.ContainerState{
+								Waiting: &corev1.ContainerStateWaiting{Reason: "ErrImagePull"},
+							},
+						},
+					},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "succeeded pod is Healthy",
+			pod:  corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodSucceeded}},
+			want: openchoreov1alpha1.HealthStatusHealthy,
+		},
+		{
+			name: "failed pod is Degraded",
+			pod:  corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodFailed}},
+			want: openchoreov1alpha1.HealthStatusDegraded,
+		},
+		{
+			name: "unknown pod phase is Unknown",
+			pod:  corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodUnknown}},
+			want: openchoreov1alpha1.HealthStatusUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := makePod(tt.pod)
+			got, err := getPodHealth(obj)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("expected %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// getCronJobHealth
+// ─────────────────────────────────────────────────────────────
+
+func TestGetCronJobHealth(t *testing.T) {
+	now := metav1.Now()
+	makeCJ := func(cj batchv1.CronJob) *unstructured.Unstructured {
+		return toUnstructured(t, &cj)
+	}
+
+	tests := []struct {
+		name    string
+		cronJob batchv1.CronJob
+		want    openchoreov1alpha1.HealthStatus
+	}{
+		{
+			name: "suspended cronjob is Suspended",
+			cronJob: batchv1.CronJob{
+				Spec: batchv1.CronJobSpec{Suspend: boolPtr(true)},
+			},
+			want: openchoreov1alpha1.HealthStatusSuspended,
+		},
+		{
+			name: "active jobs means Progressing",
+			cronJob: batchv1.CronJob{
+				Spec: batchv1.CronJobSpec{Suspend: boolPtr(false)},
+				Status: batchv1.CronJobStatus{
+					Active: []corev1.ObjectReference{{Name: "job-1"}},
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+		{
+			name: "has last schedule time with no active jobs is Healthy",
+			cronJob: batchv1.CronJob{
+				Status: batchv1.CronJobStatus{
+					LastScheduleTime: &now,
+				},
+			},
+			want: openchoreov1alpha1.HealthStatusHealthy,
+		},
+		{
+			name: "never run and not suspended is Progressing",
+			cronJob: batchv1.CronJob{
+				Spec:   batchv1.CronJobSpec{},
+				Status: batchv1.CronJobStatus{},
+			},
+			want: openchoreov1alpha1.HealthStatusProgressing,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := makeCJ(tt.cronJob)
+			got, err := getCronJobHealth(obj)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("expected %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// getUnknownResourceHealth
+// ─────────────────────────────────────────────────────────────
+
+func TestGetUnknownResourceHealth(t *testing.T) {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"})
+	obj.SetName("test")
+
+	health, err := getUnknownResourceHealth(obj)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if health != openchoreov1alpha1.HealthStatusHealthy {
+		t.Errorf("expected Healthy, got %s", health)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// makeDesiredResources
+// ─────────────────────────────────────────────────────────────
+
+func TestMakeDesiredResources(t *testing.T) {
+	r := &Reconciler{}
+
+	t.Run("empty resources returns empty slice", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: "default", UID: "uid-1"},
+		}
+		result, err := r.makeDesiredResources(release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result) != 0 {
+			t.Errorf("expected 0, got %d", len(result))
+		}
+	})
+
+	t.Run("resource with valid JSON gets tracking labels", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-release", Namespace: "cp-ns", UID: "release-uid-abc"},
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				Resources: []openchoreov1alpha1.RenderedManifest{
+					{
+						ID:     "res-configmap",
+						Object: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm1","namespace":"dp-ns"}}`)},
+					},
+				},
+			},
+		}
+		result, err := r.makeDesiredResources(release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result) != 1 {
+			t.Fatalf("expected 1, got %d", len(result))
+		}
+
+		lbls := result[0].GetLabels()
+		checks := map[string]string{
+			labels.LabelKeyManagedBy:                 ControllerName,
+			labels.LabelKeyRenderedReleaseResourceID: "res-configmap",
+			labels.LabelKeyRenderedReleaseUID:        "release-uid-abc",
+			labels.LabelKeyRenderedReleaseName:       "my-release",
+			labels.LabelKeyRenderedReleaseNamespace:  "cp-ns",
+		}
+		for key, want := range checks {
+			if got := lbls[key]; got != want {
+				t.Errorf("label %s: expected %q, got %q", key, want, got)
+			}
+		}
+	})
+
+	t.Run("existing labels in resource are preserved", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			ObjectMeta: metav1.ObjectMeta{Name: "r2", Namespace: "ns", UID: "uid-2"},
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				Resources: []openchoreov1alpha1.RenderedManifest{
+					{
+						ID:     "res-x",
+						Object: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","labels":{"app":"myapp"}}}`)},
+					},
+				},
+			},
+		}
+		result, err := r.makeDesiredResources(release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result[0].GetLabels()["app"] != "myapp" {
+			t.Error("existing label not preserved")
+		}
+		if result[0].GetLabels()[labels.LabelKeyManagedBy] != ControllerName {
+			t.Error("tracking label not added")
+		}
+	})
+
+	t.Run("resource with invalid JSON returns error", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				Resources: []openchoreov1alpha1.RenderedManifest{
+					{
+						ID:     "bad",
+						Object: &runtime.RawExtension{Raw: []byte(`not json`)},
+					},
+				},
+			},
+		}
+		_, err := r.makeDesiredResources(release)
+		if err == nil {
+			t.Error("expected error for invalid JSON")
+		}
+	})
+
+	t.Run("multiple resources all get tracking labels", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			ObjectMeta: metav1.ObjectMeta{Name: "r3", Namespace: "ns3", UID: "uid-3"},
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				Resources: []openchoreov1alpha1.RenderedManifest{
+					{ID: "a", Object: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a"}}`)}},
+					{ID: "b", Object: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"b"}}`)}},
+				},
+			},
+		}
+		result, err := r.makeDesiredResources(release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result) != 2 {
+			t.Fatalf("expected 2, got %d", len(result))
+		}
+		for _, obj := range result {
+			if obj.GetLabels()[labels.LabelKeyManagedBy] != ControllerName {
+				t.Errorf("tracking label missing on %s", obj.GetName())
+			}
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// makeDesiredNamespaces
+// ─────────────────────────────────────────────────────────────
+
+func TestMakeDesiredNamespaces(t *testing.T) {
+	r := &Reconciler{}
+
+	makeObjInNamespace := func(namespace string) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"})
+		if namespace != "" {
+			obj.SetNamespace(namespace)
+		}
+		return obj
+	}
+
+	t.Run("empty resources returns empty slice", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{}
+		result := r.makeDesiredNamespaces(release, nil)
+		if len(result) != 0 {
+			t.Errorf("expected 0, got %d", len(result))
+		}
+	})
+
+	t.Run("resources with empty namespace are skipped", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{}
+		result := r.makeDesiredNamespaces(release, []*unstructured.Unstructured{
+			makeObjInNamespace(""),
+			makeObjInNamespace(""),
+		})
+		if len(result) != 0 {
+			t.Errorf("expected 0 (cluster-scoped resources skipped), got %d", len(result))
+		}
+	})
+
+	t.Run("distinct namespaces are deduplicated", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{}
+		result := r.makeDesiredNamespaces(release, []*unstructured.Unstructured{
+			makeObjInNamespace("ns-a"),
+			makeObjInNamespace("ns-a"),
+			makeObjInNamespace("ns-b"),
+			makeObjInNamespace(""),
+		})
+		if len(result) != 2 {
+			t.Fatalf("expected 2 deduplicated namespaces, got %d", len(result))
+		}
+		names := map[string]bool{}
+		for _, ns := range result {
+			names[ns.Name] = true
+		}
+		if !names["ns-a"] || !names["ns-b"] {
+			t.Errorf("expected ns-a and ns-b, got %v", names)
+		}
+	})
+
+	t.Run("labels populated from the release", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-release", Namespace: "cp-ns", UID: "uid-xyz"},
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{
+				EnvironmentName: "dev",
+				Owner:           openchoreov1alpha1.RenderedReleaseOwner{ProjectName: "my-project"},
+			},
+		}
+		result := r.makeDesiredNamespaces(release, []*unstructured.Unstructured{makeObjInNamespace("op-ns")})
+		if len(result) != 1 {
+			t.Fatalf("expected 1, got %d", len(result))
+		}
+		ns := result[0]
+		if ns.Name != "op-ns" {
+			t.Errorf("expected namespace name op-ns, got %s", ns.Name)
+		}
+		checks := map[string]string{
+			labels.LabelKeyCreatedBy:                ControllerName,
+			labels.LabelKeyRenderedReleaseName:      "my-release",
+			labels.LabelKeyRenderedReleaseNamespace: "cp-ns",
+			labels.LabelKeyRenderedReleaseUID:       "uid-xyz",
+			labels.LabelKeyNamespaceName:            "cp-ns",
+			labels.LabelKeyEnvironmentName:          "dev",
+			labels.LabelKeyProjectName:              "my-project",
+		}
+		for key, want := range checks {
+			if got := ns.Labels[key]; got != want {
+				t.Errorf("label %s: expected %q, got %q", key, want, got)
+			}
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// ensureNamespaces
+// ─────────────────────────────────────────────────────────────
+
+func TestEnsureNamespaces(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{}
+
+	makeNamespace := func(name string) *corev1.Namespace {
+		return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	}
+
+	t.Run("creates namespace that does not exist", func(t *testing.T) {
+		cl := fake.NewClientBuilder().Build()
+		if err := r.ensureNamespaces(ctx, cl, []*corev1.Namespace{makeNamespace("new-ns")}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := &corev1.Namespace{}
+		if err := cl.Get(ctx, client.ObjectKey{Name: "new-ns"}, got); err != nil {
+			t.Errorf("expected namespace to be created: %v", err)
+		}
+	})
+
+	t.Run("is idempotent when namespace already exists", func(t *testing.T) {
+		cl := fake.NewClientBuilder().WithObjects(makeNamespace("existing-ns")).Build()
+		if err := r.ensureNamespaces(ctx, cl, []*corev1.Namespace{makeNamespace("existing-ns")}); err != nil {
+			t.Fatalf("unexpected error for existing namespace: %v", err)
+		}
+	})
+
+	t.Run("empty list is a no-op", func(t *testing.T) {
+		cl := fake.NewClientBuilder().Build()
+		if err := r.ensureNamespaces(ctx, cl, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// NewRenderedReleaseFinalizingCondition / NewRenderedReleaseCleanupFailedCondition
+// ─────────────────────────────────────────────────────────────
+
+func TestNewRenderedReleaseFinalizingCondition(t *testing.T) {
+	cond := NewRenderedReleaseFinalizingCondition(42)
+
+	if cond.Type != string(ConditionFinalizing) {
+		t.Errorf("expected type %s, got %s", ConditionFinalizing, cond.Type)
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("expected status True, got %s", cond.Status)
+	}
+	if cond.Reason != string(ReasonCleanupInProgress) {
+		t.Errorf("expected reason %s, got %s", ReasonCleanupInProgress, cond.Reason)
+	}
+	if cond.ObservedGeneration != 42 {
+		t.Errorf("expected generation 42, got %d", cond.ObservedGeneration)
+	}
+}
+
+func TestNewRenderedReleaseCleanupFailedCondition(t *testing.T) {
+	testErr := fmt.Errorf("connection refused")
+	cond := NewRenderedReleaseCleanupFailedCondition(7, testErr)
+
+	if cond.Type != string(ConditionFinalizing) {
+		t.Errorf("expected type %s, got %s", ConditionFinalizing, cond.Type)
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("expected status True, got %s", cond.Status)
+	}
+	if cond.Reason != string(ReasonCleanupFailed) {
+		t.Errorf("expected reason %s, got %s", ReasonCleanupFailed, cond.Reason)
+	}
+	if cond.Message != testErr.Error() {
+		t.Errorf("expected message %q, got %q", testErr.Error(), cond.Message)
+	}
+	if cond.ObservedGeneration != 7 {
+		t.Errorf("expected generation 7, got %d", cond.ObservedGeneration)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// buildResourceStatus
+// ─────────────────────────────────────────────────────────────
+
+// buildResourcesDesired returns a minimal desired ConfigMap unstructured object with a tracking resource ID label.
+func buildResourcesDesired(resourceID, name string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"})
+	obj.SetName(name)
+	obj.SetNamespace("default")
+	obj.SetLabels(map[string]string{
+		labels.LabelKeyRenderedReleaseResourceID: resourceID,
+	})
+	return obj
+}
+
+// buildResourcesLive returns a live ConfigMap with the same identity labels plus an optional status field.
+func buildResourcesLive(resourceID, name string, statusField map[string]interface{}) *unstructured.Unstructured {
+	obj := buildResourcesDesired(resourceID, name)
+	if statusField != nil {
+		obj.Object["status"] = statusField
+	}
+	return obj
+}
+
+func TestBuildResourceStatus(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{}
+	emptyRelease := &openchoreov1alpha1.RenderedRelease{}
+
+	t.Run("empty desired and live resources returns empty", func(t *testing.T) {
+		result := r.buildResourceStatus(ctx, emptyRelease, nil, nil)
+		if len(result) != 0 {
+			t.Errorf("expected empty slice, got %d items", len(result))
+		}
+	})
+
+	t.Run("desired resource without matching live resource gets Unknown health and nil status", func(t *testing.T) {
+		desired := buildResourcesDesired("res-1", "my-cm")
+		result := r.buildResourceStatus(ctx, emptyRelease, []*unstructured.Unstructured{desired}, nil)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		rs := result[0]
+		if rs.ID != "res-1" {
+			t.Errorf("expected ID res-1, got %s", rs.ID)
+		}
+		if rs.HealthStatus != openchoreov1alpha1.HealthStatusUnknown {
+			t.Errorf("expected HealthStatusUnknown, got %s", rs.HealthStatus)
+		}
+		if rs.Status != nil {
+			t.Errorf("expected nil Status, got %v", rs.Status)
+		}
+		if rs.LastObservedTime != nil {
+			t.Errorf("expected nil LastObservedTime, got %v", rs.LastObservedTime)
+		}
+	})
+
+	t.Run("desired resource with matching live resource extracts Healthy status and sets timestamp", func(t *testing.T) {
+		desired := buildResourcesDesired("res-1", "my-cm")
+		// ConfigMap uses getUnknownResourceHealth → always Healthy
+		live := buildResourcesLive("res-1", "my-cm", map[string]interface{}{"phase": "Active"})
+		result := r.buildResourceStatus(ctx, emptyRelease, []*unstructured.Unstructured{desired}, []*unstructured.Unstructured{live})
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		rs := result[0]
+		if rs.HealthStatus != openchoreov1alpha1.HealthStatusHealthy {
+			t.Errorf("expected HealthStatusHealthy, got %s", rs.HealthStatus)
+		}
+		if rs.Status == nil {
+			t.Error("expected non-nil Status")
+		}
+		if rs.LastObservedTime == nil {
+			t.Error("expected non-nil LastObservedTime")
+		}
+	})
+}
+
+func TestBuildResourceStatusStatusMarshaling(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{}
+	emptyRelease := &openchoreov1alpha1.RenderedRelease{}
+
+	statusData := map[string]interface{}{"replicas": float64(3), "readyReplicas": float64(3)}
+	desired := buildResourcesDesired("res-1", "my-cm")
+	live := buildResourcesLive("res-1", "my-cm", statusData)
+	result := r.buildResourceStatus(ctx, emptyRelease, []*unstructured.Unstructured{desired}, []*unstructured.Unstructured{live})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(result))
+	}
+	rs := result[0]
+	if rs.Status == nil {
+		t.Fatal("expected non-nil Status")
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(rs.Status.Raw, &got); err != nil {
+		t.Fatalf("failed to unmarshal status: %v", err)
+	}
+	if got["replicas"] != float64(3) {
+		t.Errorf("expected replicas=3, got %v", got["replicas"])
+	}
+	if got["readyReplicas"] != float64(3) {
+		t.Errorf("expected readyReplicas=3, got %v", got["readyReplicas"])
+	}
+}
+
+func TestBuildResourceStatusTimestamps(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{}
+	emptyRelease := &openchoreov1alpha1.RenderedRelease{}
+	fixedTime := metav1.NewTime(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	t.Run("timestamp preserved when status and health are unchanged", func(t *testing.T) {
+		statusData := map[string]interface{}{"phase": "Active"}
+		statusBytes, _ := json.Marshal(statusData)
+		old := &openchoreov1alpha1.RenderedRelease{
+			Status: openchoreov1alpha1.RenderedReleaseStatus{
+				Resources: []openchoreov1alpha1.RenderedManifestStatus{
+					{
+						ID:               "res-1",
+						HealthStatus:     openchoreov1alpha1.HealthStatusHealthy, // matches ConfigMap's getUnknownResourceHealth
+						Status:           &runtime.RawExtension{Raw: statusBytes},
+						LastObservedTime: &fixedTime,
+					},
+				},
+			},
+		}
+		result := r.buildResourceStatus(ctx, old,
+			[]*unstructured.Unstructured{buildResourcesDesired("res-1", "my-cm")},
+			[]*unstructured.Unstructured{buildResourcesLive("res-1", "my-cm", statusData)},
+		)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		if result[0].LastObservedTime == nil {
+			t.Fatal("expected non-nil LastObservedTime")
+		}
+		if !result[0].LastObservedTime.Equal(&fixedTime) {
+			t.Errorf("expected timestamp to be preserved: got %v, want %v", result[0].LastObservedTime, fixedTime)
+		}
+	})
+
+	t.Run("timestamp updated when health changes", func(t *testing.T) {
+		// Old has Progressing; new live ConfigMap will produce Healthy → health changed
+		old := &openchoreov1alpha1.RenderedRelease{
+			Status: openchoreov1alpha1.RenderedReleaseStatus{
+				Resources: []openchoreov1alpha1.RenderedManifestStatus{
+					{
+						ID:               "res-1",
+						HealthStatus:     openchoreov1alpha1.HealthStatusProgressing,
+						LastObservedTime: &fixedTime,
+					},
+				},
+			},
+		}
+		result := r.buildResourceStatus(ctx, old,
+			[]*unstructured.Unstructured{buildResourcesDesired("res-1", "my-cm")},
+			[]*unstructured.Unstructured{buildResourcesLive("res-1", "my-cm", nil)},
+		)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		if result[0].LastObservedTime == nil {
+			t.Fatal("expected non-nil LastObservedTime")
+		}
+		if result[0].LastObservedTime.Equal(&fixedTime) {
+			t.Error("expected timestamp to be updated, but it was preserved from old")
+		}
+	})
+
+	t.Run("timestamp updated for new resource not in old status", func(t *testing.T) {
+		result := r.buildResourceStatus(ctx, emptyRelease,
+			[]*unstructured.Unstructured{buildResourcesDesired("res-new", "new-cm")},
+			[]*unstructured.Unstructured{buildResourcesLive("res-new", "new-cm", nil)},
+		)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		if result[0].LastObservedTime == nil {
+			t.Error("expected non-nil LastObservedTime for new resource")
+		}
+	})
+}
+
+func TestBuildResourceStatusMixedResources(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{}
+	emptyRelease := &openchoreov1alpha1.RenderedRelease{}
+
+	// res-2 has no live resource; res-1 and res-3 do
+	result := r.buildResourceStatus(ctx, emptyRelease,
+		[]*unstructured.Unstructured{
+			buildResourcesDesired("res-1", "cm-1"),
+			buildResourcesDesired("res-2", "cm-2"),
+			buildResourcesDesired("res-3", "cm-3"),
+		},
+		[]*unstructured.Unstructured{
+			buildResourcesLive("res-1", "cm-1", nil),
+			buildResourcesLive("res-3", "cm-3", nil),
+		},
+	)
+	if len(result) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(result))
+	}
+
+	byID := make(map[string]openchoreov1alpha1.RenderedManifestStatus)
+	for _, rs := range result {
+		byID[rs.ID] = rs
+	}
+
+	if byID["res-1"].HealthStatus != openchoreov1alpha1.HealthStatusHealthy {
+		t.Errorf("res-1: expected Healthy, got %s", byID["res-1"].HealthStatus)
+	}
+	if byID["res-3"].HealthStatus != openchoreov1alpha1.HealthStatusHealthy {
+		t.Errorf("res-3: expected Healthy, got %s", byID["res-3"].HealthStatus)
+	}
+	if byID["res-2"].HealthStatus != openchoreov1alpha1.HealthStatusUnknown {
+		t.Errorf("res-2: expected Unknown, got %s", byID["res-2"].HealthStatus)
+	}
+	if byID["res-2"].LastObservedTime != nil {
+		t.Error("res-2: expected nil LastObservedTime when no live resource")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// extractDeploymentConditions
+// ─────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────
+// ensureFinalizer
+// ─────────────────────────────────────────────────────────────
+
+func TestEnsureFinalizer(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := openchoreov1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	makeRelease := func(targetPlane string, finalizers ...string) *openchoreov1alpha1.RenderedRelease {
+		return &openchoreov1alpha1.RenderedRelease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "test-release",
+				Namespace:  "default",
+				Finalizers: finalizers,
+			},
+			Spec: openchoreov1alpha1.RenderedReleaseSpec{TargetPlane: targetPlane},
+		}
+	}
+
+	t.Run("obs-plane release gets ObsPlaneCleanupFinalizer", func(t *testing.T) {
+		release := makeRelease(targetPlaneObservabilityPlane)
+		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(release).Build()
+		r := &Reconciler{Client: fakeClient}
+
+		added, err := r.ensureFinalizer(context.Background(), release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !added {
+			t.Error("expected finalizer to be added")
+		}
+		if !controllerutil.ContainsFinalizer(release, ObsPlaneCleanupFinalizer) {
+			t.Errorf("expected %q on obs-plane release", ObsPlaneCleanupFinalizer)
+		}
+		if controllerutil.ContainsFinalizer(release, DataPlaneCleanupFinalizer) {
+			t.Errorf("unexpected %q on obs-plane release", DataPlaneCleanupFinalizer)
+		}
+	})
+
+	t.Run("empty targetPlane gets DataPlaneCleanupFinalizer", func(t *testing.T) {
+		release := makeRelease("")
+		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(release).Build()
+		r := &Reconciler{Client: fakeClient}
+
+		added, err := r.ensureFinalizer(context.Background(), release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !added {
+			t.Error("expected finalizer to be added")
+		}
+		if !controllerutil.ContainsFinalizer(release, DataPlaneCleanupFinalizer) {
+			t.Errorf("expected %q on data-plane release", DataPlaneCleanupFinalizer)
+		}
+	})
+
+	t.Run("does not add finalizer when release is being deleted", func(t *testing.T) {
+		now := metav1.Now()
+		// DeletionTimestamp can only be set server-side; simulate by pre-setting a finalizer
+		// so the fake client accepts it, then set the timestamp manually on the in-memory object.
+		release := makeRelease(targetPlaneObservabilityPlane, "existing-finalizer")
+		release.DeletionTimestamp = &now
+		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(release).Build()
+		r := &Reconciler{Client: fakeClient}
+
+		added, err := r.ensureFinalizer(context.Background(), release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if added {
+			t.Error("expected no finalizer added when release is being deleted")
+		}
+	})
+
+	t.Run("no-op when correct finalizer already present", func(t *testing.T) {
+		release := makeRelease(targetPlaneObservabilityPlane, ObsPlaneCleanupFinalizer)
+		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(release).Build()
+		r := &Reconciler{Client: fakeClient}
+
+		added, err := r.ensureFinalizer(context.Background(), release)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if added {
+			t.Error("expected no-op when finalizer already present")
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// finalizeObsPlane — no-finalizer fast path
+// ─────────────────────────────────────────────────────────────
+
+func TestFinalizeObsPlane_NoFinalizersIsNoOp(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := openchoreov1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	release := &openchoreov1alpha1.RenderedRelease{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-release", Namespace: "default"},
+		Spec:       openchoreov1alpha1.RenderedReleaseSpec{TargetPlane: targetPlaneObservabilityPlane},
+		// No Finalizers
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(release).Build()
+	r := &Reconciler{Client: fakeClient}
+
+	result, err := r.finalizeObsPlane(context.Background(), release, release)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Errorf("expected empty Result for no-op path, got Requeue=%v RequeueAfter=%v", result.Requeue, result.RequeueAfter)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// intersectObsPlaneGVKs
+// ─────────────────────────────────────────────────────────────
+
+func TestIntersectObsPlaneGVKs(t *testing.T) {
+	r := &Reconciler{}
+	ctx := context.Background()
+
+	t.Run("empty status resources returns empty", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{}
+		result := r.intersectObsPlaneGVKs(ctx, release)
+		if len(result) != 0 {
+			t.Errorf("expected 0 GVKs, got %d", len(result))
+		}
+	})
+
+	t.Run("status resource in allowlist is included", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Status: openchoreov1alpha1.RenderedReleaseStatus{
+				Resources: []openchoreov1alpha1.RenderedManifestStatus{
+					{Group: "openchoreo.dev", Version: "v1alpha1", Kind: "ObservabilityAlertRule"},
+				},
+			},
+		}
+		result := r.intersectObsPlaneGVKs(ctx, release)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 GVK, got %d", len(result))
+		}
+		if result[0].Kind != "ObservabilityAlertRule" {
+			t.Errorf("expected ObservabilityAlertRule, got %s", result[0].Kind)
+		}
+	})
+
+	t.Run("status resource not in allowlist is excluded", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Status: openchoreov1alpha1.RenderedReleaseStatus{
+				Resources: []openchoreov1alpha1.RenderedManifestStatus{
+					{Group: "other.io", Version: "v1", Kind: "SomeOtherType"},
+				},
+			},
+		}
+		result := r.intersectObsPlaneGVKs(ctx, release)
+		if len(result) != 0 {
+			t.Errorf("expected 0 GVKs (non-allowlisted excluded), got %d", len(result))
+		}
+	})
+
+	t.Run("duplicate GVKs in status are deduplicated", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Status: openchoreov1alpha1.RenderedReleaseStatus{
+				Resources: []openchoreov1alpha1.RenderedManifestStatus{
+					{Group: "openchoreo.dev", Version: "v1alpha1", Kind: "ObservabilityAlertRule"},
+					{Group: "openchoreo.dev", Version: "v1alpha1", Kind: "ObservabilityAlertRule"},
+				},
+			},
+		}
+		result := r.intersectObsPlaneGVKs(ctx, release)
+		if len(result) != 1 {
+			t.Errorf("expected 1 deduplicated GVK, got %d", len(result))
+		}
+	})
+
+	t.Run("mixed: allowlisted and non-allowlisted GVKs", func(t *testing.T) {
+		release := &openchoreov1alpha1.RenderedRelease{
+			Status: openchoreov1alpha1.RenderedReleaseStatus{
+				Resources: []openchoreov1alpha1.RenderedManifestStatus{
+					{Group: "openchoreo.dev", Version: "v1alpha1", Kind: "ObservabilityAlertRule"},
+					{Group: "other.io", Version: "v1", Kind: "NotAllowlisted"},
+				},
+			},
+		}
+		result := r.intersectObsPlaneGVKs(ctx, release)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 GVK, got %d", len(result))
+		}
+		if result[0].Kind != "ObservabilityAlertRule" {
+			t.Errorf("expected ObservabilityAlertRule, got %s", result[0].Kind)
+		}
+	})
+}
+
+func TestExtractDeploymentConditions(t *testing.T) {
+	makeCondition := func(condType appsv1.DeploymentConditionType, status corev1.ConditionStatus, reason string) appsv1.DeploymentCondition {
+		return appsv1.DeploymentCondition{Type: condType, Status: status, Reason: reason}
+	}
+
+	t.Run("empty conditions returns nil for all", func(t *testing.T) {
+		avail, prog, replicaFail := extractDeploymentConditions(nil)
+		if avail != nil || prog != nil || replicaFail != nil {
+			t.Error("expected all nil for empty conditions")
+		}
+	})
+
+	t.Run("all three condition types present returns correct pointers", func(t *testing.T) {
+		conditions := []appsv1.DeploymentCondition{
+			makeCondition(appsv1.DeploymentAvailable, corev1.ConditionTrue, "MinimumReplicasAvailable"),
+			makeCondition(appsv1.DeploymentProgressing, corev1.ConditionTrue, "NewReplicaSetAvailable"),
+			makeCondition(appsv1.DeploymentReplicaFailure, corev1.ConditionFalse, ""),
+		}
+		avail, prog, replicaFail := extractDeploymentConditions(conditions)
+		if avail == nil {
+			t.Fatal("expected non-nil Available")
+		}
+		if avail.Reason != "MinimumReplicasAvailable" {
+			t.Errorf("wrong Available reason: %s", avail.Reason)
+		}
+		if prog == nil {
+			t.Fatal("expected non-nil Progressing")
+		}
+		if prog.Reason != "NewReplicaSetAvailable" {
+			t.Errorf("wrong Progressing reason: %s", prog.Reason)
+		}
+		if replicaFail == nil {
+			t.Error("expected non-nil ReplicaFailure")
+		}
+	})
+
+	t.Run("only Available condition present", func(t *testing.T) {
+		conditions := []appsv1.DeploymentCondition{
+			makeCondition(appsv1.DeploymentAvailable, corev1.ConditionTrue, "MinimumReplicasAvailable"),
+		}
+		avail, prog, replicaFail := extractDeploymentConditions(conditions)
+		if avail == nil {
+			t.Error("expected non-nil Available")
+		}
+		if prog != nil {
+			t.Error("expected nil Progressing")
+		}
+		if replicaFail != nil {
+			t.Error("expected nil ReplicaFailure")
+		}
+	})
+
+	t.Run("only Progressing condition present", func(t *testing.T) {
+		conditions := []appsv1.DeploymentCondition{
+			makeCondition(appsv1.DeploymentProgressing, corev1.ConditionTrue, "ReplicaSetUpdated"),
+		}
+		avail, prog, replicaFail := extractDeploymentConditions(conditions)
+		if avail != nil {
+			t.Error("expected nil Available")
+		}
+		if prog == nil {
+			t.Error("expected non-nil Progressing")
+		}
+		if replicaFail != nil {
+			t.Error("expected nil ReplicaFailure")
+		}
+	})
+
+	t.Run("unknown condition types are ignored", func(t *testing.T) {
+		conditions := []appsv1.DeploymentCondition{
+			{Type: "SomeUnknownCondition", Status: corev1.ConditionTrue},
+		}
+		avail, prog, replicaFail := extractDeploymentConditions(conditions)
+		if avail != nil || prog != nil || replicaFail != nil {
+			t.Error("expected all nil for unknown condition types")
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────
+// Health must describe the spec that was applied
+// ─────────────────────────────────────────────────────────────
+
+// healthyDeployment builds a Deployment that reads as fully rolled out at the
+// given generation: every replica updated, ready and available.
+func healthyDeployment(generation, observedGeneration int64) *unstructured.Unstructured {
+	const resourceID = "deployment-checkout"
+	obj := &unstructured.Unstructured{}
+	obj.SetAPIVersion("apps/v1")
+	obj.SetKind("Deployment")
+	obj.SetName("checkout")
+	obj.SetNamespace("dp-ns")
+	obj.SetGeneration(generation)
+	obj.SetLabels(map[string]string{labels.LabelKeyRenderedReleaseResourceID: resourceID})
+	if err := unstructured.SetNestedMap(obj.Object, map[string]any{
+		"observedGeneration":  observedGeneration,
+		"replicas":            int64(1),
+		"updatedReplicas":     int64(1),
+		"readyReplicas":       int64(1),
+		"availableReplicas":   int64(1),
+		"unavailableReplicas": int64(0),
+	}, "status"); err != nil {
+		panic(err)
+	}
+	if err := unstructured.SetNestedSlice(obj.Object, []any{
+		map[string]any{"type": "Available", "status": "True", "reason": "MinimumReplicasAvailable"},
+		map[string]any{"type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable"},
+	}, "status", "conditions"); err != nil {
+		panic(err)
+	}
+	if err := unstructured.SetNestedField(obj.Object, int64(1), "spec", "replicas"); err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// TestBuildResourceStatusRejectsPreApplySnapshot pins that health is only
+// reported for a snapshot of the spec this reconcile applied.
+//
+// applyResources uses server-side apply, and the client writes the server's
+// response back into the desired object, so its generation is the one the write
+// produced. The List that follows is served from the API server's watch cache
+// and can lag that write, handing back the previous revision -- fully rolled out
+// and healthy, with its own generation and observedGeneration agreeing, so
+// getDeploymentHealth has no way to notice.
+//
+// Publishing that as this generation's health told the delivery events a rollout
+// had succeeded before its new ReplicaSet existed, which is what succeededAt --
+// and therefore Lead Time for Changes -- is measured from.
+func TestBuildResourceStatusRejectsPreApplySnapshot(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{}
+	emptyRelease := &openchoreov1alpha1.RenderedRelease{}
+
+	t.Run("live snapshot behind the apply is Progressing, not Healthy", func(t *testing.T) {
+		// The apply returned generation 7; the cache still holds generation 6,
+		// settled and healthy on the revision being replaced.
+		applied := healthyDeployment(7, 7)
+		live := healthyDeployment(6, 6)
+
+		result := r.buildResourceStatus(ctx, emptyRelease,
+			[]*unstructured.Unstructured{applied}, []*unstructured.Unstructured{live})
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		if got := result[0].HealthStatus; got != openchoreov1alpha1.HealthStatusProgressing {
+			t.Errorf("health = %q, want Progressing: the snapshot predates the applied spec", got)
+		}
+	})
+
+	t.Run("live snapshot at the applied generation is judged normally", func(t *testing.T) {
+		applied := healthyDeployment(7, 7)
+		live := healthyDeployment(7, 7)
+
+		result := r.buildResourceStatus(ctx, emptyRelease,
+			[]*unstructured.Unstructured{applied}, []*unstructured.Unstructured{live})
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		if got := result[0].HealthStatus; got != openchoreov1alpha1.HealthStatusHealthy {
+			t.Errorf("health = %q, want Healthy", got)
+		}
+	})
+
+	t.Run("kinds without a generation are unaffected", func(t *testing.T) {
+		// ConfigMaps do not track generation, so both sides read zero. Comparing
+		// them must not make every such resource permanently Progressing.
+		desired := buildResourcesDesired("res-cm", "my-cm")
+		live := buildResourcesLive("res-cm", "my-cm", map[string]interface{}{})
+
+		result := r.buildResourceStatus(ctx, emptyRelease,
+			[]*unstructured.Unstructured{desired}, []*unstructured.Unstructured{live})
+		if len(result) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(result))
+		}
+		if got := result[0].HealthStatus; got == openchoreov1alpha1.HealthStatusProgressing {
+			t.Errorf("health = %q, want anything but Progressing for a generation-less kind", got)
+		}
+	})
+}
+
+// TestUpdateStatusPersistsConditionOnlyChange pins that the apply-success
+// condition reaches the API server.
+//
+// It used to be persisted by its own Status().Update mid-reconcile, and
+// updateStatus copied conditions onto old before comparing so that write would
+// not look like a diff. It is now published here instead, together with the
+// resource statuses it will be read beside -- so the comparison has to include
+// conditions, or a reconcile whose resource health did not change would drop the
+// condition entirely.
+func TestUpdateStatusPersistsConditionOnlyChange(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := openchoreov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+
+	release := &openchoreov1alpha1.RenderedRelease{
+		ObjectMeta: metav1.ObjectMeta{Name: "rr-1", Namespace: "ns-1", Generation: 3},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(release).WithStatusSubresource(release).Build()
+	r := &Reconciler{Client: cl}
+
+	old := release.DeepCopy()
+	updated := release.DeepCopy()
+	// Same resources on both sides; only the condition differs.
+	statuses := []openchoreov1alpha1.RenderedManifestStatus{
+		{ID: "res-1", Kind: "ConfigMap", HealthStatus: openchoreov1alpha1.HealthStatusHealthy},
+	}
+	old.Status.Resources = statuses
+	updated.Status.Conditions = []metav1.Condition{{
+		Type:               ConditionResourcesApplied,
+		Status:             metav1.ConditionTrue,
+		Reason:             ReasonApplySucceeded,
+		ObservedGeneration: 3,
+		LastTransitionTime: metav1.Now(),
+	}}
+
+	changed, err := r.updateStatus(ctx, old, updated, statuses)
+	if err != nil {
+		t.Fatalf("updateStatus returned %v", err)
+	}
+	if !changed {
+		t.Fatal("a condition-only change must still be persisted")
+	}
+
+	stored := &openchoreov1alpha1.RenderedRelease{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "rr-1", Namespace: "ns-1"}, stored); err != nil {
+		t.Fatalf("get stored release: %v", err)
+	}
+	if len(stored.Status.Conditions) != 1 ||
+		stored.Status.Conditions[0].Type != ConditionResourcesApplied {
+		t.Errorf("stored conditions = %+v, want ResourcesApplied", stored.Status.Conditions)
+	}
+}

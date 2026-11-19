@@ -1,0 +1,673 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package component
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"sigs.k8s.io/yaml"
+
+	"github.com/openchoreo/openchoreo/internal/occ/cmd/pagination"
+	"github.com/openchoreo/openchoreo/internal/occ/cmd/setoverride"
+	"github.com/openchoreo/openchoreo/internal/occ/cmd/utils"
+	"github.com/openchoreo/openchoreo/internal/occ/cmd/workflow"
+	"github.com/openchoreo/openchoreo/internal/occ/cmd/workflowrun"
+	"github.com/openchoreo/openchoreo/internal/occ/cmdutil"
+	"github.com/openchoreo/openchoreo/internal/occ/resources/client"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/api/gen"
+	scaffold "github.com/openchoreo/openchoreo/internal/scaffold/component"
+)
+
+type Component struct {
+	client client.Interface
+}
+
+func New(c client.Interface) *Component {
+	return &Component{client: c}
+}
+
+// List lists all components in a project
+func (cp *Component) List(params ListParams) error {
+	if err := cmdutil.RequireFields("list", "component", map[string]string{"namespace": params.Namespace}); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	items, err := pagination.FetchAll(func(limit int, cursor string) ([]gen.Component, string, error) {
+		p := &gen.ListComponentsParams{}
+		if params.Project != "" {
+			p.Project = &params.Project
+		}
+		p.Limit = &limit
+		if cursor != "" {
+			p.Cursor = &cursor
+		}
+		result, err := cp.client.ListComponents(ctx, params.Namespace, "", p)
+		if err != nil {
+			return nil, "", err
+		}
+		next := ""
+		if result.Pagination.NextCursor != nil {
+			next = *result.Pagination.NextCursor
+		}
+		return result.Items, next, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return printList(items, params.Project == "")
+}
+
+// StartWorkflow gets the component, resolves its workflow name, and starts a workflow run.
+func (cp *Component) StartWorkflow(params StartWorkflowParams) error {
+	if params.Namespace == "" {
+		return fmt.Errorf("namespace is required")
+	}
+	if params.ComponentName == "" {
+		return fmt.Errorf("component name is required")
+	}
+
+	ctx := context.Background()
+
+	comp, err := cp.client.GetComponent(ctx, params.Namespace, params.ComponentName)
+	if err != nil {
+		return err
+	}
+
+	if comp.Spec == nil || comp.Spec.Workflow == nil || comp.Spec.Workflow.Name == "" {
+		return fmt.Errorf("component %q has no workflow configured", params.ComponentName)
+	}
+
+	canonicalProject := comp.Spec.Owner.ProjectName
+	if params.Project != "" && params.Project != canonicalProject {
+		return fmt.Errorf("project %q does not match component %q owner project %q", params.Project, params.ComponentName, canonicalProject)
+	}
+	params.Project = canonicalProject
+
+	wfConfig := comp.Spec.Workflow
+	var baseParams map[string]interface{}
+	if wfConfig.Parameters != nil {
+		baseParams = *wfConfig.Parameters
+	}
+
+	var workflowKind string
+	if wfConfig.Kind != nil {
+		workflowKind = string(*wfConfig.Kind)
+	}
+
+	return workflow.New(cp.client).StartRun(workflow.StartRunParams{
+		Namespace:    params.Namespace,
+		WorkflowName: wfConfig.Name,
+		WorkflowKind: workflowKind,
+		RunName:      fmt.Sprintf("%s-build-%d", params.ComponentName, time.Now().Unix()),
+		Parameters:   baseParams,
+		Set:          params.Set,
+		Labels: map[string]string{
+			"openchoreo.dev/component": params.ComponentName,
+			"openchoreo.dev/project":   params.Project,
+		},
+	})
+}
+
+// ListWorkflowRuns lists workflow runs filtered by component name.
+func (cp *Component) ListWorkflowRuns(params ListWorkflowRunsParams) error {
+	if params.Namespace == "" {
+		return fmt.Errorf("namespace is required")
+	}
+	if params.ComponentName == "" {
+		return fmt.Errorf("component name is required")
+	}
+
+	items, err := workflowrun.New(cp.client).FetchAll(params.Namespace, "")
+	if err != nil {
+		return err
+	}
+
+	filtered := workflowrun.FilterByComponent(items, params.ComponentName)
+	return workflowrun.PrintList(filtered)
+}
+
+// Get retrieves a single component and outputs it as YAML
+func (cp *Component) Get(params GetParams) error {
+	if err := cmdutil.RequireFields("get", "component", map[string]string{"namespace": params.Namespace}); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	result, err := cp.client.GetComponent(ctx, params.Namespace, params.ComponentName)
+	if err != nil {
+		return err
+	}
+
+	data, err := yaml.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("failed to marshal component to YAML: %w", err)
+	}
+
+	fmt.Print(string(data))
+	return nil
+}
+
+// Delete deletes a single component
+func (cp *Component) Delete(params DeleteParams) error {
+	if err := cmdutil.RequireFields("delete", "component", map[string]string{"namespace": params.Namespace, "name": params.ComponentName}); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	if err := cp.client.DeleteComponent(ctx, params.Namespace, params.ComponentName); err != nil {
+		return err
+	}
+
+	fmt.Printf("Component '%s' deleted\n", params.ComponentName)
+	return nil
+}
+
+// Scaffold generates a scaffold YAML for a component based on its ComponentType and optional Traits and Workflow
+func (cp *Component) Scaffold(params ScaffoldParams) error {
+	return cp.scaffoldComponent(params)
+}
+
+// Deploy deploys or promotes a component
+func (cp *Component) Deploy(params DeployParams) error {
+	// Validate required params
+	if err := cmdutil.RequireFields("deploy", "component", map[string]string{"namespace": params.Namespace, "project": params.Project}); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	var err error
+	var binding *gen.ReleaseBinding
+
+	// Check if this is a promotion or initial deployment
+	if params.To != "" {
+		// Promotion flow
+		binding, err = cp.promoteComponent(ctx, cp.client, params)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Deploy to lowest environment in the pipeline
+		binding, err = cp.deployComponent(ctx, cp.client, params)
+		if err != nil {
+			return err
+		}
+	}
+
+	environment := ""
+	if binding.Spec != nil {
+		environment = binding.Spec.Environment
+	}
+	fmt.Printf("Successfully deployed component '%s' to environment '%s'\n", params.ComponentName, environment)
+	if binding.Spec != nil && binding.Spec.ReleaseName != nil {
+		fmt.Printf("  Release: %s\n", *binding.Spec.ReleaseName)
+	}
+	fmt.Printf("  Binding: %s\n", binding.Metadata.Name)
+
+	return nil
+}
+
+// deployComponent deploys a component to the lowest environment in the pipeline
+func (cp *Component) deployComponent(ctx context.Context, c client.Interface, params DeployParams) (*gen.ReleaseBinding, error) {
+	releaseName := params.Release
+
+	// If no release specified, generate a new one
+	if releaseName == "" {
+		release, err := c.GenerateRelease(ctx, params.Namespace, params.ComponentName, gen.GenerateReleaseRequest{})
+		if err != nil {
+			return nil, err
+		}
+		releaseName = release.Metadata.Name
+		fmt.Printf("Created release: %s\n", releaseName)
+	}
+
+	// Resolve the lowest environment from the deployment pipeline
+	pipeline, err := c.GetProjectDeploymentPipeline(ctx, params.Namespace, params.Project)
+	if err != nil {
+		return nil, err
+	}
+
+	lowestEnv, err := utils.FindLowestEnvironment(pipeline)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the ReleaseBinding
+	bindingName := fmt.Sprintf("%s-%s", params.ComponentName, lowestEnv)
+	rb := gen.ReleaseBinding{
+		Metadata: gen.ObjectMeta{
+			Name: bindingName,
+		},
+		Spec: &gen.ReleaseBindingSpec{
+			Owner: struct {
+				ComponentName string `json:"componentName"`
+				ProjectName   string `json:"projectName"`
+			}{
+				ComponentName: params.ComponentName,
+				ProjectName:   params.Project,
+			},
+			Environment: lowestEnv,
+			ReleaseName: &releaseName,
+		},
+	}
+
+	// Check if a binding already exists for the lowest environment
+	existing, err := c.GetReleaseBinding(ctx, params.Namespace, bindingName)
+	if err != nil {
+		return nil, err
+	}
+
+	if existing != nil {
+		// Update existing binding with the new release
+		existing.Spec.ReleaseName = rb.Spec.ReleaseName
+
+		// Apply overrides if provided
+		if len(params.Set) > 0 {
+			merged, err := mergeOverridesWithBinding(existing, params.Set)
+			if err != nil {
+				return nil, fmt.Errorf("failed to merge overrides: %w", err)
+			}
+			existing = merged
+		}
+
+		return c.UpdateReleaseBinding(ctx, params.Namespace, bindingName, *existing)
+	}
+
+	// Apply overrides if provided
+	if len(params.Set) > 0 {
+		merged, err := mergeOverridesWithBinding(&rb, params.Set)
+		if err != nil {
+			return nil, fmt.Errorf("failed to merge overrides: %w", err)
+		}
+		rb = *merged
+	}
+
+	return c.CreateReleaseBinding(ctx, params.Namespace, rb)
+}
+
+// promoteComponent promotes a component to the target environment
+func (cp *Component) promoteComponent(ctx context.Context, c client.Interface, params DeployParams) (*gen.ReleaseBinding, error) {
+	pipeline, err := c.GetProjectDeploymentPipeline(ctx, params.Namespace, params.Project)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceEnv, err := utils.FindSourceEnvironment(pipeline, params.To)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the source release binding to find the release name
+	sourceBindings, err := c.ListReleaseBindings(ctx, params.Namespace, &gen.ListReleaseBindingsParams{
+		Component: &params.ComponentName,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var releaseName string
+	for _, b := range sourceBindings.Items {
+		if b.Spec != nil && b.Spec.Environment == sourceEnv &&
+			b.Spec.Owner.ComponentName == params.ComponentName {
+			if b.Spec.ReleaseName != nil {
+				releaseName = *b.Spec.ReleaseName
+			}
+			break
+		}
+	}
+	if releaseName == "" {
+		return nil, fmt.Errorf("no release binding found for source environment '%s'", sourceEnv)
+	}
+
+	// Check if a binding already exists for the target environment
+	bindingName := fmt.Sprintf("%s-%s", params.ComponentName, params.To)
+	existing, err := c.GetReleaseBinding(ctx, params.Namespace, bindingName)
+	if err != nil {
+		return nil, err
+	}
+
+	if existing != nil {
+		// Update existing binding with the new release
+		existing.Spec.ReleaseName = &releaseName
+
+		// Apply overrides if provided
+		if len(params.Set) > 0 {
+			merged, err := mergeOverridesWithBinding(existing, params.Set)
+			if err != nil {
+				return nil, fmt.Errorf("failed to merge overrides: %w", err)
+			}
+			existing = merged
+		}
+
+		return c.UpdateReleaseBinding(ctx, params.Namespace, bindingName, *existing)
+	}
+
+	// Create new binding
+	rb := gen.ReleaseBinding{
+		Metadata: gen.ObjectMeta{
+			Name: bindingName,
+		},
+		Spec: &gen.ReleaseBindingSpec{
+			Owner: struct {
+				ComponentName string `json:"componentName"`
+				ProjectName   string `json:"projectName"`
+			}{
+				ComponentName: params.ComponentName,
+				ProjectName:   params.Project,
+			},
+			Environment: params.To,
+			ReleaseName: &releaseName,
+		},
+	}
+
+	// Apply overrides if provided
+	if len(params.Set) > 0 {
+		merged, err := mergeOverridesWithBinding(&rb, params.Set)
+		if err != nil {
+			return nil, fmt.Errorf("failed to merge overrides: %w", err)
+		}
+		rb = *merged
+	}
+
+	return c.CreateReleaseBinding(ctx, params.Namespace, rb)
+}
+
+// scaffoldResolution holds the resolved scope information for scaffold parameters.
+type scaffoldResolution struct {
+	workloadType       string
+	componentTypeName  string
+	traitNames         []string
+	traitKinds         map[string]string // trait name -> kind
+	workflowName       string
+	componentTypeKind  string
+	workflowKind       string
+	useClusterCT       bool
+	useClusterWorkflow bool
+}
+
+func (cp *Component) scaffoldComponent(params ScaffoldParams) error {
+	if err := validateScaffoldParams(params); err != nil {
+		return err
+	}
+
+	res, err := resolveScaffoldScope(params)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	componentTypeSchema, traitSchemas, workflowSchema, err := fetchScaffoldSchemas(ctx, cp.client, params.Namespace, res)
+	if err != nil {
+		return err
+	}
+
+	opts := &scaffold.Options{
+		ComponentName:             params.ComponentName,
+		Namespace:                 params.Namespace,
+		ProjectName:               params.ProjectName,
+		IncludeAllFields:          !params.SkipOptional,
+		IncludeFieldDescriptions:  !params.SkipComments,
+		IncludeStructuralComments: !params.SkipComments,
+		IncludeWorkflow:           res.workflowName != "",
+	}
+
+	kindOpts := &scaffold.KindOptions{
+		ComponentTypeKind: res.componentTypeKind,
+		TraitKinds:        res.traitKinds,
+		WorkflowKind:      res.workflowKind,
+	}
+
+	generator, err := scaffold.NewGeneratorFromSchemas(
+		res.componentTypeName, res.workloadType,
+		componentTypeSchema, traitSchemas,
+		res.workflowName, workflowSchema,
+		opts, kindOpts,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create generator: %w", err)
+	}
+
+	yamlContent, err := generator.Generate()
+	if err != nil {
+		return fmt.Errorf("failed to generate Component YAML: %w", err)
+	}
+
+	if params.OutputPath != "" {
+		if err := os.WriteFile(params.OutputPath, []byte(yamlContent), 0600); err != nil {
+			return fmt.Errorf("failed to write output file %s: %w", params.OutputPath, err)
+		}
+		fmt.Printf("Component YAML written to %s\n", params.OutputPath)
+	} else {
+		fmt.Print(yamlContent)
+	}
+
+	return nil
+}
+
+func validateScaffoldParams(params ScaffoldParams) error {
+	if params.ComponentName == "" {
+		return fmt.Errorf("component name is required")
+	}
+	if params.Namespace == "" {
+		return fmt.Errorf("namespace is required (--namespace or set via context)")
+	}
+	if params.ProjectName == "" {
+		return fmt.Errorf("project is required (--project or set via context)")
+	}
+	if params.ComponentType != "" && params.ClusterComponentType != "" {
+		return fmt.Errorf("--componenttype and --clustercomponenttype are mutually exclusive")
+	}
+	if params.ComponentType == "" && params.ClusterComponentType == "" {
+		return fmt.Errorf("one of --componenttype or --clustercomponenttype is required")
+	}
+	if params.WorkflowName != "" && params.ClusterWorkflowName != "" {
+		return fmt.Errorf("--workflow and --clusterworkflow are mutually exclusive")
+	}
+	return nil
+}
+
+func resolveScaffoldScope(params ScaffoldParams) (*scaffoldResolution, error) {
+	res := &scaffoldResolution{
+		useClusterCT:       params.ClusterComponentType != "",
+		useClusterWorkflow: params.ClusterWorkflowName != "",
+	}
+
+	componentTypeStr := params.ComponentType
+	if res.useClusterCT {
+		componentTypeStr = params.ClusterComponentType
+	}
+
+	var err error
+	res.workloadType, res.componentTypeName, err = parseComponentType(componentTypeStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Merge namespace-scoped and cluster-scoped traits, tracking each trait's kind
+	res.traitKinds = make(map[string]string)
+	for _, name := range params.Traits {
+		res.traitNames = append(res.traitNames, name)
+		res.traitKinds[name] = "Trait"
+	}
+	for _, name := range params.ClusterTraits {
+		res.traitNames = append(res.traitNames, name)
+		res.traitKinds[name] = "ClusterTrait"
+	}
+
+	res.workflowName = params.WorkflowName
+	if res.useClusterWorkflow {
+		res.workflowName = params.ClusterWorkflowName
+	}
+
+	res.componentTypeKind = "ComponentType"
+	if res.useClusterCT {
+		res.componentTypeKind = "ClusterComponentType"
+	}
+	res.workflowKind = "Workflow"
+	if res.useClusterWorkflow {
+		res.workflowKind = "ClusterWorkflow"
+	}
+
+	return res, nil
+}
+
+func fetchScaffoldSchemas(
+	ctx context.Context,
+	apiClient client.Interface,
+	namespace string,
+	res *scaffoldResolution,
+) (*extv1.JSONSchemaProps, map[string]*extv1.JSONSchemaProps, *extv1.JSONSchemaProps, error) {
+	// Fetch ComponentType schema
+	var componentTypeSchemaRaw *json.RawMessage
+	var err error
+	if res.useClusterCT {
+		componentTypeSchemaRaw, err = apiClient.GetClusterComponentTypeSchema(ctx, res.componentTypeName)
+	} else {
+		componentTypeSchemaRaw, err = apiClient.GetComponentTypeSchema(ctx, namespace, res.componentTypeName)
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	componentTypeSchema, err := unmarshalSchema(componentTypeSchemaRaw)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid ComponentType schema: %w", err)
+	}
+
+	// Fetch Trait schemas (each trait resolved by its own kind)
+	traitSchemas := make(map[string]*extv1.JSONSchemaProps)
+	for _, traitName := range res.traitNames {
+		var traitSchemaRaw *json.RawMessage
+		if res.traitKinds[traitName] == "ClusterTrait" {
+			traitSchemaRaw, err = apiClient.GetClusterTraitSchema(ctx, traitName)
+		} else {
+			traitSchemaRaw, err = apiClient.GetTraitSchema(ctx, namespace, traitName)
+		}
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		traitSchema, err := unmarshalSchema(traitSchemaRaw)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("invalid Trait schema for %q: %w", traitName, err)
+		}
+		traitSchemas[traitName] = traitSchema
+	}
+
+	// Fetch Workflow schema
+	var workflowSchema *extv1.JSONSchemaProps
+	if res.workflowName != "" {
+		var workflowSchemaRaw *json.RawMessage
+		if res.useClusterWorkflow {
+			workflowSchemaRaw, err = apiClient.GetClusterWorkflowSchema(ctx, res.workflowName)
+		} else {
+			workflowSchemaRaw, err = apiClient.GetWorkflowSchema(ctx, namespace, res.workflowName)
+		}
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		workflowSchema, err = unmarshalSchema(workflowSchemaRaw)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("invalid Workflow schema: %w", err)
+		}
+	}
+
+	return componentTypeSchema, traitSchemas, workflowSchema, nil
+}
+
+// parseComponentType parses "workloadType/componentTypeName" format
+func parseComponentType(typeStr string) (workloadType, componentTypeName string, err error) {
+	if typeStr == "" {
+		return "", "", fmt.Errorf("component type is required (format: workloadType/componentTypeName, e.g., deployment/web-app)")
+	}
+
+	parts := strings.SplitN(typeStr, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid component type format: expected 'workloadType/componentTypeName' (e.g., deployment/web-app), got %q", typeStr)
+	}
+
+	return parts[0], parts[1], nil
+}
+
+// unmarshalSchema unmarshals a JSON RawMessage to JSONSchemaProps
+func unmarshalSchema(raw *json.RawMessage) (*extv1.JSONSchemaProps, error) {
+	var schema extv1.JSONSchemaProps
+	if err := json.Unmarshal(*raw, &schema); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal schema: %w", err)
+	}
+	return &schema, nil
+}
+
+// mergeOverridesWithBinding merges --set override values with existing ReleaseBinding.
+func mergeOverridesWithBinding(existingBinding *gen.ReleaseBinding, setValues []string) (*gen.ReleaseBinding, error) {
+	existingJSON, err := json.Marshal(existingBinding)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal existing binding: %w", err)
+	}
+
+	jsonStr, err := setoverride.Apply(string(existingJSON), setValues)
+	if err != nil {
+		return nil, fmt.Errorf("failed to merge overrides: %w", err)
+	}
+
+	var rb gen.ReleaseBinding
+	if err := json.Unmarshal([]byte(jsonStr), &rb); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal merged result: %w", err)
+	}
+
+	return &rb, nil
+}
+
+func printList(items []gen.Component, showProject bool) error {
+	if len(items) == 0 {
+		fmt.Println("No components found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	if showProject {
+		fmt.Fprintln(w, "NAME\tPROJECT\tTYPE\tAGE")
+	} else {
+		fmt.Fprintln(w, "NAME\tTYPE\tAGE")
+	}
+
+	for _, comp := range items {
+		projectName := ""
+		componentType := ""
+		if comp.Spec != nil {
+			projectName = comp.Spec.Owner.ProjectName
+			componentType = comp.Spec.ComponentType.Name
+		}
+		age := ""
+		if comp.Metadata.CreationTimestamp != nil {
+			age = utils.FormatAge(*comp.Metadata.CreationTimestamp)
+		}
+		if showProject {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+				comp.Metadata.Name,
+				projectName,
+				componentType,
+				age)
+		} else {
+			fmt.Fprintf(w, "%s\t%s\t%s\n",
+				comp.Metadata.Name,
+				componentType,
+				age)
+		}
+	}
+
+	return w.Flush()
+}

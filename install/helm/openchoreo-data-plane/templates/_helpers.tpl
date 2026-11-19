@@ -1,0 +1,262 @@
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "openchoreo-data-plane.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+If release name contains chart name it will be used as a full name.
+*/}}
+{{- define "openchoreo-data-plane.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "openchoreo-data-plane.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create the name of the service account to use
+*/}}
+{{- define "openchoreo-data-plane.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "openchoreo-data-plane.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Common labels
+These labels should be applied to all resources and include:
+- helm.sh/chart: Chart name and version
+- app.kubernetes.io/name: Name of the application
+- app.kubernetes.io/instance: Unique name identifying the instance of an application
+- app.kubernetes.io/version: Current version of the application
+- app.kubernetes.io/managed-by: Tool being used to manage the application
+- app.kubernetes.io/part-of: Name of a higher level application this one is part of
+*/}}
+{{- define "openchoreo-data-plane.labels" -}}
+helm.sh/chart: {{ include "openchoreo-data-plane.chart" . }}
+{{ include "openchoreo-data-plane.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: openchoreo
+{{- with .Values.global.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Selector labels
+These labels are used for pod selectors and should be stable across upgrades.
+They should NOT include version or chart labels as these change with upgrades.
+*/}}
+{{- define "openchoreo-data-plane.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "openchoreo-data-plane.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Component labels
+Extends common labels with component-specific identification.
+This should be used in the metadata.labels section of all component resources.
+
+The component label (app.kubernetes.io/component) is used to identify different
+components within the same application (e.g., vault, gateway, registry).
+
+Usage:
+  {{ include "openchoreo-data-plane.componentLabels" (dict "context" . "component" "my-component") }}
+
+Example with values:
+  {{ include "openchoreo-data-plane.componentLabels" (dict "context" . "component" .Values.myComponent.name) }}
+
+Parameters:
+  - context: The current Helm context (usually .)
+  - component: The component name (e.g., "vault", "gateway", "registry")
+*/}}
+{{- define "openchoreo-data-plane.componentLabels" -}}
+{{ include "openchoreo-data-plane.labels" .context }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Component selector labels
+Extends selector labels with component identification.
+This should be used for:
+  - spec.selector.matchLabels in Deployments, StatefulSets, DaemonSets
+  - spec.selector in Services
+  - metadata.labels in Pod templates
+
+These labels must be stable and should not include version information.
+
+Usage:
+  {{ include "openchoreo-data-plane.componentSelectorLabels" (dict "context" . "component" "my-component") }}
+
+Example with values:
+  {{ include "openchoreo-data-plane.componentSelectorLabels" (dict "context" . "component" .Values.myComponent.name) }}
+
+Parameters:
+  - context: The current Helm context (usually .)
+  - component: The component name (e.g., "vault", "gateway", "registry")
+*/}}
+{{- define "openchoreo-data-plane.componentSelectorLabels" -}}
+{{ include "openchoreo-data-plane.selectorLabels" .context }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Platform identity labels
+Attribution labels for platform components observability. They let the
+observability plane tell which OpenChoreo plane a log record came from.
+
+MUST be applied to pod templates ONLY - never to spec.selector.matchLabels or a
+Service's spec.selector. Selectors are immutable, so a label that reaches one
+makes `helm upgrade` fail on an existing install instead of adding the label.
+
+Usage:
+  {{ include "openchoreo-data-plane.platformIdentityLabels" . }}
+
+Parameters:
+  - The current Helm context (usually .)
+*/}}
+{{- define "openchoreo-data-plane.platformIdentityLabels" -}}
+openchoreo.dev/plane: dataplane
+openchoreo.dev/plane-id: {{ .Values.clusterAgent.planeID | default .Release.Name | quote }}
+{{- end }}
+
+{{/*
+Gateway infrastructure labels
+
+The labels kgateway stamps on the proxy pods it renders from the Gateway CR.
+Platform identity wins over values-supplied labels: an operator override must
+not be able to silently mis-attribute a proxy pod to the wrong plane.
+
+Gateway API caps spec.infrastructure.labels at 8 entries. The count is checked
+in validateGatewayLabels so an overflow fails with a readable message instead
+of an opaque CRD rejection at apply time.
+
+Usage:
+  {{ include "openchoreo-data-plane.gatewayInfrastructureLabels" . }}
+
+Parameters:
+  - The current Helm context (usually .)
+*/}}
+{{- define "openchoreo-data-plane.gatewayInfrastructureLabels" -}}
+{{- $infra := .Values.gateway.infrastructure | default dict -}}
+{{- $platform := include "openchoreo-data-plane.platformIdentityLabels" . | fromYaml -}}
+{{- toYaml (merge (dict) $platform ($infra.labels | default dict)) -}}
+{{- end }}
+
+{{/*
+Gateway infrastructure label count validation
+
+Usage:
+  {{ include "openchoreo-data-plane.validateGatewayLabels" . }}
+
+Parameters:
+  - The current Helm context (usually .)
+*/}}
+{{- define "openchoreo-data-plane.validateGatewayLabels" -}}
+{{- if .Values.gateway.enabled -}}
+{{- $labels := include "openchoreo-data-plane.gatewayInfrastructureLabels" . | fromYaml -}}
+{{- if gt (len $labels) 8 -}}
+  {{- $platform := include "openchoreo-data-plane.platformIdentityLabels" . | fromYaml -}}
+  {{- fail (printf "gateway.infrastructure.labels renders %d entries once the %d platform identity label(s) are merged in, but Gateway API caps spec.infrastructure.labels at 8. Remove %d label(s) from gateway.infrastructure.labels." (len $labels) (len $platform) (sub (len $labels) 8)) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Cluster Agent name
+*/}}
+{{- define "openchoreo-data-plane.clusterAgent.name" -}}
+{{- default "cluster-agent" .Values.clusterAgent.name }}
+{{- end }}
+
+{{/*
+Cluster Agent service account name
+*/}}
+{{- define "openchoreo-data-plane.clusterAgent.serviceAccountName" -}}
+{{- if .Values.clusterAgent.serviceAccount.create }}
+{{- default "cluster-agent" .Values.clusterAgent.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.clusterAgent.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Validate that placeholder .invalid hostnames have been replaced with real domains.
+*/}}
+{{- define "openchoreo-data-plane.validateHostnames" -}}
+{{- $ports := list (int .Values.gateway.httpPort) -}}
+{{- if .Values.gateway.tls.enabled -}}
+  {{- $ports = append $ports (int .Values.gateway.httpsPort) -}}
+{{- end -}}
+{{- if .Values.gateway.tlsPassthrough.enabled -}}
+  {{- $ports = append $ports (int .Values.gateway.tlsPassthrough.port) -}}
+{{- end -}}
+{{- if ne (len $ports) (len (uniq $ports)) -}}
+  {{- fail "gateway listener ports (httpPort, httpsPort, tlsPassthrough.port) must be unique across all enabled listeners." -}}
+{{- end -}}
+{{- if .Values.gateway.tls.enabled -}}
+  {{- $hostname := .Values.gateway.tls.hostname | default "" -}}
+  {{- if contains ".invalid" $hostname -}}
+    {{- fail "gateway.tls.hostname contains placeholder domain (.invalid). Set a real domain." -}}
+  {{- end -}}
+{{- end -}}
+{{- if .Values.gateway.tlsPassthrough.enabled -}}
+  {{- $tpHostname := .Values.gateway.tlsPassthrough.hostname | default "" -}}
+  {{- if contains ".invalid" $tpHostname -}}
+    {{- fail "gateway.tlsPassthrough.hostname contains placeholder domain (.invalid). Set a real domain." -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Container image reference for a component.
+
+Renders "<repository>:<tag>", with the tag defaulting to .Chart.AppVersion.
+When global.imageRegistry is set, the registry host of the repository is
+replaced with it so every first-party image resolves from a single private
+or mirror registry. A leading path segment counts as a registry host only
+if it contains "." or ":" or equals "localhost", the same rule Docker and
+containerd use to parse image references. The override may itself carry a
+path (e.g. "registry.example.com/ghcr.io") for path-preserving mirrors.
+
+Usage:
+  {{ include "openchoreo-data-plane.image" (dict "context" . "image" .Values.clusterAgent.image) }}
+
+Parameters:
+  - context: The current Helm context (usually .)
+  - image: The component image block (repository, tag)
+*/}}
+{{- define "openchoreo-data-plane.image" -}}
+{{- $repo := .image.repository -}}
+{{- with .context.Values.global.imageRegistry -}}
+{{- $parts := splitList "/" $repo -}}
+{{- $first := first $parts -}}
+{{- if and (gt (len $parts) 1) (or (contains "." $first) (contains ":" $first) (eq $first "localhost")) -}}
+{{- $repo = join "/" (rest $parts) -}}
+{{- end -}}
+{{- $repo = printf "%s/%s" . $repo -}}
+{{- end -}}
+{{- printf "%s:%s" $repo (.image.tag | default .context.Chart.AppVersion) -}}
+{{- end }}

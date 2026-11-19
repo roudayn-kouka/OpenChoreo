@@ -1,0 +1,106 @@
+componentName: my-api
+namespace: acme-corp
+projectName: online-store
+includeFieldDescriptions: true
+includeStructuralComments: true
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: web-app
+spec:
+  workloadType: deployment
+  parameters:
+    openAPIV3Schema:
+      type: object
+      required:
+        - tags
+        - ports
+        - env
+        - endpoints
+      properties:
+        # Simple scalar arrays
+        tags:
+          type: array
+          description: "Resource tags"
+          items:
+            type: string
+        ports:
+          type: array
+          items:
+            type: integer
+
+        # Array of objects with multiple fields
+        env:
+          type: array
+          description: "Environment variables"
+          items:
+            type: object
+            required:
+              - name
+              - value
+              - valueFrom
+            properties:
+              name:
+                type: string
+              value:
+                type: string
+                description: "Environment variable value"
+              valueFrom:
+                type: object
+                required:
+                  - secretKeyRef
+                properties:
+                  secretKeyRef:
+                    type: object
+                    required:
+                      - name
+                      - key
+                    properties:
+                      name:
+                        type: string
+                      key:
+                        type: string
+
+        # Array of objects with different field types
+        endpoints:
+          type: array
+          description: "Service endpoints"
+          items:
+            type: object
+            required:
+              - name
+              - port
+            properties:
+              name:
+                type: string
+                description: "Endpoint name"
+              port:
+                type: integer
+                description: "Port number"
+              protocol:
+                type: string
+                enum:
+                  - http
+                  - https
+                  - grpc
+                default: "http"
+              path:
+                type: string
+                default: "/"
+
+        # Optional array with default
+        extraLabels:
+          type: array
+          default:
+            - "app"
+            - "service"
+          items:
+            type: string
+
+        # Optional array with empty default
+        customAnnotations:
+          type: array
+          default: []
+          items:
+            type: string

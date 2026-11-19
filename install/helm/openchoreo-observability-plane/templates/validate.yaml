@@ -1,0 +1,2 @@
+{{- include "openchoreo-observability-plane.validateHostnames" . -}}
+{{- include "openchoreo-observability-plane.validateGatewayLabels" . -}}

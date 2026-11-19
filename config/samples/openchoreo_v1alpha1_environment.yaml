@@ -1,0 +1,12 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: Environment
+metadata:
+  labels:
+    app.kubernetes.io/name: openchoreo
+    app.kubernetes.io/managed-by: kustomize
+  name: environment-sample
+spec:
+  dataPlaneRef:
+    kind: DataPlane
+    name: default
+  isProduction: false

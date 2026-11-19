@@ -1,0 +1,324 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: web-service
+  namespace: default
+spec:
+  workloadType: deployment
+
+  parameters:
+    openAPIV3Schema:
+      $types:
+        Resources:
+          cpu: "string | default=100m"
+          memory: "string | default=256Mi"
+      replicas: "integer | default=1"
+      imagePullPolicy: "string | default=IfNotPresent"
+      port: "integer | default=8080"
+
+  environmentConfigs:
+    openAPIV3Schema:
+      $types:
+        Resources:
+          cpu: "string | default=100m"
+          memory: "string | default=256Mi"
+      resources:
+        requests: Resources
+        limits: Resources
+
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          replicas: ${parameters.replicas}
+          selector:
+            matchLabels: ${metadata.podSelectors}
+          template:
+            metadata:
+              labels: ${metadata.podSelectors}
+            spec:
+              containers:
+                - name: app
+                  image: ${workload.container.image}
+                  imagePullPolicy: ${parameters.imagePullPolicy}
+                  ports:
+                    - name: http
+                      containerPort: ${parameters.port}
+                      protocol: TCP
+                  resources:
+                    requests:
+                      cpu: ${environmentConfigs.resources.requests.cpu}
+                      memory: ${environmentConfigs.resources.requests.memory}
+                    limits:
+                      cpu: ${environmentConfigs.resources.limits.cpu}
+                      memory: ${environmentConfigs.resources.limits.memory}
+
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          type: ClusterIP
+          selector: ${metadata.podSelectors}
+          ports:
+            - name: http
+              port: 80
+              targetPort: ${parameters.port}
+              protocol: TCP
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Trait
+metadata:
+  name: persistent-volume
+  namespace: default
+spec:
+  parameters:
+    openAPIV3Schema:
+      volumeName: "string"
+      mountPath: "string"
+      containerName: "string | default=app"
+
+  environmentConfigs:
+    openAPIV3Schema:
+      size: "string | default=10Gi"
+      storageClass: "string | default=standard"
+
+  creates:
+    - template:
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: ${metadata.name}-${trait.instanceName}
+          namespace: ${metadata.namespace}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: ${environmentConfigs.size}
+          storageClassName: ${environmentConfigs.storageClass}
+
+  patches:
+    - target:
+        group: apps
+        version: v1
+        kind: Deployment
+      operations:
+        - op: add
+          path: /spec/template/spec/volumes/-
+          value:
+            name: ${parameters.volumeName}
+            persistentVolumeClaim:
+              claimName: ${metadata.name}-${trait.instanceName}
+
+    - target:
+        group: apps
+        version: v1
+        kind: Deployment
+      operations:
+        - op: add
+          path: /spec/template/spec/containers/[?(@.name=='${parameters.containerName}')]/volumeMounts/-
+          value:
+            name: ${parameters.volumeName}
+            mountPath: ${parameters.mountPath}
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Trait
+metadata:
+  name: emptydir-volume
+spec:
+  parameters:
+    openAPIV3Schema:
+      # Define custom type for mount configuration
+      $types:
+        MountConfig:
+          containerName: string
+          mountPath: string
+          readOnly: boolean | default=false
+          subPath: string | default=""
+      volumeName: string
+      mounts: "[]MountConfig | minItems=1"
+
+  environmentConfigs:
+    openAPIV3Schema:
+      sizeLimit: string | default=""
+      medium: string | default="" # "" for disk, "Memory" for tmpfs
+
+  # Patch the Deployment to add emptyDir volume
+  patches:
+    # Add emptyDir volume to pod spec
+    - target:
+        group: apps
+        version: v1
+        kind: Deployment
+      operations:
+        - op: add
+          path: /spec/template/spec/volumes/-
+          value:
+            name: ${parameters.volumeName}
+            emptyDir: |
+              ${environmentConfigs.sizeLimit != "" || environmentConfigs.medium != "" ? {
+                "sizeLimit": environmentConfigs.sizeLimit != "" ? environmentConfigs.sizeLimit : oc_omit(),
+                "medium": environmentConfigs.medium != "" ? environmentConfigs.medium : oc_omit()
+              } : {}}
+
+    # Add volumeMounts to each specified container
+    # This will be applied per mount in the mounts array
+    - forEach: ${parameters.mounts}
+      var: mount
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+      operations:
+        - op: add
+          path: /spec/template/spec/containers/[?(@.name=='${mount.containerName}')]/volumeMounts/-
+          value:
+            name: ${parameters.volumeName}
+            mountPath: ${mount.mountPath}
+            readOnly: |
+              ${has(mount.readOnly) ? mount.readOnly : false}
+            subPath: |
+              ${has(mount.subPath) ? mount.subPath : ""}
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: demo-app
+  namespace: default
+spec:
+  owner:
+    projectName: default
+
+  componentType:
+    kind: ComponentType
+    name: deployment/web-service
+
+  parameters:
+    replicas: 2
+    port: 8080
+
+  traits:
+    - name: persistent-volume
+      instanceName: data-storage
+      parameters:
+        volumeName: app-data
+        mountPath: /var/data
+        containerName: app
+    - name: emptydir-volume
+      instanceName: cache
+      parameters:
+        volumeName: cache-vol
+        mounts:
+          - containerName: app
+            mountPath: /tmp/cache
+            readOnly: false
+    - name: emptydir-volume
+      instanceName: workspace
+      parameters:
+        volumeName: workspace-vol
+        mounts:
+          - containerName: app
+            mountPath: /tmp/work
+            readOnly: false
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: demo-app-workload
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app
+
+  container:
+    image: "nginx:1.25-alpine"
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ReleaseBinding
+metadata:
+  name: demo-app-development
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app
+
+  environment: dev
+
+  componentTypeEnvironmentConfigs:
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+
+  traitEnvironmentConfigs:
+    data-storage:
+      size: "5Gi"
+      storageClass: "standard"
+    workspace:
+      medium: ""
+      sizeLimit: "1Gi"
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Environment
+metadata:
+  name: dev
+  namespace: default
+spec:
+  dataPlaneRef:
+    kind: DataPlane
+    name: dev-dataplane
+  isProduction: false
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: DataPlane
+metadata:
+  name: dev-dataplane
+  namespace: default
+spec:
+  clusterAgent:
+    clientCA:
+      value: |
+        -----BEGIN CERTIFICATE-----
+        MIIDXTCCAkWgAwIBAgIJALw5Kj2FQ7tQMA0GCSqGSIb3DQEBCwUAMEUxCzAJBgNV
+        BAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBX
+        aWRnaXRzIFB0eSBMdGQwHhcNMjUwMTAxMDAwMDAwWhcNMjYwMTAxMDAwMDAwWjBF
+        -----END CERTIFICATE-----
+  registry:
+    prefix: docker.io/myorg
+    secretRef: registry-credentials
+  gateway:
+    ingress:
+      external:
+        http:
+          port: 80
+          host: api.example.com
+        https:
+          port: 443
+          host: api.example.com
+      internal:
+        http:
+          port: 80
+          host: internal.example.com
+  observabilityPlaneRef:
+    kind: ObservabilityPlane
+    name: dev-observability

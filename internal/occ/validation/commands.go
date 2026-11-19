@@ -1,0 +1,100 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package validation
+
+import (
+	"fmt"
+	"strings"
+)
+
+// CommandType represents the type of CLI command
+type CommandType string
+
+const (
+	CmdCreate CommandType = "create"
+	CmdGet    CommandType = "get"
+	CmdList   CommandType = "list"
+	CmdLogs   CommandType = "logs"
+	CmdApply  CommandType = "apply"
+	CmdDelete CommandType = "delete"
+	CmdDeploy CommandType = "deploy"
+)
+
+// ResourceType represents the resource being managed
+type ResourceType string
+
+const (
+	ResourceProject   ResourceType = "project"
+	ResourceComponent ResourceType = "component"
+
+	ResourceDeployment ResourceType = "deployment"
+
+	ResourceEnvironment        ResourceType = "environment"
+	ResourceDeployableArtifact ResourceType = "deployableartifact"
+	ResourceEndpoint           ResourceType = "endpoint"
+	ResourceNamespace          ResourceType = "namespace"
+	ResourceDataPlane          ResourceType = "dataplane"
+	ResourceWorkflowPlane      ResourceType = "workflowplane"
+	ResourceObservabilityPlane ResourceType = "observabilityplane"
+	ResourceComponentType      ResourceType = "componenttype"
+	ResourceTrait              ResourceType = "trait"
+	ResourceWorkflow           ResourceType = "workflow"
+	ResourceSecretReference    ResourceType = "secretreference"
+	ResourceLogs               ResourceType = "logs"
+	ResourceApply              ResourceType = "apply"
+	ResourceDeploymentPipeline ResourceType = "deploymentpipeline"
+
+	ResourceWorkload                               ResourceType = "workload"
+	ResourceComponentRelease                       ResourceType = "componentrelease"
+	ResourceReleaseBinding                         ResourceType = "releasebinding"
+	ResourceWorkflowRun                            ResourceType = "workflowrun"
+	ResourceObservabilityAlertsNotificationChannel ResourceType = "observabilityalertsnotificationchannel"
+	ResourceClusterAuthzRole                       ResourceType = "clusterauthzrole"
+	ResourceClusterAuthzRoleBinding                ResourceType = "clusterauthzrolebinding"
+	ResourceAuthzRole                              ResourceType = "authzrole"
+	ResourceAuthzRoleBinding                       ResourceType = "authzrolebinding"
+)
+
+// checkRequiredFields verifies if all required fields are populated
+func checkRequiredFields(fields map[string]string) bool {
+	for _, v := range fields {
+		if v == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// generateHelpError creates a help message for missing required fields
+func generateHelpError(cmdType CommandType, resource ResourceType, fields map[string]string) error {
+	var errMsg strings.Builder
+	var missingFields []string
+
+	// Identify which fields are missing
+	for field, value := range fields {
+		if value == "" {
+			missingFields = append(missingFields, field)
+		}
+	}
+
+	fmt.Fprintf(&errMsg, "Missing required parameter%s: --%s\n\n",
+		pluralS(len(missingFields)), strings.Join(missingFields, ", --"))
+
+	errMsg.WriteString("To see usage details:\n")
+	if resource == "" {
+		fmt.Fprintf(&errMsg, "  occ %s -h", cmdType)
+	} else {
+		fmt.Fprintf(&errMsg, "  occ %s %s -h", cmdType, resource)
+	}
+
+	return fmt.Errorf("%s", errMsg.String())
+}
+
+// Helper function to handle plural forms
+func pluralS(count int) string {
+	if count > 1 {
+		return "s"
+	}
+	return ""
+}

@@ -1,0 +1,110 @@
+// Copyright 2026 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package service
+
+import (
+	"context"
+
+	"github.com/openchoreo/openchoreo/internal/observer/api/gen"
+	"github.com/openchoreo/openchoreo/internal/observer/api/internalgen"
+	"github.com/openchoreo/openchoreo/internal/observer/types"
+)
+
+// HealthChecker is the interface for checking service health.
+type HealthChecker interface {
+	Check(ctx context.Context) error
+}
+
+// LogsQuerier is the interface for querying logs.
+type LogsQuerier interface {
+	QueryLogs(ctx context.Context, req *types.LogsQueryRequest) (*types.LogsQueryResponse, error)
+}
+
+// PlatformLogsQuerier is the interface for querying platform logs.
+type PlatformLogsQuerier interface {
+	QueryPlatformLogs(ctx context.Context, req *types.PlatformLogsQueryRequest) (*types.PlatformLogsResponse, error)
+
+	// QueryPlatformLogFilterValues lists the values one of those filters can take.
+	QueryPlatformLogFilterValues(
+		ctx context.Context,
+		req *types.PlatformLogFilterValuesRequest,
+	) (*types.PlatformLogFilterValuesResponse, error)
+}
+
+// AuditLogsQuerier is the interface for querying the audit trail and the filter
+// values a picker over it is populated from. One interface because both reads
+// disclose the same content and so carry the same permission.
+type AuditLogsQuerier interface {
+	QueryAuditLogs(ctx context.Context, req *types.AuditLogsQueryRequest) (*types.AuditLogsResponse, error)
+	QueryAuditLogFilterValues(
+		ctx context.Context, req *types.AuditLogFilterValuesRequest,
+	) (*types.AuditLogFilterValuesResponse, error)
+}
+
+// EventsQuerier is the interface for querying Kubernetes events.
+type EventsQuerier interface {
+	QueryEvents(ctx context.Context, req *types.EventsQueryRequest) (*types.EventsQueryResponse, error)
+}
+
+// MetricsQuerier is the interface for querying metrics and runtime topology.
+type MetricsQuerier interface {
+	QueryMetrics(ctx context.Context, req *types.MetricsQueryRequest) (any, error)
+	QueryRuntimeTopology(ctx context.Context, req *types.RuntimeTopologyRequest) (*types.RuntimeTopologyResponse, error)
+}
+
+// TracesQuerier is the interface for querying traces and spans.
+type TracesQuerier interface {
+	QueryTraces(ctx context.Context, req *types.TracesQueryRequest) (*types.TracesQueryResponse, error)
+	QuerySpans(ctx context.Context, traceID string, req *types.TracesQueryRequest) (*types.SpansQueryResponse, error)
+	GetSpanDetails(ctx context.Context, traceID string, spanID string) (*types.SpanInfo, error)
+}
+
+// FinOpsQuerier is the interface for querying cost insights and right-sizing
+// recommendations.
+type FinOpsQuerier interface {
+	GetComponentCosts(ctx context.Context, req *types.CostQueryRequest) (any, error)
+	GetRecommendations(ctx context.Context, req *types.RecommendationQueryRequest) (any, error)
+}
+
+// AlertsQuerier is the interface for querying alerts.
+type AlertsQuerier interface {
+	QueryAlerts(ctx context.Context, req gen.AlertsQueryRequest) (*gen.AlertsQueryResponse, error)
+}
+
+// IncidentsQuerier is the interface for querying incidents.
+type IncidentsQuerier interface {
+	QueryIncidents(ctx context.Context, req gen.IncidentsQueryRequest) (*gen.IncidentsQueryResponse, error)
+}
+
+// IncidentsUpdater is the interface for updating incidents.
+type IncidentsUpdater interface {
+	UpdateIncident(ctx context.Context, incidentID string, req gen.IncidentPutRequest) (*gen.IncidentPutResponse, error)
+	// IncidentScope returns the namespace, project and component an incident
+	// belongs to. It exists for the authorization wrapper: IncidentPutRequest
+	// names no scope, so authorizing against the incident's real hierarchy
+	// requires reading the stored incident first. Returns
+	// incidententry.ErrIncidentNotFound for an unknown ID.
+	IncidentScope(ctx context.Context, incidentID string) (namespace, project, component string, err error)
+}
+
+// AlertIncidentService is a composite interface combining alert query, incident query,
+// and incident update operations. The concrete *AlertService satisfies this interface.
+// The individual sub-interfaces are kept for consumers that only need a subset.
+type AlertIncidentService interface {
+	AlertsQuerier
+	IncidentsQuerier
+	IncidentsUpdater
+}
+
+// AlertRuleService is the interface for managing alert rules
+// and processing incoming alert webhooks.
+type AlertRuleService interface {
+	CreateAlertRule(ctx context.Context, req internalgen.AlertRuleRequest) (*internalgen.AlertingRuleSyncResponse, error)
+	GetAlertRule(ctx context.Context, ruleName, sourceType string) (*internalgen.AlertRuleResponse, error)
+	UpdateAlertRule(
+		ctx context.Context, ruleName string, req internalgen.AlertRuleRequest,
+	) (*internalgen.AlertingRuleSyncResponse, error)
+	DeleteAlertRule(ctx context.Context, ruleName, sourceType string) (*internalgen.AlertingRuleSyncResponse, error)
+	HandleAlertWebhook(ctx context.Context, req internalgen.AlertWebhookRequest) (*internalgen.AlertWebhookResponse, error)
+}

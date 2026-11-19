@@ -1,0 +1,189 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	authzcore "github.com/openchoreo/openchoreo/internal/authz/core"
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/api/gen"
+)
+
+// ensureProjectSpec returns the given spec, allocating a new one if nil, so
+// callers can set individual fields without repeating the nil guard.
+func ensureProjectSpec(spec *gen.ProjectSpec) *gen.ProjectSpec {
+	if spec == nil {
+		return &gen.ProjectSpec{}
+	}
+	return spec
+}
+
+func (t *Toolsets) RegisterListProjects(s *mcp.Server, perms map[string]ToolPermission) {
+	const name = "list_projects"
+	perms[name] = ToolPermission{ToolName: name, Action: authzcore.ActionViewProject}
+	mcp.AddTool(s, &mcp.Tool{
+		Name: name,
+		Description: "List all projects in an namespace. Projects are logical groupings of related " +
+			"components that share deployment pipelines. Supports pagination via limit and cursor.",
+		InputSchema: createSchema(addPaginationProperties(map[string]any{
+			"namespace_name": stringProperty("Use list_namespaces to discover valid names"),
+		}), []string{"namespace_name"}),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		NamespaceName string `json:"namespace_name"`
+		Limit         int    `json:"limit,omitempty"`
+		Cursor        string `json:"cursor,omitempty"`
+	}) (*mcp.CallToolResult, any, error) {
+		result, err := t.ProjectToolset.ListProjects(
+			ctx, args.NamespaceName, ListOpts{Limit: args.Limit, Cursor: args.Cursor})
+		return handleToolResult(result, err)
+	})
+}
+
+func (t *Toolsets) RegisterCreateProject(s *mcp.Server, perms map[string]ToolPermission) {
+	const name = "create_project"
+	perms[name] = ToolPermission{ToolName: name, Action: authzcore.ActionCreateProject}
+	mcp.AddTool(s, &mcp.Tool{
+		Name: name,
+		Description: "Create a new project in an namespace. Project names must be DNS-compatible " +
+			"(lowercase, alphanumeric, hyphens only, max 63 chars). The project references a " +
+			"ProjectType (namespace-scoped) or ClusterProjectType (cluster-scoped) template; when " +
+			"omitted it defaults to the cluster-scoped \"default\" ClusterProjectType. " +
+			"This creates only the Project entity and does NOT create ProjectReleaseBindings, so the " +
+			"project is not yet deployed to any environment. Making it deployable is the expected next " +
+			"step: unless the caller only wants the bare entity, follow up by creating one " +
+			"ProjectReleaseBinding per target environment with create_project_release_binding. " +
+			"Create bindings right away with the release pin left empty: they stay pending and the " +
+			"controller fills the pin once the project's first ProjectRelease is cut, so a not-yet-existing " +
+			"release is not a blocker. Use get_deployment_pipeline to list the pipeline's environments.",
+		InputSchema: createSchema(map[string]any{
+			"namespace_name": defaultStringProperty(),
+			"name": stringProperty(
+				"DNS-compatible identifier (lowercase, alphanumeric, hyphens only, max 63 chars)"),
+			"description": stringProperty("Human-readable description"),
+			"deployment_pipeline": stringProperty(
+				"Name of the DeploymentPipeline to use. Defaults to \"default\" if not specified."),
+			"type_name": stringProperty(
+				"Optional: name of the (Cluster)ProjectType to reference. Defaults to \"default\". " +
+					"Use list_project_types to discover names."),
+			"type_kind": stringProperty(
+				"Optional: \"ProjectType\" (namespace-scoped, default) or \"ClusterProjectType\" (cluster-scoped)."),
+			"parameters": map[string]any{
+				"type":        "object",
+				"description": "Optional: parameter values for the referenced (Cluster)ProjectType schema.",
+			},
+		}, []string{"namespace_name", "name"}),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		NamespaceName      string         `json:"namespace_name"`
+		Name               string         `json:"name"`
+		Description        string         `json:"description"`
+		DeploymentPipeline string         `json:"deployment_pipeline"`
+		TypeName           string         `json:"type_name"`
+		TypeKind           string         `json:"type_kind"`
+		Parameters         map[string]any `json:"parameters"`
+	}) (*mcp.CallToolResult, any, error) {
+		annotations := map[string]string{}
+		if args.Description != "" {
+			annotations["openchoreo.dev/description"] = args.Description
+		}
+
+		projectReq := &gen.CreateProjectJSONRequestBody{
+			Metadata: gen.ObjectMeta{
+				Name:        args.Name,
+				Annotations: &annotations,
+			},
+		}
+		if args.DeploymentPipeline != "" {
+			projectReq.Spec = ensureProjectSpec(projectReq.Spec)
+			projectReq.Spec.DeploymentPipelineRef = &struct {
+				Kind *gen.ProjectSpecDeploymentPipelineRefKind `json:"kind,omitempty"`
+				Name string                                    `json:"name"`
+			}{
+				Name: args.DeploymentPipeline,
+			}
+		}
+		if args.TypeName != "" {
+			projectReq.Spec = ensureProjectSpec(projectReq.Spec)
+			typeRef := gen.ProjectTypeRef{Name: args.TypeName}
+			if args.TypeKind != "" {
+				kind := gen.ProjectTypeRefKind(args.TypeKind)
+				typeRef.Kind = &kind
+			}
+			projectReq.Spec.Type = &typeRef
+		}
+		if args.Parameters != nil {
+			projectReq.Spec = ensureProjectSpec(projectReq.Spec)
+			projectReq.Spec.Parameters = &args.Parameters
+		}
+		result, err := t.ProjectToolset.CreateProject(ctx, args.NamespaceName, projectReq)
+		return handleToolResult(result, err)
+	})
+}
+
+func (t *Toolsets) RegisterUpdateProject(s *mcp.Server, perms map[string]ToolPermission) {
+	const name = "update_project"
+	perms[name] = ToolPermission{ToolName: name, Action: authzcore.ActionUpdateProject}
+
+	type updateProjectArgs struct {
+		NamespaceName      string `json:"namespace_name"`
+		ProjectName        string `json:"project_name"`
+		DeploymentPipeline string `json:"deployment_pipeline"`
+		DisplayName        string `json:"display_name"`
+		Description        string `json:"description"`
+	}
+
+	inputSchema := createSchema(map[string]any{
+		"namespace_name": defaultStringProperty(),
+		"project_name": stringProperty(
+			"Name of the existing project to update. Use list_projects to discover valid names."),
+		"deployment_pipeline": stringProperty(
+			"Name of the DeploymentPipeline the project should use."),
+		"display_name": stringProperty(
+			"Updated human-readable display name."),
+		"description": stringProperty(
+			"Updated human-readable description."),
+	}, []string{"namespace_name", "project_name"})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: name,
+		Description: "Update an existing project's deployment pipeline reference, display name, " +
+			"and description. Only provided fields will be updated.",
+		InputSchema: inputSchema,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateProjectArgs) (*mcp.CallToolResult, any, error) {
+		patchReq := &gen.PatchProjectRequest{}
+		if args.DeploymentPipeline != "" {
+			patchReq.DeploymentPipeline = &args.DeploymentPipeline
+		}
+		if args.DisplayName != "" {
+			patchReq.DisplayName = &args.DisplayName
+		}
+		if args.Description != "" {
+			patchReq.Description = &args.Description
+		}
+
+		result, err := t.ProjectToolset.UpdateProject(ctx, args.NamespaceName, args.ProjectName, patchReq)
+		return handleToolResult(result, err)
+	})
+}
+
+func (t *Toolsets) RegisterDeleteProject(s *mcp.Server, perms map[string]ToolPermission) {
+	const name = "delete_project"
+	perms[name] = ToolPermission{ToolName: name, Action: authzcore.ActionDeleteProject}
+	mcp.AddTool(s, &mcp.Tool{
+		Name: name,
+		Description: "Delete a project. Destructive: cascades to remove all components, workloads, releases, " +
+			"and bindings owned by the project. Confirm with the user before calling.",
+		InputSchema: createSchema(map[string]any{
+			"namespace_name": defaultStringProperty(),
+			"project_name":   stringProperty("Use list_projects to discover valid names"),
+		}, []string{"namespace_name", "project_name"}),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		NamespaceName string `json:"namespace_name"`
+		ProjectName   string `json:"project_name"`
+	}) (*mcp.CallToolResult, any, error) {
+		result, err := t.ProjectToolset.DeleteProject(ctx, args.NamespaceName, args.ProjectName)
+		return handleToolResult(result, err)
+	})
+}

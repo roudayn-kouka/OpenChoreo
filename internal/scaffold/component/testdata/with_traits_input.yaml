@@ -1,0 +1,76 @@
+componentName: my-api
+namespace: acme-corp
+projectName: online-store
+includeFieldDescriptions: true
+includeStructuralComments: true
+traitInstanceNames:
+  storage: app-storage
+  logging: app-logging
+  networking: app-networking
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: web-app
+spec:
+  workloadType: deployment
+  parameters:
+    openAPIV3Schema:
+      type: object
+      required:
+        - port
+      properties:
+        port:
+          type: integer
+---
+# Multiple traits to verify deterministic ordering (alphabetical: logging, networking, storage)
+apiVersion: openchoreo.dev/v1alpha1
+kind: Trait
+metadata:
+  name: storage
+spec:
+  parameters:
+    openAPIV3Schema:
+      type: object
+      required:
+        - mountPath
+      properties:
+        mountPath:
+          type: string
+          description: "Mount path"
+        size:
+          type: string
+          default: "10Gi"
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Trait
+metadata:
+  name: logging
+spec:
+  parameters:
+    openAPIV3Schema:
+      type: object
+      properties:
+        level:
+          type: string
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+          default: "info"
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Trait
+metadata:
+  name: networking
+spec:
+  parameters:
+    openAPIV3Schema:
+      type: object
+      required:
+        - ingress
+      properties:
+        ingress:
+          type: boolean
+          description: "Enable ingress"

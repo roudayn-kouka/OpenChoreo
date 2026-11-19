@@ -1,0 +1,22 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: AuthzRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: openchoreo
+    app.kubernetes.io/managed-by: kustomize
+  name: dev-team-crm-project
+  namespace: acme-org
+spec:
+  entitlement:
+    claim: groups
+    value: dev-team
+  roleMappings:
+    - roleRef:
+        kind: AuthzRole
+        name: developer
+      scope:
+        project: crm
+    - roleRef:
+        kind: ClusterAuthzRole
+        name: viewer
+  effect: allow

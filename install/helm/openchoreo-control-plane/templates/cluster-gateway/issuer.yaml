@@ -1,0 +1,13 @@
+{{- if not .Values.clusterGateway.tls.existingSecret }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Values.clusterGateway.tls.issuerRef.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openchoreo-control-plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-gateway
+spec:
+  ca:
+    secretName: cluster-gateway-ca
+{{- end }}

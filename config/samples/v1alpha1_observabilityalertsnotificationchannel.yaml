@@ -1,0 +1,70 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: ObservabilityAlertsNotificationChannel
+metadata:
+  labels:
+    app.kubernetes.io/name: openchoreo
+    app.kubernetes.io/managed-by: kustomize
+  name: observabilityalertsnotificationchannel-sample
+spec:
+  environment: development
+  type: email
+  emailConfig:
+    from: test@example.com
+    to:
+      - test@example.com
+    smtp:
+      host: smtp.example.com
+      port: 587
+      auth:
+        username:
+          secretKeyRef:
+            name: observability-sample-smtp-auth
+            key: username
+        password:
+          secretKeyRef:
+            name: observability-sample-smtp-auth
+            key: password
+      tls:
+        insecureSkipVerify: true
+    template:
+      subject: "[${alert.severity}] - ${alert.name} Triggered"
+      body: "Alert: ${alert.name} triggered at ${alert.startsAt}.\nSummary: ${alert.description}"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: observability-sample-smtp-auth
+data:
+  username: dGVzdEBleGFtcGxlLmNvbQ==
+  password: dGVzdEBleGFtcGxlLmNvbQ==
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ObservabilityAlertsNotificationChannel
+metadata:
+  labels:
+    app.kubernetes.io/name: openchoreo
+    app.kubernetes.io/managed-by: kustomize
+  name: observabilityalertsnotificationchannel-webhook-sample
+spec:
+  environment: development
+  type: webhook
+  webhookConfig:
+    url: https://example.com/webhook/alerts
+    headers:
+      Authorization:
+        value: "Bearer your-token-here"
+      X-Custom-Header:
+        valueFrom:
+          secretKeyRef:
+            name: observability-sample-webhook-auth
+            key: api-key
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: observability-sample-webhook-auth
+data:
+  api-key: eW91ci1hcGkta2V5LWhlcmU=

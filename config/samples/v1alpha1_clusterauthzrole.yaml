@@ -1,0 +1,12 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: ClusterAuthzRole
+metadata:
+  labels:
+    app.kubernetes.io/name: openchoreo
+    openchoreo.dev/internal: "false"
+  name: platform-admin
+spec:
+  description: "Platform administrator with full access to all resources"
+  actions:
+  # Full access to all resources
+    - "*"

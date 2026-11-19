@@ -1,0 +1,10 @@
+{{- if .Values.security.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "openchoreo-data-plane.fullname" . }}-selfsigned-issuer
+  labels:
+  {{- include "openchoreo-data-plane.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+{{- end }}

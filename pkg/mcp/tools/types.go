@@ -1,0 +1,648 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/openchoreo/openchoreo/internal/openchoreo-api/api/gen"
+)
+
+// ToolsetType represents a type of toolset that can be enabled
+type ToolsetType string
+
+const (
+	ToolsetNamespace  ToolsetType = "namespace"
+	ToolsetProject    ToolsetType = "project"
+	ToolsetComponent  ToolsetType = "component"
+	ToolsetDeployment ToolsetType = "deployment"
+	ToolsetBuild      ToolsetType = "build"
+	ToolsetPE         ToolsetType = "pe"
+	ToolsetResource   ToolsetType = "resource"
+)
+
+// requestedToolsetsCtxKey is the context key used to carry the set of toolsets
+// the client requested via the ?toolsets= query param.
+type requestedToolsetsCtxKey struct{}
+
+// filterByAuthzCtxKey is the context key used to carry the per-request
+// filterByAuthz flag from the ?filterByAuthz= query param.
+type filterByAuthzCtxKey struct{}
+
+// WithRequestedToolsets returns a copy of ctx that carries the set of toolsets
+// the client requested. Empty or nil set means "no narrowing" — the middleware
+// will not apply a toolset filter.
+func WithRequestedToolsets(ctx context.Context, requested map[ToolsetType]bool) context.Context {
+	if len(requested) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, requestedToolsetsCtxKey{}, requested)
+}
+
+// RequestedToolsetsFromContext returns the set of toolsets the client requested
+// for this request, if any. The second return value reports whether the client
+// supplied any narrowing.
+func RequestedToolsetsFromContext(ctx context.Context) (map[ToolsetType]bool, bool) {
+	v, ok := ctx.Value(requestedToolsetsCtxKey{}).(map[ToolsetType]bool)
+	return v, ok && len(v) > 0
+}
+
+// WithFilterByAuthz returns a copy of ctx carrying the per-request decision of
+// whether to apply MCP-layer authz filtering. The default (no value in ctx) is
+// true.
+func WithFilterByAuthz(ctx context.Context, filter bool) context.Context {
+	return context.WithValue(ctx, filterByAuthzCtxKey{}, filter)
+}
+
+// FilterByAuthzFromContext returns the per-request filterByAuthz flag if the
+// client explicitly supplied one. The second return value reports whether a
+// value was set; callers should default to true when not set.
+func FilterByAuthzFromContext(ctx context.Context) (bool, bool) {
+	v, ok := ctx.Value(filterByAuthzCtxKey{}).(bool)
+	return v, ok
+}
+
+// DefaultPageSize is the default number of items per page for MCP list operations.
+const DefaultPageSize = 100
+
+// ListOpts holds optional pagination parameters for list operations.
+type ListOpts struct {
+	// Limit is the maximum number of items to return per page.
+	// When 0 or unset, DefaultPageSize is used.
+	Limit int
+	// Cursor is an opaque pagination cursor from a previous response.
+	Cursor string
+}
+
+// EffectiveLimit returns the limit to use, applying DefaultPageSize when unset.
+func (o ListOpts) EffectiveLimit() int {
+	if o.Limit <= 0 {
+		return DefaultPageSize
+	}
+	return o.Limit
+}
+
+type Toolsets struct {
+	NamespaceToolset  NamespaceToolsetHandler
+	ProjectToolset    ProjectToolsetHandler
+	ComponentToolset  ComponentToolsetHandler
+	DeploymentToolset DeploymentToolsetHandler
+	BuildToolset      BuildToolsetHandler
+	PEToolset         PEToolsetHandler
+	ResourceToolset   ResourceToolsetHandler
+}
+
+// AllToolsetsHandler is satisfied by a single handler implementing every
+// toolset's interface. NewToolsets takes one so a caller that wants several
+// (or all) toolsets backed by the same handler value doesn't need its own
+// struct literal naming every field — see mcphandlers.MCPHandler, the only
+// production implementation, which backs every field in practice today.
+type AllToolsetsHandler interface {
+	NamespaceToolsetHandler
+	ProjectToolsetHandler
+	ComponentToolsetHandler
+	DeploymentToolsetHandler
+	BuildToolsetHandler
+	PEToolsetHandler
+	ResourceToolsetHandler
+}
+
+// AllToolsetTypes returns every known ToolsetType mapped to true. This is the
+// one place the full set is enumerated — callers that need "every toolset"
+// (constructing a from-scratch registry for documentation or coverage
+// tooling, e.g. tools/auditcoverage) should build off this rather than
+// re-listing the ToolsetType consts by hand, which is what let the coverage
+// tool and its test silently drift out of sync with each other and with
+// production's toolset switch before this existed.
+func AllToolsetTypes() map[ToolsetType]bool {
+	return map[ToolsetType]bool{
+		ToolsetNamespace:  true,
+		ToolsetProject:    true,
+		ToolsetComponent:  true,
+		ToolsetDeployment: true,
+		ToolsetBuild:      true,
+		ToolsetPE:         true,
+		ToolsetResource:   true,
+	}
+}
+
+// NewToolsets builds a Toolsets struct with handler backing every toolset
+// named true in enabled, leaving the rest nil (nil is exactly Register's
+// signal to skip a toolset — see register.go). Pass AllToolsetTypes() for
+// enabled to back every toolset with the same handler.
+func NewToolsets(handler AllToolsetsHandler, enabled map[ToolsetType]bool) *Toolsets {
+	t := &Toolsets{}
+	if enabled[ToolsetNamespace] {
+		t.NamespaceToolset = handler
+	}
+	if enabled[ToolsetProject] {
+		t.ProjectToolset = handler
+	}
+	if enabled[ToolsetComponent] {
+		t.ComponentToolset = handler
+	}
+	if enabled[ToolsetDeployment] {
+		t.DeploymentToolset = handler
+	}
+	if enabled[ToolsetBuild] {
+		t.BuildToolset = handler
+	}
+	if enabled[ToolsetPE] {
+		t.PEToolset = handler
+	}
+	if enabled[ToolsetResource] {
+		t.ResourceToolset = handler
+	}
+	return t
+}
+
+// PEToolsetHandler handles platform engineering operations on openchoreo
+type PEToolsetHandler interface {
+	// Environment operations
+	ListEnvironments(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	CreateEnvironment(ctx context.Context, namespaceName string, req *gen.CreateEnvironmentJSONRequestBody) (any, error)
+	UpdateEnvironment(ctx context.Context, namespaceName string, req *gen.UpdateEnvironmentJSONRequestBody) (any, error)
+	DeleteEnvironment(ctx context.Context, namespaceName, envName string) (any, error)
+
+	// Component release operations
+	ListComponentReleases(ctx context.Context, namespaceName, componentName string, opts ListOpts) (any, error)
+	CreateComponentRelease(ctx context.Context, namespaceName, componentName, releaseName string) (any, error)
+	GetComponentRelease(ctx context.Context, namespaceName, releaseName string) (any, error)
+	GetComponentReleaseSchema(
+		ctx context.Context, namespaceName, componentName, releaseName string,
+	) (any, error)
+
+	// Resource release operations
+	ListResourceReleases(
+		ctx context.Context, namespaceName, resourceName string, opts ListOpts,
+	) (any, error)
+	CreateResourceRelease(
+		ctx context.Context, namespaceName string,
+		req *gen.CreateResourceReleaseJSONRequestBody,
+	) (any, error)
+	GetResourceRelease(ctx context.Context, namespaceName, releaseName string) (any, error)
+
+	// Project release operations (delete lives on the deployment toolset).
+	ListProjectReleases(
+		ctx context.Context, namespaceName, projectName string, opts ListOpts,
+	) (any, error)
+	CreateProjectRelease(
+		ctx context.Context, namespaceName string,
+		req *gen.CreateProjectReleaseJSONRequestBody,
+	) (any, error)
+	GetProjectRelease(ctx context.Context, namespaceName, releaseName string) (any, error)
+
+	// DeploymentPipeline operations
+	CreateDeploymentPipeline(ctx context.Context, namespaceName string,
+		req *gen.CreateDeploymentPipelineJSONRequestBody) (any, error)
+	UpdateDeploymentPipeline(ctx context.Context, namespaceName string,
+		req *gen.UpdateDeploymentPipelineJSONRequestBody) (any, error)
+	DeleteDeploymentPipeline(ctx context.Context, namespaceName, dpName string) (any, error)
+
+	// DataPlane operations
+	ListDataPlanes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetDataPlane(ctx context.Context, namespaceName, dpName string) (any, error)
+
+	// WorkflowPlane operations
+	ListWorkflowPlanes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetWorkflowPlane(ctx context.Context, namespaceName, workflowPlaneName string) (any, error)
+
+	// ObservabilityPlane operations
+	ListObservabilityPlanes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetObservabilityPlane(ctx context.Context, namespaceName, observabilityPlaneName string) (any, error)
+
+	// ClusterDataPlane operations
+	ListClusterDataPlanes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterDataPlane(ctx context.Context, cdpName string) (any, error)
+
+	// ClusterWorkflowPlane operations
+	ListClusterWorkflowPlanes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterWorkflowPlane(ctx context.Context, cbpName string) (any, error)
+
+	// ClusterObservabilityPlane operations
+	ListClusterObservabilityPlanes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterObservabilityPlane(ctx context.Context, copName string) (any, error)
+
+	// Platform standards (namespace-scoped) — read
+	ListComponentTypes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetComponentType(ctx context.Context, namespaceName, ctName string) (any, error)
+	GetComponentTypeSchema(ctx context.Context, namespaceName, ctName string) (any, error)
+	ListTraits(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetTrait(ctx context.Context, namespaceName, traitName string) (any, error)
+	GetTraitSchema(ctx context.Context, namespaceName, traitName string) (any, error)
+	ListWorkflows(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetWorkflow(ctx context.Context, namespaceName, workflowName string) (any, error)
+	GetWorkflowSchema(ctx context.Context, namespaceName, workflowName string) (any, error)
+
+	// Platform standards (namespace-scoped) — write
+	CreateComponentType(
+		ctx context.Context, namespaceName string, req *gen.CreateComponentTypeJSONRequestBody,
+	) (any, error)
+	UpdateComponentType(
+		ctx context.Context, namespaceName string, req *gen.UpdateComponentTypeJSONRequestBody,
+	) (any, error)
+	DeleteComponentType(ctx context.Context, namespaceName, ctName string) (any, error)
+	CreateTrait(ctx context.Context, namespaceName string, req *gen.CreateTraitJSONRequestBody) (any, error)
+	UpdateTrait(ctx context.Context, namespaceName string, req *gen.UpdateTraitJSONRequestBody) (any, error)
+	DeleteTrait(ctx context.Context, namespaceName, traitName string) (any, error)
+	CreateWorkflow(ctx context.Context, namespaceName string, req *gen.CreateWorkflowJSONRequestBody) (any, error)
+	UpdateWorkflow(ctx context.Context, namespaceName string, req *gen.UpdateWorkflowJSONRequestBody) (any, error)
+	DeleteWorkflow(ctx context.Context, namespaceName, workflowName string) (any, error)
+
+	// Platform standards (cluster-scoped) — read
+	ListClusterComponentTypes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterComponentType(ctx context.Context, cctName string) (any, error)
+	GetClusterComponentTypeSchema(ctx context.Context, cctName string) (any, error)
+	ListClusterTraits(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterTrait(ctx context.Context, ctName string) (any, error)
+	GetClusterTraitSchema(ctx context.Context, ctName string) (any, error)
+	ListClusterWorkflows(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterWorkflow(ctx context.Context, cwfName string) (any, error)
+	GetClusterWorkflowSchema(ctx context.Context, cwfName string) (any, error)
+
+	// Platform standards (cluster-scoped) — write
+	CreateClusterComponentType(ctx context.Context, req *gen.CreateClusterComponentTypeJSONRequestBody) (any, error)
+	UpdateClusterComponentType(ctx context.Context, req *gen.UpdateClusterComponentTypeJSONRequestBody) (any, error)
+	DeleteClusterComponentType(ctx context.Context, cctName string) (any, error)
+	CreateClusterTrait(ctx context.Context, req *gen.CreateClusterTraitJSONRequestBody) (any, error)
+	UpdateClusterTrait(ctx context.Context, req *gen.UpdateClusterTraitJSONRequestBody) (any, error)
+	DeleteClusterTrait(ctx context.Context, clusterTraitName string) (any, error)
+	CreateClusterWorkflow(ctx context.Context, req *gen.CreateClusterWorkflowJSONRequestBody) (any, error)
+	UpdateClusterWorkflow(ctx context.Context, req *gen.UpdateClusterWorkflowJSONRequestBody) (any, error)
+	DeleteClusterWorkflow(ctx context.Context, clusterWorkflowName string) (any, error)
+
+	// Resource types (namespace-scoped) — read
+	ListResourceTypes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetResourceType(ctx context.Context, namespaceName, rtName string) (any, error)
+	GetResourceTypeSchema(ctx context.Context, namespaceName, rtName string) (any, error)
+
+	// Resource types (namespace-scoped) — write
+	CreateResourceType(
+		ctx context.Context, namespaceName string, req *gen.CreateResourceTypeJSONRequestBody,
+	) (any, error)
+	UpdateResourceType(
+		ctx context.Context, namespaceName string, req *gen.UpdateResourceTypeJSONRequestBody,
+	) (any, error)
+	DeleteResourceType(ctx context.Context, namespaceName, rtName string) (any, error)
+
+	// Resource types (cluster-scoped) — read
+	ListClusterResourceTypes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterResourceType(ctx context.Context, crtName string) (any, error)
+	GetClusterResourceTypeSchema(ctx context.Context, crtName string) (any, error)
+
+	// Resource types (cluster-scoped) — write
+	CreateClusterResourceType(
+		ctx context.Context, req *gen.CreateClusterResourceTypeJSONRequestBody,
+	) (any, error)
+	UpdateClusterResourceType(
+		ctx context.Context, req *gen.UpdateClusterResourceTypeJSONRequestBody,
+	) (any, error)
+	DeleteClusterResourceType(ctx context.Context, crtName string) (any, error)
+
+	// Project types (namespace-scoped) — read
+	ListProjectTypes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetProjectType(ctx context.Context, namespaceName, ptName string) (any, error)
+	GetProjectTypeSchema(ctx context.Context, namespaceName, ptName string) (any, error)
+
+	// Project types (namespace-scoped) — write
+	CreateProjectType(
+		ctx context.Context, namespaceName string, req *gen.CreateProjectTypeJSONRequestBody,
+	) (any, error)
+	UpdateProjectType(
+		ctx context.Context, namespaceName string, req *gen.UpdateProjectTypeJSONRequestBody,
+	) (any, error)
+	DeleteProjectType(ctx context.Context, namespaceName, ptName string) (any, error)
+
+	// Project types (cluster-scoped) — read
+	ListClusterProjectTypes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterProjectType(ctx context.Context, cptName string) (any, error)
+	GetClusterProjectTypeSchema(ctx context.Context, cptName string) (any, error)
+
+	// Project types (cluster-scoped) — write
+	CreateClusterProjectType(
+		ctx context.Context, req *gen.CreateClusterProjectTypeJSONRequestBody,
+	) (any, error)
+	UpdateClusterProjectType(
+		ctx context.Context, req *gen.UpdateClusterProjectTypeJSONRequestBody,
+	) (any, error)
+	DeleteClusterProjectType(ctx context.Context, cptName string) (any, error)
+
+	// Diagnostics
+	GetResourceTree(ctx context.Context, namespaceName, releaseBindingName string) (any, error)
+	GetResourceEvents(ctx context.Context, namespaceName, releaseBindingName,
+		group, version, kind, name string) (any, error)
+	GetResourceLogs(ctx context.Context, namespaceName, releaseBindingName,
+		podName, container string, sinceSeconds *int64) (any, error)
+
+	// Authz roles (namespace-scoped)
+	ListAuthzRoles(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetAuthzRole(ctx context.Context, namespaceName, roleName string) (any, error)
+	CreateAuthzRole(
+		ctx context.Context, namespaceName string, req *gen.CreateNamespaceRoleJSONRequestBody,
+	) (any, error)
+	UpdateAuthzRole(
+		ctx context.Context, namespaceName string, req *gen.UpdateNamespaceRoleJSONRequestBody,
+	) (any, error)
+	DeleteAuthzRole(ctx context.Context, namespaceName, roleName string) (any, error)
+
+	// Authz roles (cluster-scoped)
+	ListClusterAuthzRoles(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterAuthzRole(ctx context.Context, roleName string) (any, error)
+	CreateClusterAuthzRole(ctx context.Context, req *gen.CreateClusterRoleJSONRequestBody) (any, error)
+	UpdateClusterAuthzRole(ctx context.Context, req *gen.UpdateClusterRoleJSONRequestBody) (any, error)
+	DeleteClusterAuthzRole(ctx context.Context, roleName string) (any, error)
+
+	// Authz role bindings (namespace-scoped)
+	ListAuthzRoleBindings(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetAuthzRoleBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+	CreateAuthzRoleBinding(
+		ctx context.Context, namespaceName string, req *gen.CreateNamespaceRoleBindingJSONRequestBody,
+	) (any, error)
+	UpdateAuthzRoleBinding(
+		ctx context.Context, namespaceName string, req *gen.UpdateNamespaceRoleBindingJSONRequestBody,
+	) (any, error)
+	DeleteAuthzRoleBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+
+	// Authz role bindings (cluster-scoped)
+	ListClusterAuthzRoleBindings(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterAuthzRoleBinding(ctx context.Context, bindingName string) (any, error)
+	CreateClusterAuthzRoleBinding(
+		ctx context.Context, req *gen.CreateClusterRoleBindingJSONRequestBody,
+	) (any, error)
+	UpdateClusterAuthzRoleBinding(
+		ctx context.Context, req *gen.UpdateClusterRoleBindingJSONRequestBody,
+	) (any, error)
+	DeleteClusterAuthzRoleBinding(ctx context.Context, bindingName string) (any, error)
+
+	// Authz diagnostics
+	EvaluateAuthz(ctx context.Context, requests []gen.EvaluateRequest) (any, error)
+	ListAuthzActions(ctx context.Context) (any, error)
+
+	// SecretReference operations
+	ListSecretReferences(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetSecretReference(ctx context.Context, namespaceName, secretReferenceName string) (any, error)
+	CreateSecretReference(
+		ctx context.Context, namespaceName string, req *gen.CreateSecretReferenceJSONRequestBody,
+	) (any, error)
+	UpdateSecretReference(
+		ctx context.Context, namespaceName string, req *gen.UpdateSecretReferenceJSONRequestBody,
+	) (any, error)
+	DeleteSecretReference(ctx context.Context, namespaceName, secretReferenceName string) (any, error)
+}
+
+// NamespaceToolsetHandler handles namespace operations
+type NamespaceToolsetHandler interface {
+	ListNamespaces(ctx context.Context, opts ListOpts) (any, error)
+	CreateNamespace(ctx context.Context, req *gen.CreateNamespaceJSONRequestBody) (any, error)
+	ListSecretReferences(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetSecretReference(ctx context.Context, namespaceName, secretReferenceName string) (any, error)
+}
+
+// ProjectToolsetHandler handles project operations
+type ProjectToolsetHandler interface {
+	// Project operations
+	ListProjects(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	CreateProject(ctx context.Context, namespaceName string, req *gen.CreateProjectJSONRequestBody) (any, error)
+	UpdateProject(ctx context.Context, namespaceName, projectName string, req *gen.PatchProjectRequest) (any, error)
+	DeleteProject(ctx context.Context, namespaceName, projectName string) (any, error)
+
+	// Project types (read-only, namespace-scoped)
+	ListProjectTypes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetProjectType(ctx context.Context, namespaceName, ptName string) (any, error)
+	GetProjectTypeSchema(ctx context.Context, namespaceName, ptName string) (any, error)
+
+	// Project types (read-only, cluster-scoped)
+	ListClusterProjectTypes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterProjectType(ctx context.Context, cptName string) (any, error)
+	GetClusterProjectTypeSchema(ctx context.Context, cptName string) (any, error)
+}
+
+// ComponentToolsetHandler handles component definition and configuration operations
+type ComponentToolsetHandler interface {
+	CreateComponent(
+		ctx context.Context, namespaceName, projectName string, req *gen.CreateComponentRequest,
+	) (any, error)
+	ListComponents(ctx context.Context, namespaceName, projectName string, opts ListOpts) (any, error)
+	GetComponent(ctx context.Context, namespaceName, componentName string) (any, error)
+	PatchComponent(
+		ctx context.Context, namespaceName, componentName string, req *gen.PatchComponentRequest,
+	) (any, error)
+	ListWorkloads(ctx context.Context, namespaceName, componentName string, opts ListOpts) (any, error)
+	GetWorkload(ctx context.Context, namespaceName, workloadName string) (any, error)
+	CreateWorkload(
+		ctx context.Context, namespaceName, componentName string, workloadSpec any,
+	) (any, error)
+	UpdateWorkload(
+		ctx context.Context, namespaceName, workloadName string, workloadSpec any,
+	) (any, error)
+	DeleteComponent(ctx context.Context, namespaceName, componentName string) (any, error)
+	DeleteWorkload(ctx context.Context, namespaceName, workloadName string) (any, error)
+	GetWorkloadSchema(ctx context.Context) (any, error)
+	GetComponentSchema(ctx context.Context, namespaceName, componentName string) (any, error)
+
+	// Platform standards (read-only, namespace-scoped)
+	ListComponentTypes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetComponentType(ctx context.Context, namespaceName, ctName string) (any, error)
+	GetComponentTypeSchema(ctx context.Context, namespaceName, ctName string) (any, error)
+	ListTraits(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetTrait(ctx context.Context, namespaceName, traitName string) (any, error)
+	GetTraitSchema(ctx context.Context, namespaceName, traitName string) (any, error)
+
+	// Platform standards (read-only, cluster-scoped)
+	ListClusterComponentTypes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterComponentType(ctx context.Context, cctName string) (any, error)
+	GetClusterComponentTypeSchema(ctx context.Context, cctName string) (any, error)
+	ListClusterTraits(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterTrait(ctx context.Context, ctName string) (any, error)
+	GetClusterTraitSchema(ctx context.Context, ctName string) (any, error)
+}
+
+// DeploymentToolsetHandler handles release, deployment, and promotion operations
+type DeploymentToolsetHandler interface {
+	ListComponentReleases(ctx context.Context, namespaceName, componentName string, opts ListOpts) (any, error)
+	CreateComponentRelease(ctx context.Context, namespaceName, componentName, releaseName string) (any, error)
+	GetComponentRelease(ctx context.Context, namespaceName, releaseName string) (any, error)
+	GetComponentReleaseSchema(
+		ctx context.Context, namespaceName, componentName, releaseName string,
+	) (any, error)
+	ListReleaseBindings(ctx context.Context, namespaceName, componentName string, opts ListOpts) (any, error)
+	GetReleaseBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+	CreateReleaseBinding(
+		ctx context.Context, namespaceName string,
+		req *gen.ReleaseBindingSpec,
+	) (any, error)
+	UpdateReleaseBinding(
+		ctx context.Context, namespaceName, bindingName string,
+		req *gen.ReleaseBindingSpec,
+	) (any, error)
+	DeleteReleaseBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+	DeleteComponentRelease(ctx context.Context, namespaceName, componentReleaseName string) (any, error)
+	ListDeploymentPipelines(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetDeploymentPipeline(ctx context.Context, namespaceName, pipelineName string) (any, error)
+	ListEnvironments(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+
+	// Resource release delete (dev-side cleanup; mirrors DeleteComponentRelease).
+	DeleteResourceRelease(ctx context.Context, namespaceName, resourceReleaseName string) (any, error)
+
+	// Project release delete (dev-side cleanup; mirrors DeleteResourceRelease).
+	DeleteProjectRelease(ctx context.Context, namespaceName, projectReleaseName string) (any, error)
+
+	// Resource release binding operations
+	ListResourceReleaseBindings(
+		ctx context.Context, namespaceName, resourceName string, opts ListOpts,
+	) (any, error)
+	GetResourceReleaseBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+	CreateResourceReleaseBinding(
+		ctx context.Context, namespaceName string,
+		req *gen.CreateResourceReleaseBindingJSONRequestBody,
+	) (any, error)
+	UpdateResourceReleaseBinding(
+		ctx context.Context, namespaceName string,
+		req *gen.UpdateResourceReleaseBindingJSONRequestBody,
+	) (any, error)
+	DeleteResourceReleaseBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+
+	// Project release binding operations
+	ListProjectReleaseBindings(
+		ctx context.Context, namespaceName, projectName string, opts ListOpts,
+	) (any, error)
+	GetProjectReleaseBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+	CreateProjectReleaseBinding(
+		ctx context.Context, namespaceName string,
+		req *gen.CreateProjectReleaseBindingJSONRequestBody,
+	) (any, error)
+	UpdateProjectReleaseBinding(
+		ctx context.Context, namespaceName string,
+		req *gen.UpdateProjectReleaseBindingJSONRequestBody,
+	) (any, error)
+	DeleteProjectReleaseBinding(ctx context.Context, namespaceName, bindingName string) (any, error)
+}
+
+// BuildToolsetHandler handles workflow and CI/CD operations
+type BuildToolsetHandler interface {
+	TriggerWorkflowRun(
+		ctx context.Context, namespaceName, projectName, componentName, commit string,
+	) (any, error)
+	CreateWorkflowRun(
+		ctx context.Context, namespaceName, workflowName string,
+		parameters map[string]any,
+	) (any, error)
+	ListWorkflowRuns(
+		ctx context.Context, namespaceName, projectName, componentName string,
+		opts ListOpts,
+	) (any, error)
+	GetWorkflowRun(ctx context.Context, namespaceName, runName string) (any, error)
+	GetWorkflowRunStatus(ctx context.Context, namespaceName, runName string) (any, error)
+	GetWorkflowRunLogs(
+		ctx context.Context, namespaceName, runName, taskName string, sinceSeconds *int64,
+	) (any, error)
+	GetWorkflowRunEvents(ctx context.Context, namespaceName, runName, taskName string) (any, error)
+	ListWorkflows(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetWorkflow(ctx context.Context, namespaceName, workflowName string) (any, error)
+	GetWorkflowSchema(ctx context.Context, namespaceName, workflowName string) (any, error)
+	ListClusterWorkflows(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterWorkflow(ctx context.Context, cwfName string) (any, error)
+	GetClusterWorkflowSchema(ctx context.Context, cwfName string) (any, error)
+}
+
+// ResourceToolsetHandler handles the dev-facing surface of the managed-infrastructure
+// resource family: Resource CRUD plus read-only access to ResourceType and
+// ClusterResourceType templates. Template writes, releases, and bindings live on
+// PEToolsetHandler / DeploymentToolsetHandler matching the component-family role split.
+type ResourceToolsetHandler interface {
+	// Resource operations
+	CreateResource(
+		ctx context.Context, namespaceName, projectName string,
+		req *gen.CreateResourceJSONRequestBody,
+	) (any, error)
+	ListResources(ctx context.Context, namespaceName, projectName string, opts ListOpts) (any, error)
+	GetResource(ctx context.Context, namespaceName, resourceName string) (any, error)
+	UpdateResource(
+		ctx context.Context, namespaceName string, req *gen.UpdateResourceJSONRequestBody,
+	) (any, error)
+	DeleteResource(ctx context.Context, namespaceName, resourceName string) (any, error)
+
+	// Resource types (read-only, namespace-scoped)
+	ListResourceTypes(ctx context.Context, namespaceName string, opts ListOpts) (any, error)
+	GetResourceType(ctx context.Context, namespaceName, rtName string) (any, error)
+	GetResourceTypeSchema(ctx context.Context, namespaceName, rtName string) (any, error)
+
+	// Resource types (read-only, cluster-scoped)
+	ListClusterResourceTypes(ctx context.Context, opts ListOpts) (any, error)
+	GetClusterResourceType(ctx context.Context, crtName string) (any, error)
+	GetClusterResourceTypeSchema(ctx context.Context, crtName string) (any, error)
+}
+
+// RegisterFunc is a function type for registering MCP tools.
+// Each RegisterFunc must declare its required permission by writing to the perms map.
+type RegisterFunc func(s *mcp.Server, perms map[string]ToolPermission)
+
+// ToolPermission associates an MCP tool with the authz action(s) required to use
+// it. Action values must be action constants defined in
+// internal/authz/core/actions.go.
+type ToolPermission struct {
+	// ToolName is the MCP tool name (first arg to mcp.AddTool).
+	ToolName string
+	// Action is the required authz action (e.g. "namespace:view", "component:create")
+	// for tools whose required action does not depend on the request arguments.
+	// Mutually exclusive with ScopedActions.
+	Action string
+	// ScopedActions maps a `scope` argument value (ScopeNamespace / ScopeCluster)
+	// to the authz action required for that scope. It is populated for
+	// scope-collapsed tools whose required action depends on the requested scope.
+	// When set, Action is empty.
+	ScopedActions map[string]string
+}
+
+// Actions returns every authz action this permission may require. For a
+// scope-collapsed tool this is the union of all per-scope actions; for a plain
+// tool it is the single action (or empty).
+func (p ToolPermission) Actions() []string {
+	if len(p.ScopedActions) > 0 {
+		out := make([]string, 0, len(p.ScopedActions))
+		for _, a := range p.ScopedActions {
+			if a != "" {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+	if p.Action == "" {
+		return nil
+	}
+	return []string{p.Action}
+}
+
+// IsReadOnly reports whether every action this permission may require is a
+// "view" verb, meaning the tool needs no audit binding or exemption. A tool
+// with no actions at all is conservatively treated as not read-only, since
+// there is nothing here confirming it's safe to skip.
+func (p ToolPermission) IsReadOnly() bool {
+	actions := p.Actions()
+	if len(actions) == 0 {
+		return false
+	}
+	for _, a := range actions {
+		if !strings.HasSuffix(a, ":view") {
+			return false
+		}
+	}
+	return true
+}
+
+// ActionForScope returns the authz action required for the given scope value. For
+// a plain tool it returns Action regardless of scope. For a scope-collapsed tool
+// an empty scope is treated as ScopeNamespace.
+func (p ToolPermission) ActionForScope(scope string) string {
+	if len(p.ScopedActions) == 0 {
+		return p.Action
+	}
+	if scope == "" {
+		scope = ScopeNamespace
+	}
+	return p.ScopedActions[scope]
+}

@@ -1,0 +1,913 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package renderer
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
+
+	"github.com/openchoreo/openchoreo/api/v1alpha1"
+	"github.com/openchoreo/openchoreo/internal/template"
+)
+
+func TestRenderResources(t *testing.T) {
+	engine := template.NewEngine()
+	renderer := NewRenderer(engine)
+
+	tests := []struct {
+		name          string
+		templatesYAML string
+		context       map[string]any
+		wantCount     int
+		wantErr       bool
+	}{
+		{
+			name: "single resource without conditions",
+			templatesYAML: `
+- id: deployment
+  template:
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: ${metadata.name}
+`,
+			context: map[string]any{
+				"metadata": map[string]any{
+					"name": "test-app",
+				},
+			},
+			wantCount: 1,
+			wantErr:   false,
+		},
+		{
+			name: "resource with includeWhen true",
+			templatesYAML: `
+- id: service
+  includeWhen: ${parameters.expose}
+  template:
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: test-service
+`,
+			context: map[string]any{
+				"parameters": map[string]any{
+					"expose": true,
+				},
+			},
+			wantCount: 1,
+			wantErr:   false,
+		},
+		{
+			name: "resource with includeWhen false",
+			templatesYAML: `
+- id: service
+  includeWhen: ${parameters.expose}
+  template:
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: test-service
+`,
+			context: map[string]any{
+				"parameters": map[string]any{
+					"expose": false,
+				},
+			},
+			wantCount: 0,
+			wantErr:   false,
+		},
+		{
+			name: "resource with forEach",
+			templatesYAML: `
+- id: configmap
+  forEach: ${parameters.configs}
+  var: config
+  template:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ${config.name}
+    data:
+      value: ${config.value}
+`,
+			context: map[string]any{
+				"parameters": map[string]any{
+					"configs": []any{
+						map[string]any{"name": "config1", "value": "val1"},
+						map[string]any{"name": "config2", "value": "val2"},
+						map[string]any{"name": "config3", "value": "val3"},
+					},
+				},
+			},
+			wantCount: 3,
+			wantErr:   false,
+		},
+		{
+			name: "multiple resources mixed",
+			templatesYAML: `
+- id: deployment
+  template:
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: app
+- id: service
+  includeWhen: ${parameters.expose}
+  template:
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: app-svc
+- id: secret
+  forEach: ${parameters.secrets}
+  var: secret
+  template:
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: ${secret}
+`,
+			context: map[string]any{
+				"parameters": map[string]any{
+					"expose":  true,
+					"secrets": []any{"db-secret", "api-secret"},
+				},
+			},
+			wantCount: 4, // 1 deployment + 1 service + 2 secrets
+			wantErr:   false,
+		},
+		{
+			name: "includeWhen + forEach - includeWhen controls entire forEach block",
+			templatesYAML: `
+- id: configmap
+  includeWhen: ${parameters.createConfigs}
+  forEach: ${parameters.configs}
+  var: config
+  template:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ${config.name}
+`,
+			context: map[string]any{
+				"parameters": map[string]any{
+					"createConfigs": false,
+					"configs": []any{
+						map[string]any{"name": "cfg1"},
+						map[string]any{"name": "cfg2"},
+					},
+				},
+			},
+			wantCount: 0, // includeWhen=false skips entire forEach
+			wantErr:   false,
+		},
+		{
+			name: "forEach with filter() instead of includeWhen for item filtering",
+			templatesYAML: `
+- id: filtered
+  forEach: ${parameters.items.filter(i, i.enabled)}
+  var: item
+  template:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ${item.name}
+`,
+			context: map[string]any{
+				"parameters": map[string]any{
+					"items": []any{
+						map[string]any{"name": "item1", "enabled": true},
+						map[string]any{"name": "item2", "enabled": false},
+						map[string]any{"name": "item3", "enabled": true},
+					},
+				},
+			},
+			wantCount: 2, // Only enabled items
+			wantErr:   false,
+		},
+		{
+			name: "resource with forEach over map",
+			templatesYAML: `
+- id: configmap
+  forEach: ${parameters.envVars}
+  var: env
+  template:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: env-${env.key}
+    data:
+      "${env.key}": "${env.value}"
+`,
+			context: map[string]any{
+				"parameters": map[string]any{
+					"envVars": map[string]any{
+						"DB_HOST": "localhost",
+						"DB_PORT": "5432",
+					},
+				},
+			},
+			wantCount: 2,
+			wantErr:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Parse templates from YAML
+			var templates []v1alpha1.ResourceTemplate
+			if err := yaml.Unmarshal([]byte(tt.templatesYAML), &templates); err != nil {
+				t.Fatalf("Failed to parse templates YAML: %v", err)
+			}
+
+			got, err := renderer.RenderResources(t.Context(), templates, tt.context)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("RenderResources() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && len(got) != tt.wantCount {
+				t.Errorf("RenderResources() got %d resources, want %d", len(got), tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestShouldInclude(t *testing.T) {
+	engine := template.NewEngine()
+
+	tests := []struct {
+		name        string
+		includeWhen string
+		context     map[string]any
+		want        bool
+		wantErr     bool
+	}{
+		{
+			name:        "no includeWhen - defaults to true",
+			includeWhen: "",
+			context:     map[string]any{},
+			want:        true,
+			wantErr:     false,
+		},
+		{
+			name:        "includeWhen evaluates to true",
+			includeWhen: "${enabled}",
+			context: map[string]any{
+				"enabled": true,
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name:        "includeWhen evaluates to false",
+			includeWhen: "${enabled}",
+			context: map[string]any{
+				"enabled": false,
+			},
+			want:    false,
+			wantErr: false,
+		},
+		{
+			name:        "includeWhen with complex expression",
+			includeWhen: "${parameters.replicas > 1}",
+			context: map[string]any{
+				"parameters": map[string]any{
+					"replicas": 3,
+				},
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name:        "includeWhen with missing data - returns error",
+			includeWhen: "${nonexistent.field}",
+			context:     map[string]any{},
+			want:        false,
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ShouldInclude(t.Context(), engine, tt.includeWhen, tt.context)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ShouldInclude() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("ShouldInclude() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRenderWithForEach(t *testing.T) {
+	engine := template.NewEngine()
+	renderer := NewRenderer(engine)
+
+	tests := []struct {
+		name         string
+		templateYAML string
+		context      map[string]any
+		wantCount    int
+		wantYAML     string // Expected output YAML
+		wantErr      bool
+	}{
+		{
+			name: "forEach with default var name",
+			templateYAML: `
+id: test
+forEach: ${items}
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${item}
+`,
+			context: map[string]any{
+				"items": []any{"item1", "item2", "item3"},
+			},
+			wantCount: 3,
+			wantErr:   false,
+		},
+		{
+			name: "forEach with custom var name",
+			templateYAML: `
+id: test
+forEach: ${configs}
+var: config
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${config.name}
+  data:
+    value: ${config.value}
+`,
+			context: map[string]any{
+				"configs": []any{
+					map[string]any{"name": "cfg1", "value": "val1"},
+					map[string]any{"name": "cfg2", "value": "val2"},
+				},
+			},
+			wantCount: 2,
+			wantErr:   false,
+		},
+		{
+			name: "forEach with empty array",
+			templateYAML: `
+id: test
+forEach: ${items}
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: test
+`,
+			context: map[string]any{
+				"items": []any{},
+			},
+			wantCount: 0,
+			wantErr:   false,
+		},
+		{
+			name: "forEach with filter() - filters items before iteration",
+			templateYAML: `
+id: test
+forEach: ${items.filter(i, i.enabled)}
+var: item
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${item.name}
+  data:
+    value: ${item.value}
+`,
+			context: map[string]any{
+				"items": []any{
+					map[string]any{"name": "item1", "value": "val1", "enabled": true},
+					map[string]any{"name": "item2", "value": "val2", "enabled": false},
+					map[string]any{"name": "item3", "value": "val3", "enabled": true},
+				},
+			},
+			wantCount: 2, // Only item1 and item3 (enabled=true)
+			wantYAML: `
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: item1
+  data:
+    value: val1
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: item3
+  data:
+    value: val3
+`,
+			wantErr: false,
+		},
+		{
+			name: "forEach with filter() and map() - transform filtered list",
+			templateYAML: `
+id: test
+forEach: |
+  ${items.filter(i, i.enabled).map(i, {"name": i.name, "data": i.value})}
+var: item
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${item.name}
+  data:
+    config: ${item.data}
+`,
+			context: map[string]any{
+				"items": []any{
+					map[string]any{"name": "cfg1", "value": "val1", "enabled": true},
+					map[string]any{"name": "cfg2", "value": "val2", "enabled": false},
+					map[string]any{"name": "cfg3", "value": "val3", "enabled": true},
+				},
+			},
+			wantCount: 2, // Only cfg1 and cfg3
+			wantYAML: `
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: cfg1
+  data:
+    config: val1
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: cfg3
+  data:
+    config: val3
+`,
+			wantErr: false,
+		},
+		{
+			name: "forEach with map - creates resources for each entry",
+			templateYAML: `
+id: test
+forEach: ${configMap}
+var: entry
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: config-${entry.key}
+  data:
+    "${entry.key}": "${entry.value}"
+`,
+			context: map[string]any{
+				"configMap": map[string]any{
+					"database": "postgres://localhost:5432",
+					"cache":    "redis://localhost:6379",
+				},
+			},
+			wantCount: 2,
+			wantErr:   false,
+		},
+		{
+			name: "forEach with empty map",
+			templateYAML: `
+id: test
+forEach: ${emptyMap}
+var: entry
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: config-${entry.key}
+`,
+			context: map[string]any{
+				"emptyMap": map[string]any{},
+			},
+			wantCount: 0,
+			wantErr:   false,
+		},
+		{
+			name: "forEach with map - deterministic order",
+			templateYAML: `
+id: test
+forEach: ${settings}
+var: setting
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: setting-${setting.key}
+  data:
+    value: "${setting.value}"
+`,
+			context: map[string]any{
+				"settings": map[string]any{
+					"zebra": "z-value",
+					"alpha": "a-value",
+					"beta":  "b-value",
+				},
+			},
+			wantCount: 3,
+			// Keys sorted: alpha, beta, zebra
+			wantYAML: `
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: setting-alpha
+  data:
+    value: a-value
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: setting-beta
+  data:
+    value: b-value
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: setting-zebra
+  data:
+    value: z-value
+`,
+			wantErr: false,
+		},
+		{
+			name: "forEach with map containing complex values",
+			templateYAML: `
+id: test
+forEach: ${configs}
+var: cfg
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${cfg.key}
+  data:
+    host: "${cfg.value.host}"
+    port: "${string(cfg.value.port)}"
+`,
+			context: map[string]any{
+				"configs": map[string]any{
+					"db": map[string]any{
+						"host": "localhost",
+						"port": 5432,
+					},
+				},
+			},
+			wantCount: 1,
+			wantErr:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Parse template from YAML
+			var template v1alpha1.ResourceTemplate
+			if err := yaml.Unmarshal([]byte(tt.templateYAML), &template); err != nil {
+				t.Fatalf("Failed to parse template YAML: %v", err)
+			}
+
+			got, err := renderer.renderWithForEach(t.Context(), template, tt.context)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("renderWithForEach() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && len(got) != tt.wantCount {
+				t.Errorf("renderWithForEach() got %d resources, want %d", len(got), tt.wantCount)
+			}
+
+			// Compare YAML output if wantYAML is specified
+			if !tt.wantErr && tt.wantYAML != "" {
+				gotYAML, err := yaml.Marshal(got)
+				if err != nil {
+					t.Fatalf("Failed to marshal got resources: %v", err)
+				}
+
+				// Normalize both by unmarshaling and remarshaling
+				var wantNormalized, gotNormalized []map[string]any
+				if err := yaml.Unmarshal([]byte(tt.wantYAML), &wantNormalized); err != nil {
+					t.Fatalf("Failed to parse wantYAML: %v", err)
+				}
+				if err := yaml.Unmarshal(gotYAML, &gotNormalized); err != nil {
+					t.Fatalf("Failed to parse gotYAML: %v", err)
+				}
+
+				// Compare as YAML strings
+				wantYAMLStr, _ := yaml.Marshal(wantNormalized)
+				gotYAMLStr, _ := yaml.Marshal(gotNormalized)
+
+				if string(wantYAMLStr) != string(gotYAMLStr) {
+					t.Errorf("renderWithForEach() output mismatch:\n=== WANT ===\n%s\n=== GOT ===\n%s", wantYAMLStr, gotYAMLStr)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderSingleResource(t *testing.T) {
+	engine := template.NewEngine()
+	renderer := NewRenderer(engine)
+
+	tests := []struct {
+		name         string
+		templateYAML string
+		context      map[string]any
+		wantErr      bool
+		checkFn      func(*testing.T, map[string]any)
+	}{
+		{
+			name: "basic resource rendering",
+			templateYAML: `
+id: test
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${name}
+  data:
+    key: ${value}
+`,
+			context: map[string]any{
+				"name":  "my-config",
+				"value": "my-value",
+			},
+			wantErr: false,
+			checkFn: func(t *testing.T, resource map[string]any) {
+				if resource["kind"] != "ConfigMap" {
+					t.Errorf("Expected kind=ConfigMap, got %v", resource["kind"])
+				}
+				metadata := resource["metadata"].(map[string]any)
+				if metadata["name"] != "my-config" {
+					t.Errorf("Expected name=my-config, got %v", metadata["name"])
+				}
+				data := resource["data"].(map[string]any)
+				if data["key"] != "my-value" {
+					t.Errorf("Expected key=my-value, got %v", data["key"])
+				}
+			},
+		},
+		{
+			name: "resource with omit()",
+			templateYAML: `
+id: test
+template:
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: test
+    annotations: ${oc_omit()}
+`,
+			context: map[string]any{},
+			wantErr: false,
+			checkFn: func(t *testing.T, resource map[string]any) {
+				metadata := resource["metadata"].(map[string]any)
+				if _, hasAnnotations := metadata["annotations"]; hasAnnotations {
+					t.Errorf("Expected annotations to be omitted")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Parse template from YAML
+			var template v1alpha1.ResourceTemplate
+			if err := yaml.Unmarshal([]byte(tt.templateYAML), &template); err != nil {
+				t.Fatalf("Failed to parse template YAML: %v", err)
+			}
+
+			got, err := renderer.renderSingleResource(t.Context(), template, tt.context)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("renderSingleResource() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && tt.checkFn != nil {
+				tt.checkFn(t, got)
+			}
+		})
+	}
+}
+
+func TestValidateResource(t *testing.T) {
+	tests := []struct {
+		name       string
+		resource   map[string]any
+		resourceID string
+		wantErr    bool
+	}{
+		{
+			name: "valid resource",
+			resource: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name": "test",
+				},
+			},
+			resourceID: "test",
+			wantErr:    false,
+		},
+		{
+			name: "missing kind",
+			resource: map[string]any{
+				"apiVersion": "v1",
+				"metadata": map[string]any{
+					"name": "test",
+				},
+			},
+			resourceID: "test",
+			wantErr:    true,
+		},
+		{
+			name: "missing apiVersion",
+			resource: map[string]any{
+				"kind": "ConfigMap",
+				"metadata": map[string]any{
+					"name": "test",
+				},
+			},
+			resourceID: "test",
+			wantErr:    true,
+		},
+		{
+			name: "missing metadata",
+			resource: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+			},
+			resourceID: "test",
+			wantErr:    true,
+		},
+		{
+			name: "missing metadata.name",
+			resource: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{},
+			},
+			resourceID: "test",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateResource(tt.resource, tt.resourceID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateResource() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRenderResources_IncludeWhenError(t *testing.T) {
+	engine := template.NewEngine()
+	r := NewRenderer(engine)
+
+	templatesYAML := `
+- id: my-service
+  includeWhen: ${nonexistent.field}
+  template:
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: test-service
+`
+	var templates []v1alpha1.ResourceTemplate
+	require.NoError(t, yaml.Unmarshal([]byte(templatesYAML), &templates))
+
+	_, err := r.RenderResources(t.Context(), templates, map[string]any{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "my-service", "error should reference the resource ID")
+	assert.Contains(t, err.Error(), "includeWhen", "error should mention includeWhen")
+}
+
+func TestRenderResources_ForEachError(t *testing.T) {
+	engine := template.NewEngine()
+	r := NewRenderer(engine)
+
+	templatesYAML := `
+- id: my-configmap
+  forEach: ${nonexistent.list}
+  var: item
+  template:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ${item}
+`
+	var templates []v1alpha1.ResourceTemplate
+	require.NoError(t, yaml.Unmarshal([]byte(templatesYAML), &templates))
+
+	_, err := r.RenderResources(t.Context(), templates, map[string]any{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "my-configmap", "error should reference the resource ID")
+}
+
+func TestRenderResources_TemplateRenderError(t *testing.T) {
+	engine := template.NewEngine()
+	r := NewRenderer(engine)
+
+	templatesYAML := `
+- id: my-deployment
+  template:
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: ${nonexistent.field}
+`
+	var templates []v1alpha1.ResourceTemplate
+	require.NoError(t, yaml.Unmarshal([]byte(templatesYAML), &templates))
+
+	_, err := r.RenderResources(t.Context(), templates, map[string]any{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "my-deployment", "error should reference the resource ID")
+}
+
+func TestRenderResources_TargetPlane(t *testing.T) {
+	engine := template.NewEngine()
+	r := NewRenderer(engine)
+
+	templatesYAML := `
+- id: deployment
+  targetPlane: dataplane
+  template:
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: test-app
+- id: observability
+  targetPlane: observabilityplane
+  template:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: obs-config
+`
+	var templates []v1alpha1.ResourceTemplate
+	require.NoError(t, yaml.Unmarshal([]byte(templatesYAML), &templates))
+
+	results, err := r.RenderResources(t.Context(), templates, map[string]any{})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	assert.Equal(t, "dataplane", results[0].TargetPlane)
+	assert.Equal(t, "observabilityplane", results[1].TargetPlane)
+}
+
+func TestRenderResources_ForEachTargetPlane(t *testing.T) {
+	engine := template.NewEngine()
+	r := NewRenderer(engine)
+
+	templatesYAML := `
+- id: configmap
+  targetPlane: dataplane
+  forEach: ${items}
+  var: item
+  template:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ${item}
+`
+	var templates []v1alpha1.ResourceTemplate
+	require.NoError(t, yaml.Unmarshal([]byte(templatesYAML), &templates))
+
+	ctx := map[string]any{
+		"items": []any{"cfg1", "cfg2", "cfg3"},
+	}
+	results, err := r.RenderResources(t.Context(), templates, ctx)
+	require.NoError(t, err)
+	require.Len(t, results, 3)
+	for i, res := range results {
+		assert.Equal(t, "dataplane", res.TargetPlane, "forEach resource at index %d should inherit targetPlane", i)
+	}
+
+	// Verify that each resource also has the correct name
+	names := make([]string, len(results))
+	for i, res := range results {
+		metadata := res.Resource["metadata"].(map[string]any)
+		names[i] = metadata["name"].(string)
+	}
+	assert.ElementsMatch(t, []string{"cfg1", "cfg2", "cfg3"}, names)
+}
+
+func TestShouldInclude_NonBooleanResult(t *testing.T) {
+	engine := template.NewEngine()
+
+	got, err := ShouldInclude(t.Context(), engine, "${parameters.name}", map[string]any{
+		"parameters": map[string]any{
+			"name": "my-app",
+		},
+	})
+	require.Error(t, err)
+	assert.False(t, got)
+	assert.True(t, strings.Contains(err.Error(), "boolean"), "error should mention boolean, got: %s", err.Error())
+}

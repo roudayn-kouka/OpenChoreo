@@ -1,0 +1,10 @@
+# Helm values for OpenChoreo Workflow Plane in e2e testing setup
+# Only used when E2E_WITH_BUILD=true
+#
+# OpenBao is installed as an independent Helm release by _e2e.install-openbao
+# (see make/e2e.mk), mirroring install/k3d/k3d-install.sh — it is not a
+# subchart of openchoreo-workflow-plane.
+
+argo-workflows:
+  server:
+    enabled: false

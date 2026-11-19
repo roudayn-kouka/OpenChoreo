@@ -1,0 +1,151 @@
+spec:
+  environment: dev
+  component:
+    metadata:
+      name: test-app
+    spec: {}
+  releaseBinding:
+    spec:
+      componentTypeEnvironmentConfigs:
+        replicas: 2
+  componentType:
+    spec:
+      workloadType: deployment
+      environmentConfigs:
+        openAPIV3Schema:
+          type: object
+          properties:
+            replicas:
+              type: integer
+      resources:
+        - id: deployment
+          template:
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: ${metadata.name}
+            spec:
+              replicas: ${environmentConfigs.replicas}
+              template:
+                spec:
+                  containers:
+                    - name: main
+                      image: myapp:latest
+                      envFrom: ${configurations.toContainerEnvFrom()}
+                      volumeMounts: ${configurations.toContainerVolumeMounts()}
+                  volumes: ${configurations.toVolumes()}
+        - id: env-config
+          forEach: ${configurations.toConfigEnvsByContainer()}
+          var: envConfig
+          template:
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: ${envConfig.resourceName}
+            data: |
+              ${envConfig.envs.transformMapEntry(index, env, {env.name: env.value})}
+        - id: file-config
+          forEach: ${configurations.toConfigFileList()}
+          var: config
+          template:
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: ${config.resourceName}
+              namespace: ${metadata.namespace}
+            data:
+              ${config.name}: |
+                ${config.value}
+        - id: secret-env-external
+          forEach: ${configurations.toSecretEnvsByContainer()}
+          var: secretEnv
+          template:
+            apiVersion: external-secrets.io/v1
+            kind: ExternalSecret
+            metadata:
+              name: ${secretEnv.resourceName}
+              namespace: ${metadata.namespace}
+            spec:
+              refreshInterval: 15s
+              secretStoreRef:
+                name: ${dataplane.secretStore}
+                kind: ClusterSecretStore
+              target:
+                name: ${secretEnv.resourceName}
+                creationPolicy: Owner
+              data: |
+                ${secretEnv.envs.map(secret, {
+                  "secretKey": secret.name,
+                  "remoteRef": {
+                    "key": secret.remoteRef.key,
+                    "property": secret.remoteRef.property
+                  }
+                })}
+        - id: secret-file-external
+          forEach: ${configurations.toSecretFileList()}
+          var: file
+          template:
+            apiVersion: external-secrets.io/v1
+            kind: ExternalSecret
+            metadata:
+              name: ${file.resourceName}
+              namespace: ${metadata.namespace}
+            spec:
+              refreshInterval: 15s
+              secretStoreRef:
+                name: ${dataplane.secretStore}
+                kind: ClusterSecretStore
+              target:
+                name: ${file.resourceName}
+                creationPolicy: Owner
+              data:
+                - secretKey: ${file.name}
+                  remoteRef:
+                    key: ${file.remoteRef.key}
+                    property: ${file.remoteRef.property}
+  workload:
+    spec:
+      container:
+        image: myapp:latest
+        env:
+          - key: LOG_LEVEL
+            value: info
+          - key: DEBUG_MODE
+            value: "true"
+          - key: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: db-secret
+                key: password
+          - key: API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: api-secret
+                key: api_key
+        files:
+          - key: config.json
+            value: |
+              {
+                "database": {
+                  "host": "localhost",
+                  "port": 5432
+                }
+              }
+            mountPath: /etc/config
+          - key: app.properties
+            value: |
+              app.name=myapp
+              app.version=1.0.0
+            mountPath: /etc/config
+          - key: tls.crt
+            mountPath: /etc/tls
+            valueFrom:
+              secretKeyRef:
+                name: tls-secret
+                key: tls.crt
+          - key: application.yaml
+            mountPath: /etc/config
+            valueFrom:
+              secretKeyRef:
+                name: app-config-secret
+                key: application.yaml

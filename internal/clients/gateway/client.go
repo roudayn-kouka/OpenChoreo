@@ -1,0 +1,528 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+)
+
+const DefaultMaxPodLogBytes = 10 * 1024 * 1024 // 10MB
+
+type Config struct {
+	BaseURL        string
+	TLS            TLSConfig
+	Timeout        time.Duration
+	MaxPodLogBytes int64
+}
+
+type TLSConfig struct {
+	InsecureSkipVerify bool
+	CAFile             string
+	CAData             []byte
+	ServerName         string
+	// ClientCertFile and ClientKeyFile enable mTLS to the cluster gateway.
+	// Both must be set together.
+	ClientCertFile string
+	ClientKeyFile  string
+}
+
+type Client struct {
+	baseURL    string
+	httpClient *http.Client
+	// resourceTreeClient serves MatchResourceTreeChildren only. It shares
+	// httpClient's transport (and therefore its TLS config and connection pool)
+	// but carries its own, longer timeout, because the cluster agent budgets 25s
+	// for a match batch and the shared client's default would abort first.
+	// Its Timeout is a field so a test can shrink it.
+	resourceTreeClient *http.Client
+	maxPodLogBytes     int64
+}
+
+type PlaneNotification struct {
+	PlaneType string `json:"planeType"` // "dataplane", "workflowplane", "observabilityplane"
+	PlaneID   string `json:"planeID"`
+	Event     string `json:"event"` // "created", "updated", "deleted"
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+type NotificationResponse struct {
+	DisconnectedAgents int  `json:"disconnectedAgents"`
+	Success            bool `json:"success"`
+}
+
+type PlaneConnectionStatus struct {
+	PlaneType       string    `json:"planeType"`
+	PlaneID         string    `json:"planeID"`
+	Connected       bool      `json:"connected"`
+	ConnectedAgents int       `json:"connectedAgents"`
+	LastSeen        time.Time `json:"lastSeen,omitempty"`
+}
+
+// TransientError represents a transient error that should be retried
+// Examples: network errors, 5xx status codes, timeouts
+type TransientError struct {
+	StatusCode int
+	Message    string
+	Err        error
+}
+
+func (e *TransientError) Error() string {
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("transient gateway error (status %d): %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("transient gateway error: %s", e.Message)
+}
+
+func (e *TransientError) Unwrap() error {
+	return e.Err
+}
+
+// PermanentError represents a permanent error that should not be retried
+// Examples: 4xx status codes (except 429), validation errors
+type PermanentError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *PermanentError) Error() string {
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("permanent gateway error (status %d): %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("permanent gateway error: %s", e.Message)
+}
+
+func IsTransientError(err error) bool {
+	var transientErr *TransientError
+	return err != nil && (errors.As(err, &transientErr) || isNetworkError(err))
+}
+
+func IsPermanentError(err error) bool {
+	var permanentErr *PermanentError
+	return err != nil && errors.As(err, &permanentErr)
+}
+
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "no such host") ||
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
+func classifyHTTPError(statusCode int) error {
+	if statusCode >= http.StatusInternalServerError && statusCode < 600 {
+		return &TransientError{
+			StatusCode: statusCode,
+			Message:    "gateway server error",
+		}
+	} else if statusCode == http.StatusTooManyRequests {
+		return &TransientError{
+			StatusCode: statusCode,
+			Message:    "gateway rate limited",
+		}
+	} else if statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError {
+		return &PermanentError{
+			StatusCode: statusCode,
+			Message:    "gateway client error",
+		}
+	}
+	return &TransientError{
+		StatusCode: statusCode,
+		Message:    "unexpected status code",
+	}
+}
+
+func HandleGatewayError(logger interface{ Error(error, string, ...any) }, err error, operation string) (shouldRetry bool, result ctrl.Result, retryErr error) {
+	if IsTransientError(err) {
+		logger.Error(err, fmt.Sprintf("Transient error notifying gateway of %s, will retry", operation))
+		return true, ctrl.Result{}, err
+	}
+
+	if IsPermanentError(err) {
+		logger.Error(err, fmt.Sprintf("Permanent error notifying gateway of %s, skipping retry", operation))
+		return false, ctrl.Result{}, nil
+	}
+
+	logger.Error(err, fmt.Sprintf("Failed to notify gateway of %s", operation))
+	return false, ctrl.Result{}, nil
+}
+
+// NewClientWithConfig creates a new gateway client with the provided configuration.
+// The server certificate is verified against the system root CA pool by default;
+// set TLSConfig.CAFile or TLSConfig.CAData to pin a custom CA. For development
+// against self-signed gateways, callers may set TLSConfig.InsecureSkipVerify.
+func NewClientWithConfig(config *Config) (*Client, error) {
+	if config.BaseURL == "" {
+		return nil, fmt.Errorf("baseURL is required")
+	}
+
+	tlsConfig, err := BuildTLSConfig(&config.TLS)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build TLS config: %w", err)
+	}
+
+	timeout := config.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
+	maxPodLogBytes := config.MaxPodLogBytes
+	if maxPodLogBytes == 0 {
+		maxPodLogBytes = DefaultMaxPodLogBytes
+	}
+
+	return &Client{
+		baseURL: config.BaseURL,
+		httpClient: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		},
+		resourceTreeClient: &http.Client{
+			Timeout:   DefaultResourceTreeTimeout,
+			Transport: transport,
+		},
+		maxPodLogBytes: maxPodLogBytes,
+	}, nil
+}
+
+func BuildTLSConfig(config *TLSConfig) (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12, // Enforce minimum TLS 1.2
+	}
+
+	if config.ServerName != "" {
+		tlsConfig.ServerName = config.ServerName
+	}
+
+	if config.InsecureSkipVerify {
+		// #nosec G402 -- InsecureSkipVerify is configurable and should only be used in development
+		tlsConfig.InsecureSkipVerify = true
+	} else if config.CAFile != "" || len(config.CAData) > 0 {
+		caCertPool := x509.NewCertPool()
+
+		var caData []byte
+		var err error
+
+		if config.CAFile != "" {
+			caData, err = os.ReadFile(config.CAFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read CA file %s: %w", config.CAFile, err)
+			}
+		} else {
+			caData = config.CAData
+		}
+
+		if !caCertPool.AppendCertsFromPEM(caData) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	if config.ClientCertFile != "" || config.ClientKeyFile != "" {
+		if config.ClientCertFile == "" || config.ClientKeyFile == "" {
+			return nil, fmt.Errorf("both ClientCertFile and ClientKeyFile must be set for mTLS")
+		}
+		cert, err := tls.LoadX509KeyPair(config.ClientCertFile, config.ClientKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client key pair: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+
+	return tlsConfig, nil
+}
+
+func (c *Client) NotifyPlaneLifecycle(ctx context.Context, notification *PlaneNotification) (*NotificationResponse, error) {
+	body, err := json.Marshal(notification)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal notification: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/api/v1/planes/notify", c.baseURL)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Network errors are transient and should be retried
+		return nil, &TransientError{
+			Message: "failed to send notification",
+			Err:     err,
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifyHTTPError(resp.StatusCode)
+	}
+
+	var response NotificationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &response, nil
+}
+
+func (c *Client) ForceReconnect(ctx context.Context, planeType, planeID string) (*NotificationResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/planes/%s/%s/reconnect", c.baseURL, planeType, planeID)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Network errors are transient and should be retried
+		return nil, &TransientError{
+			Message: "failed to send reconnect request",
+			Err:     err,
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifyHTTPError(resp.StatusCode)
+	}
+
+	var response NotificationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &response, nil
+}
+
+// GetPlaneStatus retrieves the connection status for a specific plane from the gateway
+// This is used by controllers to query agent connection status and update CR status fields
+// If namespace and name are provided, it returns CR-specific authorization status
+// If they are empty, it returns plane-level connection status
+func (c *Client) GetPlaneStatus(ctx context.Context, planeType, planeID, namespace, name string) (*PlaneConnectionStatus, error) {
+	url := fmt.Sprintf("%s/api/v1/planes/%s/%s/status", c.baseURL, planeType, planeID)
+
+	// Add query parameters for CR-specific status if provided
+	if namespace != "" && name != "" {
+		url = fmt.Sprintf("%s?namespace=%s&name=%s", url, namespace, name)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Network errors are transient and should be retried
+		return nil, &TransientError{
+			Message: "failed to get plane status",
+			Err:     err,
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifyHTTPError(resp.StatusCode)
+	}
+
+	var status PlaneConnectionStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &status, nil
+}
+
+// PodReference represents a Kubernetes pod reference
+type PodReference struct {
+	Namespace string
+	Name      string
+}
+
+// PodLogsOptions contains options for fetching pod logs through the gateway
+type PodLogsOptions struct {
+	ContainerName     string // Specific container name to get logs from
+	IncludeTimestamps bool   // Include timestamps in log lines
+	SinceSeconds      *int64 // Return logs newer than this many seconds
+}
+
+// GetPodLogsFromPlane retrieves pod logs through the gateway proxy with optional parameters
+// This method makes direct Kubernetes API calls through the gateway proxy to support
+// advanced log retrieval options like container selection, timestamps, and time filtering
+func (c *Client) GetPodLogsFromPlane(ctx context.Context, planeType, planeID, planeNamespace, planeName string, podReference *PodReference, options *PodLogsOptions) (string, error) {
+	if podReference == nil || podReference.Namespace == "" || podReference.Name == "" {
+		return "", fmt.Errorf("pod reference is required and must have namespace and name")
+	}
+
+	// Build query parameters
+	queryParams := ""
+	if options != nil {
+		params := []string{}
+		if options.ContainerName != "" {
+			params = append(params, fmt.Sprintf("container=%s", options.ContainerName))
+		}
+		if options.IncludeTimestamps {
+			params = append(params, "timestamps=true")
+		}
+		if options.SinceSeconds != nil && *options.SinceSeconds > 0 {
+			params = append(params, fmt.Sprintf("sinceSeconds=%d", *options.SinceSeconds))
+		}
+		if len(params) > 0 {
+			queryParams = "?" + strings.Join(params, "&")
+		}
+	}
+
+	// Build the URL for the Kubernetes API request
+	k8sAPIPathForPodLogs := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log%s", podReference.Namespace, podReference.Name, queryParams)
+	k8sProxyURLForPodLogs := fmt.Sprintf("%s/api/proxy/%s/%s/%s/%s/k8s%s", c.baseURL, planeType, planeID, planeNamespace, planeName, k8sAPIPathForPodLogs)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", k8sProxyURLForPodLogs, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Network errors are transient and should be retried
+		return "", &TransientError{
+			Message: "failed to send request",
+			Err:     err,
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", classifyHTTPError(resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxPodLogBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+	if int64(len(body)) > c.maxPodLogBytes {
+		return "", fmt.Errorf("response body is too large, max is %d bytes", c.maxPodLogBytes)
+	}
+
+	return string(body), nil
+}
+
+// ProxyK8sRequest proxies a read-only K8s API request through the gateway.
+// Returns the raw HTTP response for the caller to stream back.
+// For cluster-scoped CRs, pass crNamespace as "_cluster".
+func (c *Client) ProxyK8sRequest(ctx context.Context, planeType, planeID, crNamespace, crName, k8sPath, rawQuery string) (*http.Response, error) {
+	proxyURL := fmt.Sprintf("%s/api/proxy/%s/%s/%s/%s/k8s/%s", c.baseURL, planeType, planeID, crNamespace, crName, k8sPath)
+	if rawQuery != "" {
+		proxyURL = proxyURL + "?" + rawQuery
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", proxyURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, &TransientError{
+			Message: "failed to proxy K8s request",
+			Err:     err,
+		}
+	}
+
+	return resp, nil
+}
+
+// PostK8sRequest proxies a mutating (POST) K8s API request through the gateway.
+// Returns the raw HTTP response for the caller to inspect.
+// For cluster-scoped CRs, pass crNamespace as "_cluster".
+func (c *Client) PostK8sRequest(ctx context.Context, planeType, planeID, crNamespace, crName, k8sPath string, body []byte) (*http.Response, error) {
+	proxyURL := fmt.Sprintf("%s/api/proxy/%s/%s/%s/%s/k8s/%s", c.baseURL, planeType, planeID, crNamespace, crName, k8sPath)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", proxyURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, &TransientError{
+			Message: "failed to proxy K8s request",
+			Err:     err,
+		}
+	}
+
+	return resp, nil
+}
+
+// GetPodEventsFromPlane retrieves pod events through the gateway proxy
+// This method makes direct Kubernetes API calls through the gateway proxy to fetch events
+// for a specific pod using field selectors
+func (c *Client) GetPodEventsFromPlane(ctx context.Context, planeType, planeID, planeNamespace, planeName string, podReference *PodReference) ([]byte, error) {
+	if podReference == nil || podReference.Namespace == "" || podReference.Name == "" {
+		return nil, fmt.Errorf("pod reference is required and must have namespace and name")
+	}
+
+	// Build field selector for the specific pod
+	fieldSelector := fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", podReference.Name)
+
+	// Build the URL for the Kubernetes API request with properly encoded field selector
+	k8sAPIPathForEvents := fmt.Sprintf("/api/v1/namespaces/%s/events?fieldSelector=%s", podReference.Namespace, url.QueryEscape(fieldSelector))
+	k8sProxyURLForEvents := fmt.Sprintf("%s/api/proxy/%s/%s/%s/%s/k8s%s", c.baseURL, planeType, planeID, planeNamespace, planeName, k8sAPIPathForEvents)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", k8sProxyURLForEvents, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Network errors are transient and should be retried
+		return nil, &TransientError{
+			Message: "failed to send request",
+			Err:     err,
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifyHTTPError(resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return body, nil
+}
